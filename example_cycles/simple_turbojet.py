@@ -162,7 +162,15 @@ class MPTurbojet(pyc.MPCycle):
         self.pyc_add_cycle_param('burner.dPqP', 0.03)
         self.pyc_add_cycle_param('nozz.Cv', 0.99)
 
-        
+        #Define the design point
+        self.set_input_defaults('DESIGN.fc.alt', 0, units='ft')
+        self.set_input_defaults('DESIGN.fc.MN', 0.000001)
+        self.set_input_defaults('DESIGN.balance.Fn_target', 11800.0, units='lbf')
+        self.set_input_defaults('DESIGN.balance.T4_target', 2370.0, units='degR') 
+        self.set_input_defaults('DESIGN.comp.PR', 13.5) 
+        self.set_input_defaults('DESIGN.comp.eff', 0.83)
+        self.set_input_defaults('DESIGN.turb.eff', 0.86)
+
         # define the off-design conditions we want to run
         self.od_pts = ['OD0', 'OD1']
         self.od_MNs = [0.000001, 0.2]
@@ -202,15 +210,6 @@ if __name__ == "__main__":
     prob.model = mp_turbojet = MPTurbojet()
 
     prob.setup(check=False)
-
-    #Define the design point
-    prob.set_val('DESIGN.fc.alt', 0, units='ft')
-    prob.set_val('DESIGN.fc.MN', 0.000001)
-    prob.set_val('DESIGN.balance.Fn_target', 11800.0, units='lbf')
-    prob.set_val('DESIGN.balance.T4_target', 2370.0, units='degR') 
-    prob.set_val('DESIGN.comp.PR', 13.5) 
-    prob.set_val('DESIGN.comp.eff', 0.83)
-    prob.set_val('DESIGN.turb.eff', 0.86)
 
     # Set initial guesses for balances
     prob['DESIGN.balance.FAR'] = 0.0175506829934
