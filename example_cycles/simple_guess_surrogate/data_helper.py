@@ -126,8 +126,8 @@ def get_engine_interp(xt, yt, xlimits, scaling_factors):
 if __name__ == "__main__":
     from postprocessing.MultiView.MultiView import MultiView
 
-    xt, yt, xlimits, scaling_factors = get_data()
-    interp, scaling_factors = get_engine_interp()
+    xt, yt, xlimits, scaling_factors = get_training_data('test.pkl')
+    interp  = get_engine_interp(xt, yt, xlimits, scaling_factors)
 
     info = {'nx':2,
             'ny':23,
