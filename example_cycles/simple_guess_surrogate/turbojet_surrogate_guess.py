@@ -33,7 +33,7 @@ class Turbojet(pyc.Cycle):
                                     air_fuel_elements=pyc.AIR_FUEL_MIX,
                                     fuel_type='JP-7'))
         self.pyc_add_element('turb', pyc.Turbine(map_data=pyc.LPT2269, design=design,
-                                    thermo_data=thermo_spec, elements=pyc.AIR_FUEL_MIX,),
+                                    thermo_data=thermo_spec, elements=pyc.AIR_FUEL_MIX, map_extrap=True),
                                     promotes_inputs=['Nmech'])
         self.pyc_add_element('nozz', pyc.Nozzle(nozzType='CD', lossCoef='Cv',
                                     thermo_data=thermo_spec, elements=pyc.AIR_FUEL_MIX))
@@ -99,7 +99,7 @@ class Turbojet(pyc.Cycle):
         newton.options['atol'] = 1e-6
         newton.options['rtol'] = 1e-6
         newton.options['iprint'] = 2
-        newton.options['maxiter'] = 15
+        newton.options['maxiter'] = 50
         newton.options['solve_subsystems'] = True
         newton.options['max_sub_solves'] = 100
         newton.options['reraise_child_analysiserror'] = False
@@ -208,6 +208,8 @@ if __name__ == "__main__":
     import time
     import sys
 
+    import flight_envelope
+
     prob = om.Problem()
 
     prob.model = mp_turbojet = MPTurbojet()
@@ -231,15 +233,18 @@ if __name__ == "__main__":
     prob.set_solver_print(level=-1)
     prob.set_solver_print(level=2, depth=1)
 
+    input_vars = ['OD0.fc.MN', 'OD0.fc.alt']
+    state_vars =['OD0.balance.W', 'OD0.balance.FAR', 'OD0.balance.Nmech', 'OD0.turb.PR']
+    # initialize the dict storage for the surrogate data
+    OD_data = init_data(input_vars, state_vars)
+    
     if len(sys.argv) > 1 and sys.argv[1] == 'training_data': 
-        input_vars = ['OD0.fc.MN', 'OD0.fc.alt']
-        state_vars =['OD0.balance.W', 'OD0.balance.FAR', 'OD0.balance.Nmech', 'OD0.turb.PR']
+        
 
-        # initialize the dict storage for the surrogate data
-        OD_data = init_data(input_vars, state_vars)
+       
 
-        MNs = np.linspace(0.001, 0.3, 3)
-        alts = np.linspace(0, 10000, 3)
+        MNs = np.linspace(0.001, 1.0, 15)
+        alts = np.linspace(0, 25000, 10)
         for alt in alts: 
 
             # restore the converged values from the last MN=0 point, 
@@ -249,37 +254,83 @@ if __name__ == "__main__":
             prob['OD0.balance.Nmech'] = Nmech_guess
             prob['OD0.turb.PR'] = PR_guess 
             
-
+            save_guess = True 
+            
             for MN in MNs: 
                 prob['OD0.fc.MN'] = MN
                 prob['OD0.fc.alt'] = alt
                 print()
                 print(50*'#')
-                print(f'running MN={MN}, alt={alt}')
-                prob.run_model()
 
-                record_data_point(OD_data, prob)
 
-                if MN < .01: # save off guesses for low-mach
-                    W_guess = prob['OD0.balance.W'][0]
-                    FAR_guess = prob['OD0.balance.FAR'][0] 
-                    Nmech_guess = prob['OD0.balance.Nmech'][0] 
-                    PR_guess = prob['OD0.turb.PR'][0]
+                if flight_envelope.inside(MN, alt): 
+                    print(f'running MN={MN}, alt={alt}')
+
+                    prob.run_model()
+
+                    record_data_point(OD_data, prob)
+
+                    if save_guess: 
+                        W_guess = prob['OD0.balance.W'][0]
+                        FAR_guess = prob['OD0.balance.FAR'][0] 
+                        Nmech_guess = prob['OD0.balance.Nmech'][0] 
+                        PR_guess = prob['OD0.turb.PR'][0]
+
+                        # save just the first MN from every altitude
+                        # to use as a restart at the next alt
+                        save_guess = False 
+
+                        print('saving restart point!')
+
+
+                else:
+                    print(f'skipping: MN={MN}, alt={alt}; (outside flight envelope)')
 
         save_data(OD_data, 'test.pkl')
 
-        for pt in ['DESIGN', 'OD0']:
-            viewer(prob, pt)
+        # for pt in ['DESIGN', 'OD0']:
+        #     viewer(prob, pt)
 
 
-    # grab the data and train a surrogate
+    if len(sys.argv) > 1 and sys.argv[1] == 'surrogate': 
 
-    xt, yt, xlimits, scaling_factors = get_training_data('test.pkl')
+        # grab the data and train a surrogate
 
-    interp = get_engine_interp(xt, yt, xlimits, scaling_factors)
+        xt, yt, xlimits, scaling_factors = get_training_data('test.pkl')
 
-    xp = np.array([[0.25, 1200]])
+        interp = get_engine_interp(xt, yt, xlimits, scaling_factors)
 
-    print(interp.predict_values(xp))
+        case_count = 0
+        while case_count <= 10: # run 10 random cases
+            MN = 0.001 + .999*np.random.random() # 0.001 to 1
+            alt = 25000*np.random.random() # 0 to 25000
 
-    print("time", time.time() - st)
+            if flight_envelope.inside(MN, alt): 
+
+                # MN = 0.45
+                # alt = 1257
+
+                xp = np.array([[MN, alt/1e4]])
+                yp = interp.predict_values(xp) * (scaling_factors[:, 1] - scaling_factors[:, 0]) + scaling_factors[:, 0]
+
+                FAR_guess, Nmech_guess, W_guess, PR_guess =  yp[0]
+
+                prob['OD0.balance.W'] = W_guess 
+                prob['OD0.balance.FAR'] = FAR_guess 
+                prob['OD0.balance.Nmech'] = Nmech_guess
+                prob['OD0.turb.PR'] = PR_guess 
+
+                print('*'*50)
+                print(f'running MN={MN}, alt={alt}')
+                print(f'guesses: W={W_guess}  FAR={FAR_guess}  Nmech={Nmech_guess} PR={PR_guess}')
+
+                # prob.model.OD0.nonlinear_solver.options['maxiter'] = 0
+                prob.run_model()
+                case_count += 1
+
+            else: 
+                print(f'skipping: MN={MN}, alt={alt}; (outside flight envelope)')
+            print()
+            print()
+
+        print("time", time.time() - st)

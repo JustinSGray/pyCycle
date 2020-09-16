@@ -1,4 +1,5 @@
 from __future__ import print_function, division
+from collections import OrderedDict
 import numpy as np
 import scipy
 import pickle
@@ -42,7 +43,7 @@ def init_data(inputs, states, pkl_file_name=None):
         if pkl_states != set(states): 
             raise ValueError('states in pkl_file do not match the specified states.')
     else: # initialize an empty dict instead
-        data = {'inputs':{},  'states':{}}
+        data = {'inputs':OrderedDict(),  'states':OrderedDict()}
         for inp in inputs:
             data['inputs'][inp] = []
         for st in states:
@@ -96,7 +97,7 @@ def get_training_data(pkl_file_name):
     # Set the limits for the inputs; Mach and scaled altitude
     xlimits = np.array([
         [-0.02, 2.52],
-        [-0.1, 1.2],
+        [-0.1, 3],
     ])
 
     return xt, yt, xlimits, scaling_factors
