@@ -238,7 +238,7 @@ if __name__ == "__main__":
     # initialize the dict storage for the surrogate data
     OD_data = init_data(input_vars, state_vars)
     
-    if len(sys.argv) > 1 and sys.argv[1] == 'training_data': 
+    if len(sys.argv) > 1 and sys.argv[1] == 'train': 
         
 
        
