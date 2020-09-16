@@ -43,7 +43,7 @@ def init_data(inputs, states, pkl_file_name=None):
         if pkl_states != set(states): 
             raise ValueError('states in pkl_file do not match the specified states.')
     else: # initialize an empty dict instead
-        data = {'inputs':OrderedDict(),  'states':OrderedDict()}
+        data = {'inputs':{},  'states':{}}
         for inp in inputs:
             data['inputs'][inp] = []
         for st in states:
@@ -77,7 +77,7 @@ def get_training_data(pkl_file_name):
     in_data = [v for k,v in data['inputs'].items()]
     xt = np.vstack(in_data).T
 
-    state_vars = sorted(data['states'].keys())
+    state_vars = data['states'].keys()
     state_data = data['states']
     yt = np.vstack([state_data[k] for k in state_vars]).T
 

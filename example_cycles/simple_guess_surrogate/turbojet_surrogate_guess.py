@@ -238,13 +238,18 @@ if __name__ == "__main__":
     # initialize the dict storage for the surrogate data
     OD_data = init_data(input_vars, state_vars)
     
-    if len(sys.argv) > 1 and sys.argv[1] == 'train': 
+    if len(sys.argv) > 1 and 'train' in sys.argv: 
         
 
        
 
         MNs = np.linspace(0.001, 1.0, 15)
         alts = np.linspace(0, 25000, 10)
+
+        # narrow, small set for testing 
+        # MNs = np.linspace(0.001, .3, 3)
+        # alts = np.linspace(0, 5000, 3)
+        
         for alt in alts: 
 
             # restore the converged values from the last MN=0 point, 
@@ -292,7 +297,7 @@ if __name__ == "__main__":
         #     viewer(prob, pt)
 
 
-    if len(sys.argv) > 1 and sys.argv[1] == 'surrogate': 
+    if len(sys.argv) > 1 and 'surrogate' in sys.argv: 
 
         # grab the data and train a surrogate
 
@@ -313,18 +318,22 @@ if __name__ == "__main__":
                 xp = np.array([[MN, alt/1e4]])
                 yp = interp.predict_values(xp) * (scaling_factors[:, 1] - scaling_factors[:, 0]) + scaling_factors[:, 0]
 
-                FAR_guess, Nmech_guess, W_guess, PR_guess =  yp[0]
+                # FAR_guess, Nmech_guess, W_guess, PR_guess =  yp[0]
+                # W_guess, FAR_guess, Nmech_guess, PR_guess =  yp[0]
 
-                prob['OD0.balance.W'] = W_guess 
-                prob['OD0.balance.FAR'] = FAR_guess 
-                prob['OD0.balance.Nmech'] = Nmech_guess
-                prob['OD0.turb.PR'] = PR_guess 
+                # prob['OD0.balance.W'] = W_guess 
+                # prob['OD0.balance.FAR'] = FAR_guess 
+                # prob['OD0.balance.Nmech'] = Nmech_guess
+                # prob['OD0.turb.PR'] = PR_guess 
+
+                for i, s_name in enumerate(state_vars): 
+                    prob[s_name] = yp[0,i]
 
                 print('*'*50)
                 print(f'running MN={MN}, alt={alt}')
                 print(f'guesses: W={W_guess}  FAR={FAR_guess}  Nmech={Nmech_guess} PR={PR_guess}')
 
-                # prob.model.OD0.nonlinear_solver.options['maxiter'] = 0
+                prob.model.OD0.nonlinear_solver.options['maxiter'] = 0
                 prob.run_model()
                 case_count += 1
 
