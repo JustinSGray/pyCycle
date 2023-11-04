@@ -59,5 +59,32 @@ class Element(om.Group):
 
 
 
+class NewElement(om.ExplicitComponent):
+    """
+    Custom pyCycle component for anything that requires input or output ports
+    """
+
+    def __init__(self, **kwargs):
+
+        super().__init__(**kwargs)
+
+        self.Fl_I_data = {}
+        self.Fl_O_data = {}
+
+    # notes: 
+    #  - these should return flow-station-objects
+    #  - the name arguments are used to define the I/O var names
+    def add_flow_input(self, name): # probably not an object. just created input variables
+        pass 
+
+    def add_flow_output(self, name, mode): # object for calculations, has a method to push values into the output vector
+        pass
+
+    def add_flow_station(self, mode): 
+        pass
+
+
+
+
 
 

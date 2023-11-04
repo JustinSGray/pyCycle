@@ -8,7 +8,7 @@ from pycycle.thermo.cea import species_data
 from pycycle.thermo.thermo import Thermo
 from pycycle.flow_in import FlowIn
 from pycycle.passthrough import PassThrough
-from pycycle.element_base import Element
+from pycycle.element_base import Element, NewElement
 
 class MachPressureLossMap(om.ExplicitComponent):
     """
@@ -247,6 +247,72 @@ class Duct(Element):
                                promotes=['*'])
 
         super().setup()
+
+
+class NewDuct(NewElement)
+
+    def setup(self)
+
+        thermo_method = self.options['thermo_method']
+        thermo_data = self.options['thermo_data']
+        statics = self.options['statics']
+        design = self.options['design']
+        expMN = self.options['expMN']
+
+        composition = self.Fl_I_data['Fl_I']
+
+        self.add_flow_input("FL_I")
+        
+        self.Fl_O = self.add_flow_output("FL_O")
+
+
+        if expMN > 1e-10: # Calcluate pressure losses as function of Mach number
+            if design: 
+                self.add_input('dPqP_MN', val=0.0, desc='Pressure differential as a fraction of incoming pressure')
+            else: 
+                self.add_input('s_dPqP', val=0.0,
+                        desc='Pressure loss scalar')
+            
+            self.add_output('s_dPqP', val=0.0,
+                        desc='Pressure loss scalar')
+
+        if not design:
+            self.add_input('area', val=1.0, units="in**2")
+
+        self.add_input('Qdot', val=0.0, units='Btu/s',
+                       desc='heat flow rate into (positive) or out of (negative) the air')
+
+
+
+    def initialize(self): 
+
+        self.options.declare('design', default=True, 
+                              desc='Switch between on-design and off-design calculation.')
+        self.options.declare('thermo_data', default=False,
+                              desc='thermodynamic data specific to this element', recordable=False)
+        self.options.declare('thermo_method', default='CEA', values=ALLOWED_THERMOS,
+                              desc='Method for computing thermodynamic properties')
+
+    
+
+    def compute(self, inputs, outputs): 
+
+        design = self.options['design']
+        expMN = self.options['expMN']
+
+        if expMN > 1e-10: # Calcluate pressure losses as function of Mach number
+        # otherwise values stay at default
+            if design:
+                outputs['s_dPqP'] = inputs['dPqP'] / inputs['MN_in']**expMN
+            else:
+                outputs['dPqP'] = inputs['s_dPqP'] * inputs['MN_in']**expMN
+
+        Pt_out = nputs['Fl_I:tot:P']*(1.0 - inputs['dPqP'])
+        ht_out = inputs['Fl_I:tot:h'] + inputs['Q_dot']/inputs['W_in']        
+
+
+        self.FL_O.compute_total(P=Pt_out, h=ht_out)
+        self.FL_O.set_flow(outputs)
 
 if __name__ == "__main__":
 
