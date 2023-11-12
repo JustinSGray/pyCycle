@@ -249,4 +249,51 @@ class ThermoAdd(om.Group):
 
 
 
+class ThermoStation(object):
+
+    def __init__(self, name, mode, method, thermo_kwargs):
+
+        self.name = name 
+        self.mode = mode
+        self.method = method 
+        self.thermo_kwargs = thermo_kwargs
+
+        # allowed values match that of thermo: 'total_TP', 'total_SP', 'total_hP', 'static_MN', 'static_A', 'static_Ps'
+
+        self._calc = om.Problem()
+        self._calc.model = Thermo(mode=mode, method=method, thermo_kwargs=thermo_kwargs)
+
+        self._calc.setup()
+        self._calc.final_setup()
+
+        self._set_units = {}
+        self._get_units = {}
+
+
+    #NOTE: Derivatives will have to account for any unit conversion factors!
+    def set_val(self, name, val, units=None):
+        
+        # TODO IMPLEMENT ERROR CHECKS FOR ALLOWED TOTAL VARAIBLES TO MATCH MODE
+
+        # TOOD IMPLEMENT CHECKS FOR STATICS
+
+        self._set_units[name] = units
+
+        self._calc.set_val(name, val, units)
+
+    def compute(self):
+        self._calc.run_model()
+
+    def get_val(self, name, units=None):
+        self._get_units[name] = units
+        return self._calc.get_val(name, units)
+        
+
+        
+            
+
+
+
+
+
 

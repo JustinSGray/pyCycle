@@ -263,7 +263,7 @@ class NewDuct(NewElement)
 
         self.add_flow_input("FL_I")
         
-        self.Fl_O = self.add_flow_output("FL_O")
+        self.Fl_O = self.add_flow_output(name="FL_O", mode="total_hP")
 
 
         if expMN > 1e-10: # Calcluate pressure losses as function of Mach number
@@ -311,7 +311,7 @@ class NewDuct(NewElement)
         ht_out = inputs['Fl_I:tot:h'] + inputs['Q_dot']/inputs['W_in']        
 
 
-        self.FL_O.compute_total(P=Pt_out, h=ht_out)
+        self.FL_O.compute_totals(P=Pt_out, h=ht_out)
         self.FL_O.set_flow(outputs)
 
 if __name__ == "__main__":
