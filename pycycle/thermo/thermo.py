@@ -1,3 +1,4 @@
+import numpy as np
 import openmdao.api as om
 
 from pycycle.thermo.static_ps_calc import PsCalc
@@ -266,27 +267,63 @@ class ThermoStation(object):
         self._calc.setup()
         self._calc.final_setup()
 
-        self._set_units = {}
-        self._get_units = {}
+        composition = self._calc[f'{name}:composition']
+
+
+        # This nonesense is done so that the compute funciton can return a vector value to make it AD compatible
+        self._tot_names = ['h', 'T', 'P', 'rho', 'gamma', 
+                           'Cp', 'Cv', 'S', 'R', 'composition']
+        self._tot_sizes = [1, 1, 1, 1, 1, 1, 1, 1, 1, len(composition)]
+        self._thermo_data = np.zeros(np.sum(self._tot_sizes))
+
+        self._thermo_to_names = [f'{self.name}:{var_name}' for var_name in self._tot_names]
 
 
     #NOTE: Derivatives will have to account for any unit conversion factors!
-    def set_val(self, name, val, units=None):
+    # def set_val(self, name, val, units=None):
         
-        # TODO IMPLEMENT ERROR CHECKS FOR ALLOWED TOTAL VARAIBLES TO MATCH MODE
+    #     # TODO IMPLEMENT ERROR CHECKS FOR ALLOWED TOTAL VARAIBLES TO MATCH MODE
 
-        # TOOD IMPLEMENT CHECKS FOR STATICS
+    #     # TOOD IMPLEMENT CHECKS FOR STATICS
 
-        self._set_units[name] = units
+    #     self._set_units[name] = units
 
-        self._calc.set_val(name, val, units)
+    #     self._calc.set_val(name, val, units)
 
-    def compute(self):
+    def compute(self, T=None, P=None, h=None, S=None, MN=None, A=None, Ps=None):
+
+        if self.mode == 'total_TP':
+            print("foobar", T, P)
+            # assert(1==2)
+            self._calc.set_val('T', T, units="degR")
+            self._calc.set_val('P', P, units="lbf/inch**2")
+        elif self.mode == 'total_hP':
+            self._calc.set_val('h', h)
+            self._calc.set_val('P', P)
+        elif self.mode == 'total_SP':
+            self._calc.set_val('S', S)
+            self._calc.set_val('P', P)
+        elif self.mode == 'static_MN':
+            assert(1==2)
+        elif self.mode == 'static_A':
+            assert(1==2)
+        elif self.mode == 'static_Ps':
+            assert(1==2)
+
         self._calc.run_model()
 
-    def get_val(self, name, units=None):
-        self._get_units[name] = units
-        return self._calc.get_val(name, units)
+        self._calc.model.list_outputs(prom_name=True, units=True)
+
+        # TOOD: can probably pull the vector of values directly somehow and would be a lot faster
+        idx = 0
+        for i,name in enumerate(self._thermo_to_names):
+            v_size = self._tot_sizes[i]
+            self._thermo_data[idx:idx+v_size][:] = self._calc[name]
+            idx += v_size
+
+        return self._thermo_data
+
+    
         
 
         

@@ -192,11 +192,11 @@ class PropsCalcs(ExplicitComponent):
 
 
         dCv_dresultP = np.zeros((1, num_element+1))
-        dCv_dresultP[0, -1] = -R_UNIVERSAL_ENG*n_moles*(dlnVqdlnT/dlnVqdlnP)**2
+        dCv_dresultP[0, -1] = (-R_UNIVERSAL_ENG*n_moles*(dlnVqdlnT/dlnVqdlnP)**2)[0]
         J['Cv', 'result_P'] = dCv_dresultP
 
         J['Cv', 'result_T'] = dCp_dresultT
-        J['Cv', 'result_T'][0, -1] -= n_moles*R_UNIVERSAL_ENG/dlnVqdlnP*(2*dlnVqdlnT)
+        J['Cv', 'result_T'][0, -1] -= (n_moles*R_UNIVERSAL_ENG/dlnVqdlnP*(2*dlnVqdlnT))[0]
         dCv_dresultT_last = J['Cv', 'result_T'][0, -1]
 
         J['gamma', 'n'] = dCp_dnj*(Cp/Cv-1)/(dlnVqdlnP*Cv)
@@ -205,12 +205,12 @@ class PropsCalcs(ExplicitComponent):
 
 
         dgamma_dresultT = np.zeros((1, num_element+1))
-        dgamma_dresultT[0, :num_element] = 1/Cv/dlnVqdlnP*dCp_dresultT[:num_element]*(Cp/Cv-1)
-        dgamma_dresultT[0, -1] = (-dCp_dresultT[-1]/Cv+Cp/Cv**2*dCv_dresultT_last)/dlnVqdlnP
+        dgamma_dresultT[0, :num_element] = (1/Cv/dlnVqdlnP*dCp_dresultT[:num_element]*(Cp/Cv-1))[0]
+        dgamma_dresultT[0, -1] = ((-dCp_dresultT[-1]/Cv+Cp/Cv**2*dCv_dresultT_last)/dlnVqdlnP)[0]
         J['gamma', 'result_T'] = dgamma_dresultT
 
         gamma_dresultP = np.zeros((1, num_element+1))
-        gamma_dresultP[0, num_element] = Cp/Cv/dlnVqdlnP*(dCv_dresultP[0, -1]/Cv + 1/dlnVqdlnP)
+        gamma_dresultP[0, num_element] = (Cp/Cv/dlnVqdlnP*(dCv_dresultP[0, -1]/Cv + 1/dlnVqdlnP))[0]
         J['gamma', 'result_P'] = gamma_dresultP
 
 

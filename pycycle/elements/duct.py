@@ -263,7 +263,10 @@ class NewDuct(NewElement)
 
         self.add_flow_input("FL_I")
         
-        self.Fl_O = self.add_flow_output(name="FL_O", mode="total_hP")
+        self.Fl_O = self.add_flow_output(name="FL_O", 
+                                         mode="total_hP", 
+                                         thermo_method=thermo_method, 
+                                         thermo_kwargs=thermo_data)
 
 
         if expMN > 1e-10: # Calcluate pressure losses as function of Mach number
@@ -307,11 +310,14 @@ class NewDuct(NewElement)
             else:
                 outputs['dPqP'] = inputs['s_dPqP'] * inputs['MN_in']**expMN
 
-        Pt_out = nputs['Fl_I:tot:P']*(1.0 - inputs['dPqP'])
+        Pt_out = inputs['Fl_I:tot:P']*(1.0 - inputs['dPqP'])
         ht_out = inputs['Fl_I:tot:h'] + inputs['Q_dot']/inputs['W_in']        
 
+        # I think to make this JAX compatible, I need to return all the flow station data as one big np array
+        # To make that more usable, I'll probably need to have some kind of helper wrapper that matched named values to 
+        # array indices
+        FL_O_data = self.FL_O.compute(h=ht_out, P=Pt_out)
 
-        self.FL_O.compute_totals(P=Pt_out, h=ht_out)
         self.FL_O.set_flow(outputs)
 
 if __name__ == "__main__":
