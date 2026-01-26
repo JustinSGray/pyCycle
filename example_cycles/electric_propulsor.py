@@ -108,6 +108,8 @@ def viewer(prob, pt):
 
     pyc.print_nozzle(prob, [f'{pt}.nozz'])
 
+    pyc.print_balances(prob, pt)
+
 def map_plots(prob, pt):
     comp_names = ['fan']
     comp_full_names = [f'{pt}.{c}' for c in comp_names]

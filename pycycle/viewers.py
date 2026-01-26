@@ -319,7 +319,8 @@ def print_balances(prob, pt, file=sys.stdout):
     prob : om.Problem
         OpenMDAO problem containing the pyCycle model.
     pt : str
-        Name of the cycle point to inspect.
+        Name of the cycle point to inspect. All BalanceComps within this
+        point will be automatically discovered and printed.
     file : file-like
         Output file stream. Default is sys.stdout.
     """
