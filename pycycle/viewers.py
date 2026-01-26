@@ -310,6 +310,45 @@ def print_mixer(prob, element_names, file=sys.stdout):
                   file=file, flush=True)
 
 
+def _get_input_info(prob, abs_input_path, pt):
+    """
+    Get connection/promotion info for an input variable.
+
+    Returns a string with notation:
+    - "Promoted: <name>" if promoted to a different name
+    - "Conn: <name>" if connected to a source
+    - "<*input*" if neither
+    """
+    model = prob.model
+
+    # Check if input is connected to something
+    try:
+        source = model.get_source(abs_input_path)
+        if source and source != abs_input_path:
+            # Skip auto_ivc sources - these are unconnected inputs
+            if source.startswith('_auto_ivc.'):
+                return '*input*'
+            # Strip the cycle point prefix for cleaner display
+            display_source = source[len(pt)+1:] if source.startswith(pt+'.') else source
+            return f'Conn: {display_source}'
+    except (KeyError, RuntimeError):
+        pass
+
+    # Check if input is promoted
+    try:
+        abs2prom = model._var_allprocs_abs2prom['input']
+        if abs_input_path in abs2prom:
+            prom_name = abs2prom[abs_input_path]
+            # Only show if promoted name differs from the variable's local name
+            local_name = abs_input_path.split('.')[-1]
+            if prom_name != local_name and prom_name != abs_input_path:
+                return f'Promoted: {prom_name}'
+    except (KeyError, AttributeError):
+        pass
+
+    return '<unconnected>'
+
+
 def print_balances(prob, pt, file=sys.stdout):
     """
     Print all balance components and their state variables for a cycle point.
@@ -344,7 +383,16 @@ def print_balances(prob, pt, file=sys.stdout):
                 full_name = f'{bal_comp.pathname}.{var_name}'
                 # Strip the cycle point prefix for cleaner display
                 display_name = full_name[len(pt)+1:] if full_name.startswith(pt+'.') else full_name
-                units = var_info.get('units') or ''
+
+                # Get LHS and RHS input paths
+                lhs_name = var_info.get('lhs_name', f'lhs:{var_name}')
+                rhs_name = var_info.get('rhs_name', f'rhs:{var_name}')
+                lhs_path = f'{bal_comp.pathname}.{lhs_name}'
+                rhs_path = f'{bal_comp.pathname}.{rhs_name}'
+
+                # Get connection/promotion info for LHS and RHS
+                lhs_info = _get_input_info(prob, lhs_path, pt)
+                rhs_info = _get_input_info(prob, rhs_path, pt)
 
                 try:
                     val = prob.get_val(full_name)[0]
@@ -356,7 +404,7 @@ def print_balances(prob, pt, file=sys.stdout):
                 except Exception:
                     resid = float('nan')
 
-                rows.append((display_name, val, resid, units))
+                rows.append((display_name, val, resid, lhs_info, rhs_info))
 
     if not rows:
         print("No balance variables found.", file=file, flush=True)
@@ -365,20 +413,19 @@ def print_balances(prob, pt, file=sys.stdout):
     # Calculate column widths
     name_width = max(len(r[0]) for r in rows)
     name_width = max(name_width, 8)  # minimum width for "Variable" header
+    lhs_width = max(max(len(r[3]) for r in rows), 3)  # minimum width for "LHS"
+    rhs_width = max(max(len(r[4]) for r in rows), 3)  # minimum width for "RHS"
 
-    len_header = name_width + 3 + 14 + 14 + 12
+    len_header = name_width + 14 + 14 + lhs_width + rhs_width + 12  # +12 for separators
     print("-" * len_header, file=file, flush=True)
     print("BALANCES", file=file, flush=True)
     print("-" * len_header, file=file, flush=True)
 
-    header_tmpl = f'{{:<{name_width}}} | {{"Value":>12}} | {{"Resid":>12}} | {{"Units":<10}}'
-    line_tmpl = f'{{:<{name_width}}} | {{:>12.5g}} | {{:>12.4e}} | {{:<10}}'
-
-    print(f'{"Variable":<{name_width}} | {"Value":>12} | {"Resid":>12} | {"Units":<10}', file=file, flush=True)
+    print(f'{"Variable":<{name_width}} | {"Value":>12} | {"Resid":>12} | {"LHS":<{lhs_width}} | {"RHS":<{rhs_width}}', file=file, flush=True)
     print("-" * len_header, file=file, flush=True)
 
-    for display_name, val, resid, units in rows:
-        print(line_tmpl.format(display_name, val, resid, units), file=file, flush=True)
+    for display_name, val, resid, lhs_info, rhs_info in rows:
+        print(f'{display_name:<{name_width}} | {val:>12.5g} | {resid:>12.4e} | {lhs_info:<{lhs_width}} | {rhs_info:<{rhs_width}}', file=file, flush=True)
 
     print("-" * len_header, file=file, flush=True)
 
