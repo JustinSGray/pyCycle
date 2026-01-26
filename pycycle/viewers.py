@@ -336,45 +336,49 @@ def print_balances(prob, pt, file=sys.stdout):
         print("No balance components found.", file=file, flush=True)
         return
 
-    len_header = 120
-    print("-" * len_header, file=file, flush=True)
-    print("                                        BALANCE COMPONENTS", file=file, flush=True)
-    print("-" * len_header, file=file, flush=True)
-
+    # Collect all balance data first to determine column widths
+    rows = []
     for bal_comp in balance_comps:
-        print(f"\n  {bal_comp.pathname}", file=file, flush=True)
-        print("  " + "-" * 95, file=file, flush=True)
-
-        # Access balance metadata from _state_vars
         if hasattr(bal_comp, '_state_vars') and bal_comp._state_vars:
-            line_tmpl = '    {:<15} | {:>10} | {:>10} | {:>16} | {:>16} | {:>14} | {:>14}'
-            print(line_tmpl.format('Name', 'Units', 'Eq Units', 'LHS', 'RHS', 'Value', 'Residual'),
-                  file=file, flush=True)
-            print("    " + "-" * 91, file=file, flush=True)
-
             for var_name, var_info in bal_comp._state_vars.items():
-                units = var_info.get('units') or 'None'
-                eq_units = var_info.get('eq_units') or 'None'
-                lhs_name = var_info.get('lhs_name', f'lhs:{var_name}')
-                rhs_name = var_info.get('rhs_name', f'rhs:{var_name}')
+                full_name = f'{bal_comp.pathname}.{var_name}'
+                # Strip the cycle point prefix for cleaner display
+                display_name = full_name[len(pt)+1:] if full_name.startswith(pt+'.') else full_name
+                units = var_info.get('units') or ''
 
-                # Get current value
                 try:
-                    val = prob.get_val(f'{bal_comp.pathname}.{var_name}')[0]
-                    val_str = f'{val:.6g}'
+                    val = prob.get_val(full_name)[0]
                 except Exception:
-                    val_str = 'N/A'
+                    val = float('nan')
 
-                # Get residual value
                 try:
-                    resid = prob.model._residuals[f'{bal_comp.pathname}.{var_name}'][0]
-                    resid_str = f'{resid:.6g}'
+                    resid = prob.model._residuals[full_name][0]
                 except Exception:
-                    resid_str = 'N/A'
+                    resid = float('nan')
 
-                print(line_tmpl.format(var_name, str(units), str(eq_units),
-                                       lhs_name, rhs_name, val_str, resid_str),
-                      file=file, flush=True)
+                rows.append((display_name, val, resid, units))
+
+    if not rows:
+        print("No balance variables found.", file=file, flush=True)
+        return
+
+    # Calculate column widths
+    name_width = max(len(r[0]) for r in rows)
+    name_width = max(name_width, 8)  # minimum width for "Variable" header
+
+    len_header = name_width + 3 + 14 + 14 + 12
+    print("-" * len_header, file=file, flush=True)
+    print("BALANCES", file=file, flush=True)
+    print("-" * len_header, file=file, flush=True)
+
+    header_tmpl = f'{{:<{name_width}}} | {{"Value":>12}} | {{"Resid":>12}} | {{"Units":<10}}'
+    line_tmpl = f'{{:<{name_width}}} | {{:>12.5g}} | {{:>12.4e}} | {{:<10}}'
+
+    print(f'{"Variable":<{name_width}} | {"Value":>12} | {"Resid":>12} | {"Units":<10}', file=file, flush=True)
+    print("-" * len_header, file=file, flush=True)
+
+    for display_name, val, resid, units in rows:
+        print(line_tmpl.format(display_name, val, resid, units), file=file, flush=True)
 
     print("-" * len_header, file=file, flush=True)
 
