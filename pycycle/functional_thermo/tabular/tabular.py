@@ -4,7 +4,7 @@ Tabular thermodynamic property calculations using interpolation.
 
 import numpy as np
 
-from .base import ThermoInterface, TotalProps, StaticProps
+from ..base import ThermoInterface, TotalProps, StaticProps
 
 
 class TabularThermo(ThermoInterface):

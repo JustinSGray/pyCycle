@@ -8,4 +8,4 @@ compatible with JAX automatic differentiation.
 
 from .base import ThermoInterface, TotalProps, StaticProps
 from .tabular import TabularThermo
-from .cea import CEAThermo
+from .cea import CEAThermo, ThermoAdd, ThermoAddOutput
