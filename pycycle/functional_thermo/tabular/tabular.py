@@ -51,7 +51,7 @@ class TabularThermo(ThermoInterface):
 
     def _lookup(self, prop, T, P):
         """Internal lookup function."""
-        x = np.array([self.FAR, P, T])
+        x = np.array([self.FAR, float(P), float(T)])
         return self._interps[prop].interpolate(x)[0]
 
     # =========================================================================
@@ -72,7 +72,7 @@ class TabularThermo(ThermoInterface):
         P : float
             Pressure (Pa)
         """
-        x = np.array([self.FAR, P, T])
+        x = np.array([self.FAR, float(P), float(T)])
 
         # Store the linearization point
         self._lin_T = T
@@ -160,8 +160,8 @@ class TabularThermo(ThermoInterface):
             if cotan != 0.0:
                 grad = self._gradients[prop]
                 # gradients are (dProp/dFAR, dProp/dP, dProp/dT)
-                T_bar += grad[2] * cotan
-                P_bar += grad[1] * cotan
+                T_bar = T_bar + grad[2] * cotan
+                P_bar = P_bar + grad[1] * cotan
 
         return T_bar, P_bar
 
@@ -218,7 +218,7 @@ class TabularThermo(ThermoInterface):
         from scipy.optimize import brentq
 
         def residual(T):
-            return self.h(T, P) - h_target
+            return float(self.h(T, P)) - float(h_target)
 
         T_min, T_max = 150.0, 2500.0
         return brentq(residual, T_min, T_max, xtol=1e-10)
@@ -228,7 +228,7 @@ class TabularThermo(ThermoInterface):
         from scipy.optimize import brentq
 
         def residual(T):
-            return self.S(T, P) - S_target
+            return float(self.S(T, P)) - float(S_target)
 
         T_min, T_max = 150.0, 2500.0
         return brentq(residual, T_min, T_max, xtol=1e-10)
@@ -273,7 +273,7 @@ class TabularThermo(ThermoInterface):
 
         def area_residual(MN):
             props = self.static_from_MN(Tt, Pt, MN, W)
-            return props.area - area
+            return float(props.area) - float(area)
 
         # For subsonic flow, MN is between 0 and 1
         # For supersonic flow, MN is > 1
