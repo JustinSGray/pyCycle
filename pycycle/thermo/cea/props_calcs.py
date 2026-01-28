@@ -109,7 +109,7 @@ class PropsCalcs(ExplicitComponent):
         T = inputs['T']
         P = inputs['P']
         nj = inputs['n']
-        n_moles = inputs['n_moles']
+        n_moles = inputs['n_moles'][0]
         result_T = inputs['result_T']
         result_T_last = result_T[num_element]
         result_T_rest = result_T[:num_element]

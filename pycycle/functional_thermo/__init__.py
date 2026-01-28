@@ -5,7 +5,12 @@ This module provides a common interface for computing thermodynamic properties
 using different methods (Tabular, CEA). The interface is designed to be
 compatible with JAX automatic differentiation.
 
-Units Convention (SI):
+The thermo classes work internally in SI units but can accept inputs and
+return outputs in different unit systems via the `input_units` parameter:
+    - 'SI': SI units (default)
+    - 'English': pyCycle English units (degR, psi, Btu/lbm, etc.)
+
+Internal Units (SI):
     T - Temperature (K)
     P - Pressure (Pa)
     h - Enthalpy (J/kg)
@@ -22,6 +27,7 @@ Units Convention (SI):
 """
 
 from .base import ThermoInterface, TotalProps, StaticProps
+from .units import UnitConverter, SI_UNITS, ENGLISH_UNITS
 from .tabular import TabularThermo
 from .tabular import ThermoAdd as TabularThermoAdd
 from .tabular import ThermoAddOutput as TabularThermoAddOutput

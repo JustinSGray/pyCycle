@@ -96,7 +96,7 @@ class PropsRHS(ExplicitComponent):
 
         # rhs for P
         outputs['rhs_P'][:num_element] = b0
-        outputs['rhs_P'][num_element] = inputs['n_moles']
+        outputs['rhs_P'][num_element] = inputs['n_moles'][0]
 
         # rhs for T
         self.H0_T = H0_T = thermo.H0(T)
