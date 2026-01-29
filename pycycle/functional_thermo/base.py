@@ -28,7 +28,8 @@ from openmdao.utils.units import unit_conversion
 
 # Named tuples for returning grouped properties
 TotalProps = namedtuple('TotalProps', ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R'])
-StaticProps = namedtuple('StaticProps', ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area'])
+StaticProps = namedtuple('StaticProps', ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                                          'gamma', 'Cp', 'Cv', 'S', 'R'])
 
 # SI units (internal)
 _SI_UNITS = {
@@ -191,6 +192,11 @@ class ThermoInterface:
             V=props.V * self._V_from_si,
             Vsonic=props.Vsonic * self._V_from_si,
             area=props.area * self._area_from_si,
+            gamma=props.gamma,  # dimensionless
+            Cp=props.Cp * self._S_from_si,  # same units as S
+            Cv=props.Cv * self._S_from_si,
+            S=props.S * self._S_from_si,
+            R=props.R * self._S_from_si,
         )
 
     # =========================================================================

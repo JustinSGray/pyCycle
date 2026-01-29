@@ -254,21 +254,27 @@ class TabularThermo(ThermoInterface):
         Ts = Tt_si * temp_ratio
         Ps = Pt_si * temp_ratio**(gam / (gam - 1.0))
 
-        # Get static enthalpy
+        # Full static properties at static T and P
         hs = self._lookup_si('h', Ts, Ps)
+        S_s = self._lookup_si('S', Ts, Ps)
+        gam_s = self._lookup_si('gamma', Ts, Ps)
+        Cp_s = self._lookup_si('Cp', Ts, Ps)
+        Cv_s = self._lookup_si('Cv', Ts, Ps)
+        R_s = self._lookup_si('R', Ts, Ps)
 
-        # Speed of sound and velocity
-        Vsonic = np.sqrt(gam * R_gas * Ts)
+        # Speed of sound and velocity (use static properties)
+        Vsonic = np.sqrt(gam_s * R_s * Ts)
         V = MN * Vsonic
 
         # Density from ideal gas law
-        rhos = Ps / (R_gas * Ts)
+        rhos = Ps / (R_s * Ts)
 
         # Area from continuity
         area = W_si / (rhos * V) if V > 0 else np.inf
 
         return StaticProps(Ts=Ts, Ps=Ps, hs=hs, rhos=rhos,
-                          MN=MN, V=V, Vsonic=Vsonic, area=area)
+                          MN=MN, V=V, Vsonic=Vsonic, area=area,
+                          gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_s, R=R_s)
 
     def static_from_MN(self, Tt, Pt, MN, W):
         """Compute static properties from total conditions and Mach number."""
@@ -314,33 +320,38 @@ class TabularThermo(ThermoInterface):
         Ps_si = Ps * self._P_to_si
         W_si = W * self._W_to_si
 
-        # Get gamma at total conditions
+        # Get gamma at total conditions for isentropic relation
         gam = self._lookup_si('gamma', Tt_si, Pt_si)
-        R_gas = self._lookup_si('R', Tt_si, Pt_si)
 
         # From isentropic relation
         pressure_ratio = Ps_si / Pt_si
         Ts = Tt_si * pressure_ratio**((gam - 1.0) / gam)
 
-        # Get static enthalpy
+        # Full static properties at static T and P
         hs = self._lookup_si('h', Ts, Ps_si)
+        S_s = self._lookup_si('S', Ts, Ps_si)
+        gam_s = self._lookup_si('gamma', Ts, Ps_si)
+        Cp_s = self._lookup_si('Cp', Ts, Ps_si)
+        Cv_s = self._lookup_si('Cv', Ts, Ps_si)
+        R_s = self._lookup_si('R', Ts, Ps_si)
 
         # Compute Mach number from temperature ratio
         temp_ratio = Ts / Tt_si
         MN_sq = 2.0 / (gam - 1.0) * (1.0 / temp_ratio - 1.0)
         MN = np.sqrt(max(0.0, MN_sq))
 
-        # Speed of sound and velocity
-        Vsonic = np.sqrt(gam * R_gas * Ts)
+        # Speed of sound and velocity (use static properties)
+        Vsonic = np.sqrt(gam_s * R_s * Ts)
         V = MN * Vsonic
 
         # Density from ideal gas law
-        rhos = Ps_si / (R_gas * Ts)
+        rhos = Ps_si / (R_s * Ts)
 
         # Area from continuity
         area = W_si / (rhos * V) if V > 0 else np.inf
 
         props_si = StaticProps(Ts=Ts, Ps=Ps_si, hs=hs, rhos=rhos,
-                              MN=MN, V=V, Vsonic=Vsonic, area=area)
+                              MN=MN, V=V, Vsonic=Vsonic, area=area,
+                              gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_s, R=R_s)
 
         return self._convert_static_props_from_si(props_si)
