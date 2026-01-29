@@ -6,6 +6,11 @@ import openmdao.api as om
 
 import pycycle.api as pyc
 
+# Import timing stats for profiling
+from pycycle.jax_element_base import print_timing_stats, reset_timing_stats
+from pycycle.elements.duct import print_duct_timing_stats, reset_duct_timing_stats
+from pycycle.functional_thermo.jax_wrappers import print_jax_thermo_timing, reset_jax_thermo_timing
+
 
 class HBTF(pyc.Cycle):
 
@@ -37,6 +42,9 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('fc', pyc.FlightConditions())
         self.add_subsystem('inlet', pyc.Inlet())
 
+
+        duct_class=pyc.NewDuct
+
         # Note variable promotion for the fan --
         # the LP spool speed and the fan speed are INPUTS that are promoted:
         # Note here that promotion aliases are used. Here Nmech is being aliased to LP_Nmech
@@ -44,24 +52,24 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('fan', pyc.Compressor(map_data=pyc.FanMap,
                                         bleed_names=[], map_extrap=True), promotes_inputs=[('Nmech','LP_Nmech')])
         self.add_subsystem('splitter', pyc.Splitter())
-        self.add_subsystem('duct4', pyc.NewDuct())
+        self.add_subsystem('duct4', duct_class())
         self.add_subsystem('lpc', pyc.Compressor(map_data=pyc.LPCMap,
                                         map_extrap=True),promotes_inputs=[('Nmech','LP_Nmech')])
-        self.add_subsystem('duct6', pyc.Duct())
+        self.add_subsystem('duct6', duct_class())
         self.add_subsystem('hpc', pyc.Compressor(map_data=pyc.HPCMap,
                                         bleed_names=['cool1','cool2','cust'], map_extrap=True),promotes_inputs=[('Nmech','HP_Nmech')])
         self.add_subsystem('bld3', pyc.BleedOut(bleed_names=['cool3','cool4']))
         self.add_subsystem('burner', pyc.Combustor(fuel_type=FUEL_TYPE))
         self.add_subsystem('hpt', pyc.Turbine(map_data=pyc.HPTMap,
                                         bleed_names=['cool3','cool4'], map_extrap=True),promotes_inputs=[('Nmech','HP_Nmech')])
-        self.add_subsystem('duct11', pyc.Duct())
+        self.add_subsystem('duct11', duct_class())
         self.add_subsystem('lpt', pyc.Turbine(map_data=pyc.LPTMap,
                                         bleed_names=['cool1','cool2'], map_extrap=True),promotes_inputs=[('Nmech','LP_Nmech')])
-        self.add_subsystem('duct13', pyc.Duct())
+        self.add_subsystem('duct13', duct_class())
         self.add_subsystem('core_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 
         self.add_subsystem('byp_bld', pyc.BleedOut(bleed_names=['bypBld']))
-        self.add_subsystem('duct15', pyc.Duct())
+        self.add_subsystem('duct15', duct_class())
         self.add_subsystem('byp_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 
         #Create shaft instances. Note that LP shaft has 3 ports! => no gearbox
@@ -433,6 +441,11 @@ if __name__ == "__main__":
 
     st = time.time()
 
+    # Reset timing stats before the run
+    reset_timing_stats()
+    reset_duct_timing_stats()
+    reset_jax_thermo_timing()
+
     prob.set_solver_print(level=-1)
     prob.set_solver_print(level=2, depth=2)
 
@@ -481,3 +494,8 @@ if __name__ == "__main__":
 
     print()
     print("Run time", time.time() - st)
+
+    # Print timing stats
+    print_timing_stats()       # JaxElement (NewDuct) timing
+    print_jax_thermo_timing()  # JaxThermo internal timing
+    print_duct_timing_stats()  # Original Duct timing

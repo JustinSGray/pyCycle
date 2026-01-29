@@ -312,6 +312,301 @@ class TabularThermo(ThermoInterface):
 
         return self._convert_static_props_from_si(props_si)
 
+    # =========================================================================
+    # Analytical derivatives for static properties
+    # =========================================================================
+
+    def linearize_static_MN(self, Tt, Pt, MN, W):
+        """
+        Compute and cache gradients for static_from_MN at the given state.
+
+        The static_from_MN calculation is explicit (no solver), so we can
+        differentiate directly using the chain rule through:
+        1. Isentropic relations: Ts(Tt, MN, gamma), Ps(Pt, MN, gamma)
+        2. Property lookups at (Ts, Ps)
+        3. Flow relations: V, Vsonic, rhos, area
+        """
+        # Convert inputs to SI
+        Tt_si = self._convert_T_to_si(Tt)
+        Pt_si = Pt * self._P_to_si
+        W_si = W * self._W_to_si
+
+        # Get gamma at total conditions
+        gam = self._lookup_si('gamma', Tt_si, Pt_si)
+        R_tot = self._lookup_si('R', Tt_si, Pt_si)
+
+        # Linearize at total conditions for dgamma/dTt, dgamma/dPt
+        x_tot = np.array([self.FAR, float(Pt_si), float(Tt_si)])
+        grad_gam_tot = self._interps['gamma'].gradient(x_tot)  # (dg/dFAR, dg/dP, dg/dT)
+        grad_R_tot = self._interps['R'].gradient(x_tot)
+
+        dgam_dTt = grad_gam_tot[2] * self._T_to_si  # Convert to input units
+        dgam_dPt = grad_gam_tot[1] * self._P_to_si
+
+        # Isentropic relations
+        MN2 = MN ** 2
+        gm1 = gam - 1.0
+        gm1_half = gm1 / 2.0
+        denom = 1.0 + gm1_half * MN2
+        temp_ratio = 1.0 / denom
+
+        Ts_si = Tt_si * temp_ratio
+        exp = gam / gm1
+        Ps_si = Pt_si * temp_ratio ** exp
+
+        # Derivatives of temp_ratio w.r.t. inputs
+        # temp_ratio = 1 / (1 + (gam-1)/2 * MN^2)
+        # d(temp_ratio)/dMN = -(gam-1) * MN / denom^2
+        # d(temp_ratio)/dgam = -MN^2 / (2 * denom^2)
+        dtr_dMN = -gm1 * MN / (denom ** 2)
+        dtr_dgam = -MN2 / (2.0 * denom ** 2)
+
+        # Derivatives of Ts w.r.t. inputs (Ts = Tt * temp_ratio)
+        # All derivatives should be in input units (e.g., degR/degR, degR/psi, degR/MN)
+        dTs_dTt = temp_ratio + Tt_si * dtr_dgam * dgam_dTt / self._T_to_si
+        dTs_dPt = Tt_si * dtr_dgam * dgam_dPt / self._P_to_si
+        dTs_dMN = Tt_si * dtr_dMN * self._T_from_si  # Convert T_si to T_input
+
+        # Derivatives of Ps w.r.t. inputs
+        # Ps = Pt * temp_ratio^exp, exp = gam/(gam-1)
+        # d(exp)/dgam = -1/(gam-1)^2
+        dexp_dgam = -1.0 / (gm1 ** 2)
+        ln_tr = np.log(temp_ratio) if temp_ratio > 0 else 0.0
+
+        # d(Ps)/dPt = temp_ratio^exp + Pt * exp * temp_ratio^(exp-1) * dtr/dgam * dgam/dPt
+        #           + Pt * temp_ratio^exp * ln(temp_ratio) * dexp/dgam * dgam/dPt
+        dPs_dPt_base = temp_ratio ** exp
+        dPs_dPt = dPs_dPt_base + Pt_si * (
+            exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dPt +
+            temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dPt
+        ) / self._P_to_si
+
+        dPs_dTt = Pt_si * (
+            exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dTt +
+            temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dTt
+        ) * self._P_from_si  # Convert P_si to P_input (was incorrectly / _T_to_si)
+
+        dPs_dMN = Pt_si * exp * temp_ratio ** (exp - 1) * dtr_dMN * self._P_from_si  # Convert P_si to P_input
+
+        # Get static properties and their gradients at (Ts, Ps)
+        x_stat = np.array([self.FAR, float(Ps_si), float(Ts_si)])
+        grad_hs = self._interps['h'].gradient(x_stat)
+        grad_Ss = self._interps['S'].gradient(x_stat)
+        grad_gams = self._interps['gamma'].gradient(x_stat)
+        grad_Cps = self._interps['Cp'].gradient(x_stat)
+        grad_Cvs = self._interps['Cv'].gradient(x_stat)
+        grad_Rs = self._interps['R'].gradient(x_stat)
+        grad_rhos = self._interps['rho'].gradient(x_stat)
+
+        # Static property values
+        hs_si = self._lookup_si('h', Ts_si, Ps_si)
+        gam_s = self._lookup_si('gamma', Ts_si, Ps_si)
+        R_s = self._lookup_si('R', Ts_si, Ps_si)
+
+        # Flow calculations
+        Vsonic_si = np.sqrt(gam_s * R_s * Ts_si)
+        V_si = MN * Vsonic_si
+        rhos_si = Ps_si / (R_s * Ts_si)
+        area_si = W_si / (rhos_si * V_si) if V_si > 0 else np.inf
+
+        # Store all the cached values needed for JVP
+        self._static_MN_cache = {
+            # Input values (SI)
+            'Tt_si': Tt_si, 'Pt_si': Pt_si, 'MN': MN, 'W_si': W_si,
+            # Intermediate values
+            'gam': gam, 'temp_ratio': temp_ratio, 'exp': exp,
+            'Ts_si': Ts_si, 'Ps_si': Ps_si,
+            'gam_s': gam_s, 'R_s': R_s,
+            'Vsonic_si': Vsonic_si, 'V_si': V_si, 'rhos_si': rhos_si, 'area_si': area_si,
+            # Gradients of Ts, Ps w.r.t. inputs (in input units)
+            'dTs_dTt': dTs_dTt, 'dTs_dPt': dTs_dPt, 'dTs_dMN': dTs_dMN,
+            'dPs_dTt': dPs_dTt, 'dPs_dPt': dPs_dPt, 'dPs_dMN': dPs_dMN,
+            # Gradients of static properties w.r.t. (Ts, Ps) in SI
+            'grad_hs': grad_hs, 'grad_Ss': grad_Ss, 'grad_gams': grad_gams,
+            'grad_Cps': grad_Cps, 'grad_Cvs': grad_Cvs, 'grad_Rs': grad_Rs,
+            'grad_rhos': grad_rhos,
+        }
+
+    def jacobian_static_MN(self):
+        """
+        Return the full Jacobian matrix for static_from_MN.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping property names to arrays of 4 partial derivatives
+            [d/dTt, d/dPt, d/dMN, d/dW]
+        """
+        if not hasattr(self, '_static_MN_cache'):
+            raise RuntimeError("Must call linearize_static_MN() before jacobian_static_MN()")
+
+        # Compute all four JVPs efficiently
+        jvp_Tt = self.jvp_static_MN(1.0, 0.0, 0.0, 0.0)
+        jvp_Pt = self.jvp_static_MN(0.0, 1.0, 0.0, 0.0)
+        jvp_MN = self.jvp_static_MN(0.0, 0.0, 1.0, 0.0)
+        jvp_W = self.jvp_static_MN(0.0, 0.0, 0.0, 1.0)
+
+        result = {}
+        for prop in ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                     'gamma', 'Cp', 'Cv', 'S', 'R']:
+            result[prop] = np.array([jvp_Tt[prop], jvp_Pt[prop], jvp_MN[prop], jvp_W[prop]])
+
+        return result
+
+    def jvp_static_MN(self, Tt_dot, Pt_dot, MN_dot, W_dot):
+        """
+        Compute JVP for static_from_MN using cached linearization.
+        """
+        if not hasattr(self, '_static_MN_cache'):
+            raise RuntimeError("Must call linearize_static_MN() before jvp_static_MN()")
+
+        c = self._static_MN_cache
+
+        # Derivatives of Ts, Ps w.r.t. inputs
+        Ts_dot_si = (c['dTs_dTt'] * Tt_dot + c['dTs_dPt'] * Pt_dot +
+                     c['dTs_dMN'] * MN_dot) * self._T_to_si
+        Ps_dot_si = (c['dPs_dTt'] * Tt_dot + c['dPs_dPt'] * Pt_dot +
+                     c['dPs_dMN'] * MN_dot) * self._P_to_si
+
+        # Chain rule for static properties: dprop = dprop/dTs * Ts_dot + dprop/dPs * Ps_dot
+        def chain_rule(grad):
+            # grad is (dProp/dFAR, dProp/dPs, dProp/dTs) in SI
+            return grad[2] * Ts_dot_si + grad[1] * Ps_dot_si
+
+        hs_dot_si = chain_rule(c['grad_hs'])
+        Ss_dot_si = chain_rule(c['grad_Ss'])
+        gams_dot = chain_rule(c['grad_gams'])
+        Cps_dot_si = chain_rule(c['grad_Cps'])
+        Cvs_dot_si = chain_rule(c['grad_Cvs'])
+        Rs_dot_si = chain_rule(c['grad_Rs'])
+
+        # Vsonic = sqrt(gam_s * R_s * Ts)
+        # d(Vsonic) = 1/(2*Vsonic) * (R_s*Ts * dgam_s + gam_s*Ts * dR_s + gam_s*R_s * dTs)
+        Vsonic = c['Vsonic_si']
+        gam_s, R_s, Ts_si = c['gam_s'], c['R_s'], c['Ts_si']
+        if Vsonic > 0:
+            Vsonic_dot_si = (R_s * Ts_si * gams_dot + gam_s * Ts_si * Rs_dot_si +
+                            gam_s * R_s * Ts_dot_si) / (2 * Vsonic)
+        else:
+            Vsonic_dot_si = 0.0
+
+        # V = MN * Vsonic
+        V_dot_si = MN_dot * Vsonic + c['MN'] * Vsonic_dot_si
+
+        # rhos = Ps / (R_s * Ts) = Ps * R_s^(-1) * Ts^(-1)
+        # d(rhos) = dPs/(R*T) - Ps*dR/(R^2*T) - Ps*dT/(R*T^2)
+        Ps_si, rhos_si = c['Ps_si'], c['rhos_si']
+        rhos_dot_si = (Ps_dot_si / (R_s * Ts_si) -
+                       Ps_si * Rs_dot_si / (R_s ** 2 * Ts_si) -
+                       Ps_si * Ts_dot_si / (R_s * Ts_si ** 2))
+
+        # area = W / (rhos * V)
+        # d(area) = dW/(rhos*V) - W*drhos/(rhos^2*V) - W*dV/(rhos*V^2)
+        W_si, V_si, area_si = c['W_si'], c['V_si'], c['area_si']
+        W_dot_si = W_dot * self._W_to_si
+        if V_si > 0 and rhos_si > 0:
+            area_dot_si = (W_dot_si / (rhos_si * V_si) -
+                          W_si * rhos_dot_si / (rhos_si ** 2 * V_si) -
+                          W_si * V_dot_si / (rhos_si * V_si ** 2))
+        else:
+            area_dot_si = 0.0
+
+        # Convert to output units
+        return {
+            'Ts': Ts_dot_si * self._T_from_si,
+            'Ps': Ps_dot_si * self._P_from_si,
+            'hs': hs_dot_si * self._h_from_si,
+            'rhos': rhos_dot_si * self._rho_from_si,
+            'MN': MN_dot,  # MN is dimensionless and directly input
+            'V': V_dot_si * self._V_from_si,
+            'Vsonic': Vsonic_dot_si * self._V_from_si,
+            'area': area_dot_si * self._area_from_si,
+            'gamma': gams_dot,
+            'Cp': Cps_dot_si * self._S_from_si,
+            'Cv': Cvs_dot_si * self._S_from_si,
+            'S': Ss_dot_si * self._S_from_si,
+            'R': Rs_dot_si * self._S_from_si,
+        }
+
+    def linearize_static_area(self, Tt, Pt, area, W):
+        """
+        Compute and cache gradients for static_from_area.
+
+        This uses implicit differentiation since MN is solved via brentq.
+        The implicit constraint is: area_computed(MN) = area_target
+        Using implicit function theorem: dMN/dx = -[d(area)/dMN]^(-1) * d(area)/dx
+        """
+        # First compute the solution to get MN
+        props = self.static_from_area(Tt, Pt, area, W)
+        MN = props.MN
+
+        # Now linearize static_from_MN at this MN
+        self.linearize_static_MN(Tt, Pt, MN, W)
+        c = self._static_MN_cache
+
+        # Get d(area)/dMN from the static_from_MN linearization
+        # We need to compute the JVP with only MN_dot = 1
+        jvp_MN = self.jvp_static_MN(0.0, 0.0, 1.0, 0.0)
+        darea_dMN = jvp_MN['area']
+
+        # Get d(area)/d(Tt, Pt, W) from static_from_MN linearization
+        jvp_Tt = self.jvp_static_MN(1.0, 0.0, 0.0, 0.0)
+        jvp_Pt = self.jvp_static_MN(0.0, 1.0, 0.0, 0.0)
+        jvp_W = self.jvp_static_MN(0.0, 0.0, 0.0, 1.0)
+
+        darea_dTt = jvp_Tt['area']
+        darea_dPt = jvp_Pt['area']
+        darea_dW = jvp_W['area']
+
+        # Implicit function theorem: dMN/dx = -darea_dx / darea_dMN
+        # For area_target: constraint is area_computed - area_target = 0
+        # So dMN/d(area_target) = +1 / darea_dMN (positive!)
+        if abs(darea_dMN) > 1e-20:
+            dMN_dTt = -darea_dTt / darea_dMN
+            dMN_dPt = -darea_dPt / darea_dMN
+            dMN_darea = 1.0 / darea_dMN  # Fixed: was -1.0, should be +1.0
+            dMN_dW = -darea_dW / darea_dMN
+        else:
+            dMN_dTt = dMN_dPt = dMN_darea = dMN_dW = 0.0
+
+        # Store the implicit derivatives
+        self._static_area_cache = {
+            'MN': MN,
+            'dMN_dTt': dMN_dTt,
+            'dMN_dPt': dMN_dPt,
+            'dMN_darea': dMN_darea,
+            'dMN_dW': dMN_dW,
+            # Also store the per-input JVPs from static_from_MN for total derivatives
+            'jvp_Tt': jvp_Tt,
+            'jvp_Pt': jvp_Pt,
+            'jvp_MN': jvp_MN,
+            'jvp_W': jvp_W,
+        }
+
+    def jvp_static_area(self, Tt_dot, Pt_dot, area_dot, W_dot):
+        """
+        Compute JVP for static_from_area using cached linearization.
+        """
+        if not hasattr(self, '_static_area_cache'):
+            raise RuntimeError("Must call linearize_static_area() before jvp_static_area()")
+
+        c = self._static_area_cache
+
+        # Compute MN_dot using implicit function theorem
+        MN_dot = (c['dMN_dTt'] * Tt_dot + c['dMN_dPt'] * Pt_dot +
+                  c['dMN_darea'] * area_dot + c['dMN_dW'] * W_dot)
+
+        # Total derivative = direct effect + effect through MN
+        # d(output)/d(input) = partial(output)/partial(input) + partial(output)/partial(MN) * dMN/d(input)
+        result = {}
+        for prop in ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R']:
+            result[prop] = (c['jvp_Tt'][prop] * Tt_dot +
+                           c['jvp_Pt'][prop] * Pt_dot +
+                           c['jvp_MN'][prop] * MN_dot +
+                           c['jvp_W'][prop] * W_dot)
+
+        return result
+
     def static_from_Ps(self, Tt, Pt, Ps, W):
         """Compute static properties from total conditions and static pressure."""
         # Convert inputs to SI

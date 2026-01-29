@@ -254,5 +254,109 @@ class TabularThermoLinearizeTestCase(unittest.TestCase):
         self.assertAlmostEqual(jvp['h'], dh_dT_fd, places=4)
 
 
+class TabularThermoStaticDerivativesTestCase(unittest.TestCase):
+    """Test derivatives of static property calculations against finite difference."""
+
+    def setUp(self):
+        self.thermo = TabularThermo(FAR=0.0, input_units='English')
+        self.Tt = 500.0  # degR
+        self.Pt = 14.696  # psi
+        self.W = 100.0  # lbm/s
+        self.MN = 0.5
+        self.h = 1e-6  # FD step size
+
+    def test_static_from_MN_derivatives_dTt(self):
+        """Test static_from_MN derivatives w.r.t. Tt against FD."""
+        self.thermo.linearize_static_MN(self.Tt, self.Pt, self.MN, self.W)
+        jvp = self.thermo.jvp_static_MN(1.0, 0.0, 0.0, 0.0)
+
+        # Finite difference
+        props_p = self.thermo.static_from_MN(self.Tt + self.h, self.Pt, self.MN, self.W)
+        props_m = self.thermo.static_from_MN(self.Tt - self.h, self.Pt, self.MN, self.W)
+
+        for prop in ['Ts', 'Ps', 'hs', 'V', 'Vsonic', 'area', 'gamma']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-4, f"d{prop}/dTt: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+    def test_static_from_MN_derivatives_dPt(self):
+        """Test static_from_MN derivatives w.r.t. Pt against FD."""
+        self.thermo.linearize_static_MN(self.Tt, self.Pt, self.MN, self.W)
+        jvp = self.thermo.jvp_static_MN(0.0, 1.0, 0.0, 0.0)
+
+        props_p = self.thermo.static_from_MN(self.Tt, self.Pt + self.h, self.MN, self.W)
+        props_m = self.thermo.static_from_MN(self.Tt, self.Pt - self.h, self.MN, self.W)
+
+        for prop in ['Ts', 'Ps', 'hs', 'V', 'Vsonic', 'area', 'gamma']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-4, f"d{prop}/dPt: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+    def test_static_from_MN_derivatives_dMN(self):
+        """Test static_from_MN derivatives w.r.t. MN against FD."""
+        self.thermo.linearize_static_MN(self.Tt, self.Pt, self.MN, self.W)
+        jvp = self.thermo.jvp_static_MN(0.0, 0.0, 1.0, 0.0)
+
+        props_p = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN + self.h, self.W)
+        props_m = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN - self.h, self.W)
+
+        for prop in ['Ts', 'Ps', 'hs', 'V', 'Vsonic', 'area', 'gamma']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-4, f"d{prop}/dMN: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+    def test_static_from_MN_derivatives_dW(self):
+        """Test static_from_MN derivatives w.r.t. W against FD."""
+        self.thermo.linearize_static_MN(self.Tt, self.Pt, self.MN, self.W)
+        jvp = self.thermo.jvp_static_MN(0.0, 0.0, 0.0, 1.0)
+
+        props_p = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W + self.h)
+        props_m = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W - self.h)
+
+        for prop in ['Ts', 'Ps', 'hs', 'V', 'Vsonic', 'area', 'gamma']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-4, f"d{prop}/dW: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+    def test_static_from_area_derivatives_dTt(self):
+        """Test static_from_area derivatives w.r.t. Tt against FD."""
+        # Get a valid area
+        props_mn = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W)
+        area = props_mn.area
+
+        self.thermo.linearize_static_area(self.Tt, self.Pt, area, self.W)
+        jvp = self.thermo.jvp_static_area(1.0, 0.0, 0.0, 0.0)
+
+        props_p = self.thermo.static_from_area(self.Tt + self.h, self.Pt, area, self.W)
+        props_m = self.thermo.static_from_area(self.Tt - self.h, self.Pt, area, self.W)
+
+        for prop in ['Ts', 'Ps', 'MN', 'V', 'Vsonic']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-4, f"d{prop}/dTt: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+    def test_static_from_area_derivatives_darea(self):
+        """Test static_from_area derivatives w.r.t. area against FD."""
+        props_mn = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W)
+        area = props_mn.area
+
+        self.thermo.linearize_static_area(self.Tt, self.Pt, area, self.W)
+        jvp = self.thermo.jvp_static_area(0.0, 0.0, 1.0, 0.0)
+
+        props_p = self.thermo.static_from_area(self.Tt, self.Pt, area + self.h, self.W)
+        props_m = self.thermo.static_from_area(self.Tt, self.Pt, area - self.h, self.W)
+
+        for prop in ['Ts', 'Ps', 'MN', 'V', 'Vsonic', 'area']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-4, f"d{prop}/darea: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+
 if __name__ == "__main__":
     unittest.main()

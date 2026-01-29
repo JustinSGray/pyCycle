@@ -1,14 +1,56 @@
 """ Class definition for a Duct."""
 
 import numpy as np
+import time
 
-import openmdao.api as om 
+import openmdao.api as om
 
 from pycycle.thermo.cea import species_data
 from pycycle.thermo.thermo import Thermo
 from pycycle.flow_in import FlowIn
 from pycycle.passthrough import PassThrough
 from pycycle.element_base import Element
+
+# Module-level timing accumulators
+_duct_timing_stats = {
+    'mach_loss_compute_calls': 0,
+    'mach_loss_compute_time': 0.0,
+    'mach_loss_partials_calls': 0,
+    'mach_loss_partials_time': 0.0,
+    'p_loss_compute_calls': 0,
+    'p_loss_compute_time': 0.0,
+    'p_loss_partials_calls': 0,
+    'p_loss_partials_time': 0.0,
+    'q_calc_compute_calls': 0,
+    'q_calc_compute_time': 0.0,
+    'q_calc_partials_calls': 0,
+    'q_calc_partials_time': 0.0,
+}
+
+def reset_duct_timing_stats():
+    """Reset all timing statistics."""
+    for key in _duct_timing_stats:
+        _duct_timing_stats[key] = 0.0 if 'time' in key else 0
+
+def print_duct_timing_stats():
+    """Print timing statistics."""
+    print("\n=== Original Duct Timing Stats ===")
+    print("MachPressureLossMap:")
+    print(f"  compute() calls: {_duct_timing_stats['mach_loss_compute_calls']}")
+    print(f"  compute() total time: {_duct_timing_stats['mach_loss_compute_time']*1000:.3f} ms")
+    print(f"  compute_partials() calls: {_duct_timing_stats['mach_loss_partials_calls']}")
+    print(f"  compute_partials() total time: {_duct_timing_stats['mach_loss_partials_time']*1000:.3f} ms")
+    print("PressureLoss:")
+    print(f"  compute() calls: {_duct_timing_stats['p_loss_compute_calls']}")
+    print(f"  compute() total time: {_duct_timing_stats['p_loss_compute_time']*1000:.3f} ms")
+    print(f"  compute_partials() calls: {_duct_timing_stats['p_loss_partials_calls']}")
+    print(f"  compute_partials() total time: {_duct_timing_stats['p_loss_partials_time']*1000:.3f} ms")
+    print("qCalc:")
+    print(f"  compute() calls: {_duct_timing_stats['q_calc_compute_calls']}")
+    print(f"  compute() total time: {_duct_timing_stats['q_calc_compute_time']*1000:.3f} ms")
+    print(f"  compute_partials() calls: {_duct_timing_stats['q_calc_partials_calls']}")
+    print(f"  compute_partials() total time: {_duct_timing_stats['q_calc_partials_time']*1000:.3f} ms")
+    print("==================================\n")
 
 class MachPressureLossMap(om.ExplicitComponent):
     """
@@ -39,6 +81,8 @@ class MachPressureLossMap(om.ExplicitComponent):
             self.declare_partials('dPqP', ['s_dPqP', 'MN_in'])
 
     def compute(self, inputs, outputs):
+        t_start = time.perf_counter()
+
         design = self.options['design']
         expMN = self.options['expMN']
 
@@ -47,7 +91,12 @@ class MachPressureLossMap(om.ExplicitComponent):
         else:
             outputs['dPqP'] = inputs['s_dPqP'] * inputs['MN_in']**expMN
 
+        _duct_timing_stats['mach_loss_compute_calls'] += 1
+        _duct_timing_stats['mach_loss_compute_time'] += (time.perf_counter() - t_start)
+
     def compute_partials(self, inputs, J):
+        t_start = time.perf_counter()
+
         design = self.options['design']
         expMN = self.options['expMN']
 
@@ -57,6 +106,9 @@ class MachPressureLossMap(om.ExplicitComponent):
         else:
             J['dPqP', 's_dPqP'] = inputs['MN_in']**expMN
             J['dPqP', 'MN_in'] = expMN * inputs['s_dPqP'] * inputs['MN_in']**(expMN-1.0)
+
+        _duct_timing_stats['mach_loss_partials_calls'] += 1
+        _duct_timing_stats['mach_loss_partials_time'] += (time.perf_counter() - t_start)
 
 class PressureLoss(om.ExplicitComponent):
     """
@@ -75,11 +127,21 @@ class PressureLoss(om.ExplicitComponent):
         self.declare_partials('Pt_out', '*')
 
     def compute(self, inputs, outputs):
+        t_start = time.perf_counter()
+
         outputs['Pt_out'] = inputs['Pt_in']*(1.0 - inputs['dPqP'])
 
+        _duct_timing_stats['p_loss_compute_calls'] += 1
+        _duct_timing_stats['p_loss_compute_time'] += (time.perf_counter() - t_start)
+
     def compute_partials(self, inputs, J):
+        t_start = time.perf_counter()
+
         J['Pt_out', 'dPqP'] = -inputs['Pt_in']
         J['Pt_out', 'Pt_in'] = 1.0 - inputs['dPqP']
+
+        _duct_timing_stats['p_loss_partials_calls'] += 1
+        _duct_timing_stats['p_loss_partials_time'] += (time.perf_counter() - t_start)
 
 
 class qCalc(om.ExplicitComponent):
@@ -100,12 +162,22 @@ class qCalc(om.ExplicitComponent):
         self.declare_partials('ht_out', '*')
 
     def compute(self, inputs, outputs):
+        t_start = time.perf_counter()
+
         outputs['ht_out'] = inputs['ht_in'] + inputs['Q_dot']/inputs['W_in']
 
+        _duct_timing_stats['q_calc_compute_calls'] += 1
+        _duct_timing_stats['q_calc_compute_time'] += (time.perf_counter() - t_start)
+
     def compute_partials(self, inputs, J):
+        t_start = time.perf_counter()
+
         J['ht_out','W_in'] = -inputs['Q_dot']/(inputs['W_in']**2)
         J['ht_out','Q_dot'] = 1.0/inputs['W_in']
         J['ht_out','ht_in'] = 1.0
+
+        _duct_timing_stats['q_calc_partials_calls'] += 1
+        _duct_timing_stats['q_calc_partials_time'] += (time.perf_counter() - t_start)
 
 
 class Duct(Element):

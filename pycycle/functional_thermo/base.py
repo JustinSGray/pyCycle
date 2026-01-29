@@ -430,3 +430,73 @@ class ThermoInterface:
             (T_bar, P_bar) - gradients with respect to T and P
         """
         raise NotImplementedError("Subclass must implement vjp")
+
+    # =========================================================================
+    # Static property derivatives (analytical)
+    # =========================================================================
+
+    def linearize_static_MN(self, Tt, Pt, MN, W):
+        """
+        Compute and cache gradients for static_from_MN at the given state.
+
+        Parameters
+        ----------
+        Tt : float
+            Total temperature (in input units)
+        Pt : float
+            Total pressure (in input units)
+        MN : float
+            Mach number (-)
+        W : float
+            Mass flow rate (in input units)
+        """
+        raise NotImplementedError("Subclass must implement linearize_static_MN")
+
+    def jvp_static_MN(self, Tt_dot, Pt_dot, MN_dot, W_dot):
+        """
+        Compute JVP for static_from_MN. Must call linearize_static_MN() first.
+
+        Parameters
+        ----------
+        Tt_dot, Pt_dot, MN_dot, W_dot : float
+            Tangent vectors for each input
+
+        Returns
+        -------
+        dict
+            Dictionary of property tangents: {'Ts': Ts_dot, 'Ps': Ps_dot, ...}
+        """
+        raise NotImplementedError("Subclass must implement jvp_static_MN")
+
+    def linearize_static_area(self, Tt, Pt, area, W):
+        """
+        Compute and cache gradients for static_from_area at the given state.
+
+        Parameters
+        ----------
+        Tt : float
+            Total temperature (in input units)
+        Pt : float
+            Total pressure (in input units)
+        area : float
+            Flow area (in input units)
+        W : float
+            Mass flow rate (in input units)
+        """
+        raise NotImplementedError("Subclass must implement linearize_static_area")
+
+    def jvp_static_area(self, Tt_dot, Pt_dot, area_dot, W_dot):
+        """
+        Compute JVP for static_from_area. Must call linearize_static_area() first.
+
+        Parameters
+        ----------
+        Tt_dot, Pt_dot, area_dot, W_dot : float
+            Tangent vectors for each input
+
+        Returns
+        -------
+        dict
+            Dictionary of property tangents: {'Ts': Ts_dot, 'Ps': Ps_dot, ...}
+        """
+        raise NotImplementedError("Subclass must implement jvp_static_area")
