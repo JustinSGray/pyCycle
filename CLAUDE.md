@@ -1,3 +1,7 @@
+# Testing
+run tests via the testflo pacakge. `testflo <folder>`
+
+
 # OpenMDAO Component Interface Reference
 
 This document describes the key interfaces for building libraries on top of OpenMDAO, based on patterns observed in the pyCycle codebase.
