@@ -7,6 +7,7 @@ import networkx as nx
 
 from pycycle.element_base import Element
 from pycycle.new_element_base import NewElement
+from pycycle.jax_element_base import JaxElement
 from pycycle.thermo.cea import species_data
 from pycycle.constants import ALLOWED_THERMOS
 
@@ -61,7 +62,7 @@ class Cycle(om.Group):
 
         self._children[name] = subsys
 
-        if isinstance(subsys, (Element, NewElement)):
+        if isinstance(subsys, (Element, NewElement, JaxElement)):
             self._elements.add(subsys)
             if 'thermo_method' in subsys.options:
                 subsys.options['thermo_method'] = self.options['thermo_method']

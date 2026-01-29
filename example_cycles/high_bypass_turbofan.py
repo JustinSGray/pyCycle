@@ -22,7 +22,7 @@ class HBTF(pyc.Cycle):
         #Create any relavent short hands here:
         design = self.options['design']
 
-        USE_TABULAR = False
+        USE_TABULAR = True
         if USE_TABULAR:
             self.options['thermo_method'] = 'TABULAR'
             self.options['thermo_data'] = pyc.AIR_JETA_TAB_SPEC
@@ -44,7 +44,7 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('fan', pyc.Compressor(map_data=pyc.FanMap,
                                         bleed_names=[], map_extrap=True), promotes_inputs=[('Nmech','LP_Nmech')])
         self.add_subsystem('splitter', pyc.Splitter())
-        self.add_subsystem('duct4', pyc.Duct())
+        self.add_subsystem('duct4', pyc.NewDuct())
         self.add_subsystem('lpc', pyc.Compressor(map_data=pyc.LPCMap,
                                         map_extrap=True),promotes_inputs=[('Nmech','LP_Nmech')])
         self.add_subsystem('duct6', pyc.Duct())
@@ -434,13 +434,15 @@ if __name__ == "__main__":
     st = time.time()
 
     prob.set_solver_print(level=-1)
-    prob.set_solver_print(level=2, depth=1)
+    prob.set_solver_print(level=2, depth=2)
 
-    flight_env = [(0.8, 35000), (0.7, 35000), (0.55, 35000), (0.46, 35000), (0.4, 35000),
-                  (0.4, 20000), (0.6, 20000), (0.8, 20000),
-                  (0.8, 10000), (0.6, 10000), (0.4, 10000), (0.2, 10000), (0.001, 10000),
-                  (.001, 1000), (0.2, 1000), (0.4, 1000), (0.6, 1000),
-                  (0.6, 0), (0.4, 0), (0.2, 0), (0.001, 0)]
+    # flight_env = [(0.8, 35000), (0.7, 35000), (0.55, 35000), (0.46, 35000), (0.4, 35000),
+    #               (0.4, 20000), (0.6, 20000), (0.8, 20000),
+    #               (0.8, 10000), (0.6, 10000), (0.4, 10000), (0.2, 10000), (0.001, 10000),
+    #               (.001, 1000), (0.2, 1000), (0.4, 1000), (0.6, 1000),
+    #               (0.6, 0), (0.4, 0), (0.2, 0), (0.001, 0)]
+
+    flight_env = [(0.8, 35000),]
 
     viewer_file = open('hbtf_view.out', 'w')
     first_pass = True
@@ -458,20 +460,22 @@ if __name__ == "__main__":
         prob['OD_part_pwr.fc.MN'] = MN
         prob['OD_part_pwr.fc.alt'] = alt
 
-        for PC in [1, 0.9, 0.8, .7]:
+        # for PC in [1, 0.9, 0.8, .7]:
+        for PC in [1,]:
             print(f'## PC = {PC}')
             prob['OD_part_pwr.PC'] = PC
             prob.run_model()
 
             if first_pass:
-                viewer(prob, 'DESIGN', file=viewer_file)
+                viewer(prob, 'DESIGN')
                 first_pass = False
             viewer(prob, 'OD_part_pwr', file=viewer_file)
 
         # run throttle back up to full power
-        for PC in [1, 0.85]:
-            prob['OD_part_pwr.PC'] = PC
-            prob.run_model()
+        # for PC in [1, 0.85]:
+        # for PC in [1,]:
+        #     prob['OD_part_pwr.PC'] = PC
+        #     prob.run_model()
 
 
 

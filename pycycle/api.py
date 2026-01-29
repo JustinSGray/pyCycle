@@ -9,6 +9,7 @@ from pycycle.elements.flow_start import FlowStart
 from pycycle.elements.cfd_start import CFDStart
 from pycycle.elements.inlet import Inlet, MilSpecRecovery
 from pycycle.elements.duct import Duct
+from pycycle.elements.new_duct import NewDuct
 from pycycle.elements.compressor import Compressor
 from pycycle.elements.combustor import Combustor
 from pycycle.elements.turbine import Turbine
