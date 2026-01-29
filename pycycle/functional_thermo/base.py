@@ -367,7 +367,7 @@ class ThermoInterface:
     # Linearization and JAX-compatible derivatives
     # =========================================================================
 
-    def linearize(self, T, P):
+    def linearize(self, T, P, FAR=None):
         """
         Compute and cache property gradients at the given state.
 
@@ -377,10 +377,12 @@ class ThermoInterface:
             Temperature (in input units)
         P : float
             Pressure (in input units)
+        FAR : float, optional
+            Fuel-to-air ratio. If None, uses the instance's default.
         """
         raise NotImplementedError("Subclass must implement linearize")
 
-    def jvp(self, T_dot, P_dot):
+    def jvp(self, T_dot, P_dot, FAR_dot=0.0):
         """
         Compute Jacobian-vector product (forward-mode autodiff).
 
@@ -392,6 +394,8 @@ class ThermoInterface:
             Tangent vector for temperature
         P_dot : float
             Tangent vector for pressure
+        FAR_dot : float, optional
+            Tangent vector for fuel-to-air ratio. Default is 0.0.
 
         Returns
         -------
@@ -427,7 +431,7 @@ class ThermoInterface:
         Returns
         -------
         tuple
-            (T_bar, P_bar) - gradients with respect to T and P
+            (T_bar, P_bar, FAR_bar) - gradients with respect to T, P, and FAR
         """
         raise NotImplementedError("Subclass must implement vjp")
 
@@ -435,7 +439,7 @@ class ThermoInterface:
     # Static property derivatives (analytical)
     # =========================================================================
 
-    def linearize_static_MN(self, Tt, Pt, MN, W):
+    def linearize_static_MN(self, Tt, Pt, MN, W, FAR=None):
         """
         Compute and cache gradients for static_from_MN at the given state.
 
@@ -449,10 +453,12 @@ class ThermoInterface:
             Mach number (-)
         W : float
             Mass flow rate (in input units)
+        FAR : float, optional
+            Fuel-to-air ratio. If None, uses the instance's default.
         """
         raise NotImplementedError("Subclass must implement linearize_static_MN")
 
-    def jvp_static_MN(self, Tt_dot, Pt_dot, MN_dot, W_dot):
+    def jvp_static_MN(self, Tt_dot, Pt_dot, MN_dot, W_dot, FAR_dot=0.0):
         """
         Compute JVP for static_from_MN. Must call linearize_static_MN() first.
 
@@ -460,6 +466,8 @@ class ThermoInterface:
         ----------
         Tt_dot, Pt_dot, MN_dot, W_dot : float
             Tangent vectors for each input
+        FAR_dot : float, optional
+            Tangent vector for fuel-to-air ratio. Default is 0.0.
 
         Returns
         -------
@@ -468,7 +476,7 @@ class ThermoInterface:
         """
         raise NotImplementedError("Subclass must implement jvp_static_MN")
 
-    def linearize_static_area(self, Tt, Pt, area, W):
+    def linearize_static_area(self, Tt, Pt, area, W, FAR=None):
         """
         Compute and cache gradients for static_from_area at the given state.
 
@@ -482,10 +490,12 @@ class ThermoInterface:
             Flow area (in input units)
         W : float
             Mass flow rate (in input units)
+        FAR : float, optional
+            Fuel-to-air ratio. If None, uses the instance's default.
         """
         raise NotImplementedError("Subclass must implement linearize_static_area")
 
-    def jvp_static_area(self, Tt_dot, Pt_dot, area_dot, W_dot):
+    def jvp_static_area(self, Tt_dot, Pt_dot, area_dot, W_dot, FAR_dot=0.0):
         """
         Compute JVP for static_from_area. Must call linearize_static_area() first.
 
@@ -493,6 +503,8 @@ class ThermoInterface:
         ----------
         Tt_dot, Pt_dot, area_dot, W_dot : float
             Tangent vectors for each input
+        FAR_dot : float, optional
+            Tangent vector for fuel-to-air ratio. Default is 0.0.
 
         Returns
         -------

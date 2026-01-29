@@ -214,8 +214,8 @@ class TabularThermoLinearizeTestCase(unittest.TestCase):
         # JVP: tangent in T direction
         jvp_T = self.thermo.jvp(T_dot=1.0, P_dot=0.0)
 
-        # VJP: cotangent from h
-        T_bar, P_bar = self.thermo.vjp(h_bar=1.0)
+        # VJP: cotangent from h (now returns T_bar, P_bar, FAR_bar)
+        T_bar, P_bar, FAR_bar = self.thermo.vjp(h_bar=1.0)
 
         # dh/dT from JVP should equal T_bar from VJP with h_bar=1
         self.assertAlmostEqual(jvp_T['h'], T_bar, places=10)
@@ -231,14 +231,15 @@ class TabularThermoLinearizeTestCase(unittest.TestCase):
         self.thermo.linearize(self.T, self.P)
 
         # Get individual contributions
-        T_bar_h, P_bar_h = self.thermo.vjp(h_bar=1.0)
-        T_bar_S, P_bar_S = self.thermo.vjp(S_bar=1.0)
+        T_bar_h, P_bar_h, FAR_bar_h = self.thermo.vjp(h_bar=1.0)
+        T_bar_S, P_bar_S, FAR_bar_S = self.thermo.vjp(S_bar=1.0)
 
         # Combined should be sum
-        T_bar_both, P_bar_both = self.thermo.vjp(h_bar=1.0, S_bar=1.0)
+        T_bar_both, P_bar_both, FAR_bar_both = self.thermo.vjp(h_bar=1.0, S_bar=1.0)
 
         self.assertAlmostEqual(T_bar_both, T_bar_h + T_bar_S, places=10)
         self.assertAlmostEqual(P_bar_both, P_bar_h + P_bar_S, places=10)
+        self.assertAlmostEqual(FAR_bar_both, FAR_bar_h + FAR_bar_S, places=10)
 
     def test_gradients_finite_difference(self):
         """Test gradients against finite difference."""
@@ -356,6 +357,119 @@ class TabularThermoStaticDerivativesTestCase(unittest.TestCase):
             if abs(fd) > 1e-10:
                 rel_err = abs(jvp[prop] - fd) / abs(fd)
                 self.assertLess(rel_err, 1e-4, f"d{prop}/darea: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+
+class TabularThermoFARDerivativesTestCase(unittest.TestCase):
+    """Test FAR derivatives of property calculations against finite difference."""
+
+    def setUp(self):
+        self.thermo = TabularThermo(FAR=0.02)  # Nonzero FAR baseline
+        self.T = 500.0  # K
+        self.P = 101325.0 * 3  # Pa
+        self.h = 1e-7  # FD step size for FAR
+
+    def test_jvp_FAR_direction(self):
+        """Test JVP in FAR direction."""
+        FAR = 0.02
+        self.thermo.linearize(self.T, self.P, FAR)
+        jvp = self.thermo.jvp(T_dot=0.0, P_dot=0.0, FAR_dot=1.0)
+
+        # All properties should have tangents
+        for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
+            self.assertIn(prop, jvp)
+
+    def test_jvp_FAR_finite_difference(self):
+        """Test FAR gradient against finite difference."""
+        FAR = 0.02
+        self.thermo.linearize(self.T, self.P, FAR)
+        jvp = self.thermo.jvp(T_dot=0.0, P_dot=0.0, FAR_dot=1.0)
+
+        # Finite difference for dh/dFAR
+        h_plus = self.thermo.h(self.T, self.P, FAR + self.h)
+        h_minus = self.thermo.h(self.T, self.P, FAR - self.h)
+        dh_dFAR_fd = (h_plus - h_minus) / (2 * self.h)
+
+        if abs(dh_dFAR_fd) > 1e-10:
+            rel_err = abs(jvp['h'] - dh_dFAR_fd) / abs(dh_dFAR_fd)
+            self.assertLess(rel_err, 1e-4, f"dh/dFAR: ana={jvp['h']:.8g}, fd={dh_dFAR_fd:.8g}")
+
+    def test_vjp_FAR_consistency(self):
+        """Test that VJP FAR gradient is consistent with JVP."""
+        FAR = 0.02
+        self.thermo.linearize(self.T, self.P, FAR)
+
+        # JVP: tangent in FAR direction
+        jvp_FAR = self.thermo.jvp(T_dot=0.0, P_dot=0.0, FAR_dot=1.0)
+
+        # VJP: cotangent from h
+        T_bar, P_bar, FAR_bar = self.thermo.vjp(h_bar=1.0)
+
+        # dh/dFAR from JVP should equal FAR_bar from VJP with h_bar=1
+        self.assertAlmostEqual(jvp_FAR['h'], FAR_bar, places=10)
+
+    def test_props_with_FAR_argument(self):
+        """Test that FAR argument overrides instance FAR."""
+        thermo_base = TabularThermo(FAR=0.0)
+
+        # Without FAR argument, uses instance FAR (0.0)
+        h_air = thermo_base.h(self.T, self.P)
+
+        # With FAR argument, uses provided FAR
+        h_fuel = thermo_base.h(self.T, self.P, FAR=0.03)
+
+        # Should be different
+        self.assertNotAlmostEqual(h_air, h_fuel, places=2)
+
+        # Same as creating with that FAR
+        thermo_fuel = TabularThermo(FAR=0.03)
+        h_fuel2 = thermo_fuel.h(self.T, self.P)
+        self.assertAlmostEqual(h_fuel, h_fuel2, places=10)
+
+
+class TabularThermoStaticFARDerivativesTestCase(unittest.TestCase):
+    """Test FAR derivatives of static property calculations against finite difference."""
+
+    def setUp(self):
+        self.thermo = TabularThermo(FAR=0.02, input_units='English')
+        self.Tt = 500.0  # degR
+        self.Pt = 14.696  # psi
+        self.W = 100.0  # lbm/s
+        self.MN = 0.5
+        self.h = 1e-7  # FD step size for FAR
+
+    def test_static_from_MN_derivatives_dFAR(self):
+        """Test static_from_MN derivatives w.r.t. FAR against FD."""
+        FAR = 0.02
+        self.thermo.linearize_static_MN(self.Tt, self.Pt, self.MN, self.W, FAR)
+        jvp = self.thermo.jvp_static_MN(0.0, 0.0, 0.0, 0.0, 1.0)
+
+        # Finite difference
+        props_p = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W, FAR + self.h)
+        props_m = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W, FAR - self.h)
+
+        for prop in ['Ts', 'Ps', 'hs', 'V', 'Vsonic', 'area', 'gamma']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-3, f"d{prop}/dFAR: ana={jvp[prop]:.8g}, fd={fd:.8g}")
+
+    def test_static_from_area_derivatives_dFAR(self):
+        """Test static_from_area derivatives w.r.t. FAR against FD."""
+        FAR = 0.02
+        props_mn = self.thermo.static_from_MN(self.Tt, self.Pt, self.MN, self.W, FAR)
+        area = props_mn.area
+
+        self.thermo.linearize_static_area(self.Tt, self.Pt, area, self.W, FAR)
+        jvp = self.thermo.jvp_static_area(0.0, 0.0, 0.0, 0.0, 1.0)
+
+        props_p = self.thermo.static_from_area(self.Tt, self.Pt, area, self.W, FAR=FAR + self.h)
+        props_m = self.thermo.static_from_area(self.Tt, self.Pt, area, self.W, FAR=FAR - self.h)
+
+        for prop in ['Ts', 'Ps', 'MN', 'V', 'Vsonic']:
+            fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
+            if abs(fd) > 1e-10:
+                rel_err = abs(jvp[prop] - fd) / abs(fd)
+                self.assertLess(rel_err, 1e-3, f"d{prop}/dFAR: ana={jvp[prop]:.8g}, fd={fd:.8g}")
 
 
 if __name__ == "__main__":
