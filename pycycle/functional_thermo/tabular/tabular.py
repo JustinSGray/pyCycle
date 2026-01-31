@@ -11,6 +11,236 @@ from scipy.optimize import brentq
 from ..base import ThermoInterface, TotalProps, StaticProps
 
 
+# =============================================================================
+# Generic Newton Solver
+# =============================================================================
+
+class NewtonSolver:
+    """
+    Generic Newton solver for 1D and N-D root-finding problems.
+
+    Supports analytical Jacobians, bounds clamping, and multiple convergence
+    criteria. Optimized for small systems (1D, 2D) with minimal overhead.
+
+    Parameters
+    ----------
+    max_iter : int, optional
+        Maximum number of Newton iterations. Default is 20.
+    tol : float, optional
+        Convergence tolerance. Default is 1e-10.
+    convergence_mode : str, optional
+        How to check convergence:
+        - 'relative': |R| < tol * |target| (default)
+        - 'absolute': |R| < tol
+        - 'component': max(|R_i|) < tol (for N-D)
+    abs_tol : float, optional
+        Absolute tolerance floor for 'relative' mode. Default is 1e-6.
+    stagnation_tol : float, optional
+        Minimum step size before declaring stagnation. Default is 1e-12.
+    bounds : tuple, optional
+        (lower, upper) bounds for the solution. Can be scalars or arrays.
+    jac_singular_tol : float, optional
+        Threshold below which Jacobian is considered singular. Default is 1e-30.
+
+    Examples
+    --------
+    1D problem: find T such that h(T) = h_target
+
+    >>> solver = NewtonSolver(max_iter=20, tol=1e-10, bounds=(200.0, 3000.0))
+    >>> def residual_and_jac(T):
+    ...     h, dh_dT = compute_h_and_derivative(T)
+    ...     return h - h_target, dh_dT
+    >>> T, converged, n_iter = solver.solve(residual_and_jac, T_guess)
+
+    2D problem: find (Ts, Ps) such that [entropy_error, energy_error] = 0
+
+    >>> solver = NewtonSolver(convergence_mode='component')
+    >>> def residual_and_jac(x):
+    ...     Ts, Ps = x
+    ...     R = np.array([entropy_error(Ts, Ps), energy_error(Ts, Ps)])
+    ...     J = np.array([[dR1_dTs, dR1_dPs], [dR2_dTs, dR2_dPs]])
+    ...     return R, J
+    >>> x, converged, n_iter = solver.solve(residual_and_jac, [Ts_guess, Ps_guess])
+    """
+
+    def __init__(self, max_iter=20, tol=1e-10, convergence_mode='relative',
+                 abs_tol=1e-6, stagnation_tol=1e-12, bounds=None,
+                 jac_singular_tol=1e-30):
+        self.max_iter = max_iter
+        self.tol = tol
+        self.convergence_mode = convergence_mode
+        self.abs_tol = abs_tol
+        self.stagnation_tol = stagnation_tol
+        self.bounds = bounds
+        self.jac_singular_tol = jac_singular_tol
+
+    def solve(self, residual_and_jac_fn, x0, ref_value=None):
+        """
+        Solve R(x) = 0 using Newton's method.
+
+        Parameters
+        ----------
+        residual_and_jac_fn : callable
+            Function that takes x and returns (residual, jacobian).
+            For 1D: residual and jacobian are scalars.
+            For N-D: residual is (N,) array, jacobian is (N, N) array.
+        x0 : float or array-like
+            Initial guess.
+        ref_value : float or array-like, optional
+            Reference value for relative convergence checking.
+            If None, uses the first residual magnitude.
+
+        Returns
+        -------
+        x : float or ndarray
+            Solution (same type as x0).
+        converged : bool
+            True if the solver converged within tolerance.
+        n_iter : int
+            Number of iterations performed.
+        """
+        # Determine if 1D or N-D based on x0
+        is_scalar = np.isscalar(x0)
+        if is_scalar:
+            return self._solve_1d(residual_and_jac_fn, float(x0), ref_value)
+        else:
+            x0_arr = np.asarray(x0, dtype=float)
+            if x0_arr.size == 2:
+                return self._solve_2d(residual_and_jac_fn, x0_arr, ref_value)
+            else:
+                return self._solve_nd(residual_and_jac_fn, x0_arr, ref_value)
+
+    def _solve_1d(self, residual_and_jac_fn, x, ref_value):
+        """Optimized 1D Newton solver."""
+        bounds = self.bounds
+        lower = bounds[0] if bounds else -np.inf
+        upper = bounds[1] if bounds else np.inf
+
+        for n_iter in range(1, self.max_iter + 1):
+            residual, jacobian = residual_and_jac_fn(x)
+
+            # Check convergence
+            if self._check_convergence_1d(residual, ref_value):
+                return x, True, n_iter
+
+            # Check for singular Jacobian
+            if abs(jacobian) < self.jac_singular_tol:
+                return x, False, n_iter
+
+            # Newton step
+            dx = -residual / jacobian
+            x_new = x + dx
+
+            # Apply bounds
+            x_new = max(lower, min(upper, x_new))
+
+            # Check for stagnation
+            if abs(x_new - x) < self.stagnation_tol:
+                return x_new, True, n_iter
+
+            x = x_new
+
+        return x, False, self.max_iter
+
+    def _solve_2d(self, residual_and_jac_fn, x, ref_value):
+        """Optimized 2D Newton solver using Cramer's rule."""
+        bounds = self.bounds
+        if bounds:
+            lower = np.asarray(bounds[0])
+            upper = np.asarray(bounds[1])
+        else:
+            lower = np.array([-np.inf, -np.inf])
+            upper = np.array([np.inf, np.inf])
+
+        for n_iter in range(1, self.max_iter + 1):
+            residual, jacobian = residual_and_jac_fn(x)
+
+            # Check convergence
+            if self._check_convergence_nd(residual, ref_value):
+                return x, True, n_iter
+
+            # Cramer's rule for 2x2 system: J @ dx = -R
+            J = jacobian
+            det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+
+            if abs(det) < self.jac_singular_tol:
+                return x, False, n_iter
+
+            # dx = J^{-1} @ (-R)
+            dx0 = (-residual[0] * J[1, 1] + residual[1] * J[0, 1]) / det
+            dx1 = (-residual[1] * J[0, 0] + residual[0] * J[1, 0]) / det
+
+            x_new = np.array([x[0] + dx0, x[1] + dx1])
+
+            # Apply bounds
+            x_new = np.maximum(lower, np.minimum(upper, x_new))
+
+            # Check for stagnation
+            if np.max(np.abs(x_new - x)) < self.stagnation_tol:
+                return x_new, True, n_iter
+
+            x = x_new
+
+        return x, False, self.max_iter
+
+    def _solve_nd(self, residual_and_jac_fn, x, ref_value):
+        """General N-D Newton solver using numpy.linalg.solve."""
+        bounds = self.bounds
+        if bounds:
+            lower = np.asarray(bounds[0])
+            upper = np.asarray(bounds[1])
+        else:
+            lower = np.full_like(x, -np.inf)
+            upper = np.full_like(x, np.inf)
+
+        for n_iter in range(1, self.max_iter + 1):
+            residual, jacobian = residual_and_jac_fn(x)
+
+            # Check convergence
+            if self._check_convergence_nd(residual, ref_value):
+                return x, True, n_iter
+
+            # Solve linear system
+            try:
+                dx = np.linalg.solve(jacobian, -residual)
+            except np.linalg.LinAlgError:
+                return x, False, n_iter
+
+            x_new = x + dx
+
+            # Apply bounds
+            x_new = np.maximum(lower, np.minimum(upper, x_new))
+
+            # Check for stagnation
+            if np.max(np.abs(x_new - x)) < self.stagnation_tol:
+                return x_new, True, n_iter
+
+            x = x_new
+
+        return x, False, self.max_iter
+
+    def _check_convergence_1d(self, residual, ref_value):
+        """Check convergence for 1D problem."""
+        abs_res = abs(residual)
+        if self.convergence_mode == 'absolute':
+            return abs_res < self.tol
+        elif self.convergence_mode == 'relative':
+            ref = abs(ref_value) if ref_value is not None else abs_res
+            return abs_res < self.tol * ref or abs_res < self.abs_tol
+        else:  # component (same as absolute for 1D)
+            return abs_res < self.tol
+
+    def _check_convergence_nd(self, residual, ref_value):
+        """Check convergence for N-D problem."""
+        if self.convergence_mode == 'absolute':
+            return np.linalg.norm(residual) < self.tol
+        elif self.convergence_mode == 'relative':
+            ref = np.linalg.norm(ref_value) if ref_value is not None else np.linalg.norm(residual)
+            return np.linalg.norm(residual) < self.tol * ref or np.linalg.norm(residual) < self.abs_tol
+        else:  # component
+            return np.max(np.abs(residual)) < self.tol
+
+
 # Property name constants to avoid repetition
 TOTAL_PROPS = ('h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R')
 STATIC_PROPS = ('Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R')
@@ -789,6 +1019,12 @@ class TabularThermo(ThermoInterface):
         # Convert output from SI
         return self._convert_T_from_si(T_si)
 
+    # Shared Newton solver instances (class-level to avoid repeated instantiation)
+    _newton_solver_1d = NewtonSolver(
+        max_iter=20, tol=1e-10, convergence_mode='relative',
+        abs_tol=1e-6, bounds=(160.0, 2400.0)
+    )
+
     def _T_from_hP_si(self, h_target_si, P_si, FAR, _retry=False):
         """Solve for temperature given enthalpy and pressure (SI units).
 
@@ -811,9 +1047,6 @@ class TabularThermo(ThermoInterface):
         float
             Temperature in SI (K)
         """
-        max_iter = 20
-        tol = 1e-10
-
         # Track solver stats
         if not _retry:
             self._solver_stats['T_from_hP']['calls'] += 1
@@ -821,45 +1054,28 @@ class TabularThermo(ThermoInterface):
         # Apply initial guess if needed, otherwise use cached value
         if self._needs_guess_T_from_hP:
             # Empirical initial guess: h ≈ Cp * T, so T ≈ h / Cp
-            T = max(300.0, min(2000.0, abs(h_target_si) / 1000.0 + 300.0))
+            T0 = max(300.0, min(2000.0, abs(h_target_si) / 1000.0 + 300.0))
             self._needs_guess_T_from_hP = False
             self._solver_stats['T_from_hP']['guesses'] += 1
         else:
-            T = self._cache_T_from_hP
+            T0 = self._cache_T_from_hP
 
-        converged = False
-        grad_h = None
-        for _ in range(max_iter):
-            # Get h and dh/dT using bulk interpolator
+        # Closure to capture state for residual/Jacobian computation
+        # Store last computed values for caching after solve
+        cache = {}
+
+        def residual_and_jac(T):
             values, gradients = self._lookup_subset_si(T, P_si, FAR, ['h'], compute_derivative=True)
             h = values['h']
             grad_h = gradients['h']  # (dh/dFAR, dh/dP, dh/dT)
-            dh_dT = grad_h[2]
+            # Store for post-solve caching
+            cache['h'] = h
+            cache['grad_h'] = grad_h
+            cache['T'] = T
+            return h - h_target_si, grad_h[2]
 
-            # Residual and derivative
-            residual = h - h_target_si
-
-            # Check convergence (relative tolerance)
-            if abs(residual) < tol * abs(h_target_si) or abs(residual) < 1e-6:
-                converged = True
-                break
-
-            # Newton update
-            if abs(dh_dT) < 1e-30:
-                break  # Derivative too small
-
-            dT = -residual / dh_dT
-
-            # Update with bounds enforcement
-            T_new = T + dT
-            T_new = max(160.0, min(2400.0, T_new))
-
-            # Check for stagnation
-            if abs(T_new - T) < 1e-12:
-                T = T_new
-                break
-
-            T = T_new
+        # Solve using generic Newton solver
+        T, converged, _ = self._newton_solver_1d.solve(residual_and_jac, T0, ref_value=h_target_si)
 
         # If not converged and haven't retried, reset guess flag and retry once
         if not converged and not _retry:
@@ -872,8 +1088,10 @@ class TabularThermo(ThermoInterface):
 
         # Cache h value and gradient for reuse in linearize()
         # This avoids redundant lookup when linearize is called right after T_from_hP
-        if grad_h is not None:
-            self._cache_h_for_linearize = (T, P_si, FAR, h, grad_h.copy())
+        if cache:
+            self._cache_h_for_linearize = (
+                cache['T'], P_si, FAR, cache['h'], cache['grad_h'].copy()
+            )
 
         return T
 
@@ -987,8 +1205,6 @@ class TabularThermo(ThermoInterface):
                               gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
 
         MN_sq = MN ** 2
-        max_iter = 20
-        tol = 1e-10
 
         # Track solver stats
         if not _retry:
@@ -997,21 +1213,24 @@ class TabularThermo(ThermoInterface):
         # Apply initial guess if needed, otherwise use cached values
         if self._needs_guess_static_MN:
             # Initial guesses using ideal gas isentropic relations
-            Ps = self._ideal_gas_Ps_guess(Tt_si, Pt_si, MN, gamma_t)
+            Ps0 = self._ideal_gas_Ps_guess(Tt_si, Pt_si, MN, gamma_t)
             # Ts from isentropic relation: Ts/Tt = (Ps/Pt)^((gamma-1)/gamma)
-            Ts = Tt_si * (Ps / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+            Ts0 = Tt_si * (Ps0 / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
             self._solver_stats['static_MN']['guesses'] += 1
             self._needs_guess_static_MN = False
         else:
-            Ts, Ps = self._cache_static_MN
+            Ts0, Ps0 = self._cache_static_MN
 
-        # 2D Newton solver for coupled (Ts, Ps) system
-        # Residuals:
-        #   R1 = S(Ts, Ps) - S_total = 0  (entropy conservation)
-        #   R2 = hs + MN²·γ·R·Ts/2 - ht = 0  (energy conservation)
+        # Cache for storing properties from last iteration (for post-processing)
+        cache = {}
 
-        converged = False
-        for _ in range(max_iter):
+        # Closure for 2D residual and Jacobian
+        # Residuals (normalized):
+        #   R1 = (S(Ts, Ps) - S_total) / S_total  (entropy conservation)
+        #   R2 = (hs + MN²·γ·R·Ts/2 - ht) / ht   (energy conservation)
+        def residual_and_jac(x):
+            Ts, Ps = x[0], x[1]
+
             # Bulk lookup: Get all 4 properties needed for Newton in ONE call
             values, gradients = self._lookup_subset_si(Ts, Ps, FAR, ['S', 'h', 'gamma', 'R'],
                                                        compute_derivative=True)
@@ -1021,34 +1240,26 @@ class TabularThermo(ThermoInterface):
             gamma_s = values['gamma']
             R_s = values['R']
 
+            # Store for post-processing
+            cache['hs'] = hs
+            cache['gamma_s'] = gamma_s
+            cache['R_s'] = R_s
+
             grad_S = gradients['S']      # (dS/dFAR, dS/dP, dS/dT)
             grad_h = gradients['h']      # (dh/dFAR, dh/dP, dh/dT)
             grad_gamma = gradients['gamma']
             grad_R = gradients['R']
 
-            # Compute residuals
-            # R1: entropy conservation (normalized)
+            # Compute residuals (normalized)
             R1 = (S_s - S_total) / S_total
-
-            # R2: energy conservation (normalized)
-            # ht = hs + MN² * gamma_s * R_s * Ts / 2
             kinetic = MN_sq * gamma_s * R_s * Ts / 2.0
             ht_calc = hs + kinetic
             R2 = (ht_calc - ht) / ht
 
-            # Check convergence
-            if abs(R1) < tol and abs(R2) < tol:
-                converged = True
-                break
-
             # Jacobian of residuals w.r.t. (Ts, Ps)
-            # dR1/dTs = (dS/dTs) / S_total
-            # dR1/dPs = (dS/dPs) / S_total
             dR1_dTs = grad_S[2] / S_total
             dR1_dPs = grad_S[1] / S_total
 
-            # dR2/dTs = (dhs/dTs + MN²/2 * (dγ/dTs·R·Ts + γ·dR/dTs·Ts + γ·R)) / ht
-            # dR2/dPs = (dhs/dPs + MN²/2 * (dγ/dPs·R·Ts + γ·dR/dPs·Ts)) / ht
             dkinetic_dTs = MN_sq / 2.0 * (
                 grad_gamma[2] * R_s * Ts + gamma_s * grad_R[2] * Ts + gamma_s * R_s
             )
@@ -1059,31 +1270,23 @@ class TabularThermo(ThermoInterface):
             dR2_dTs = (grad_h[2] + dkinetic_dTs) / ht
             dR2_dPs = (grad_h[1] + dkinetic_dPs) / ht
 
-            # Solve 2x2 linear system: J @ [dTs, dPs]^T = -[R1, R2]^T
-            det = dR1_dTs * dR2_dPs - dR1_dPs * dR2_dTs
-            if abs(det) < 1e-30:
-                # Jacobian is singular
-                break
+            residual = np.array([R1, R2])
+            jacobian = np.array([[dR1_dTs, dR1_dPs],
+                                 [dR2_dTs, dR2_dPs]])
 
-            # Cramer's rule
-            dTs = (-R1 * dR2_dPs + R2 * dR1_dPs) / det
-            dPs = (-R2 * dR1_dTs + R1 * dR2_dTs) / det
+            return residual, jacobian
 
-            # Apply Newton update with damping to stay in valid range
-            alpha = 1.0
-            Ts_new = Ts + alpha * dTs
-            Ps_new = Ps + alpha * dPs
+        # Create 2D solver with problem-specific bounds
+        # Ps must be less than Pt (static < total for subsonic flow)
+        solver_2d = NewtonSolver(
+            max_iter=20, tol=1e-10, convergence_mode='component',
+            bounds=([160.0, Pt_si * 0.001], [2400.0, Pt_si * 0.9999])
+        )
 
-            # Clamp to valid ranges
-            Ts_new = max(160.0, min(2400.0, Ts_new))
-            Ps_new = max(Pt_si * 0.001, min(Pt_si * 0.9999, Ps_new))
-
-            # Check for stagnation
-            if abs(Ts_new - Ts) < 1e-12 and abs(Ps_new - Ps) < 1e-12:
-                Ts, Ps = Ts_new, Ps_new
-                break
-
-            Ts, Ps = Ts_new, Ps_new
+        # Solve
+        x0 = np.array([Ts0, Ps0])
+        x, converged, _ = solver_2d.solve(residual_and_jac, x0)
+        Ts, Ps = x[0], x[1]
 
         # If not converged and haven't retried, reset guess flag and retry once
         if not converged and not _retry:
@@ -1094,7 +1297,11 @@ class TabularThermo(ThermoInterface):
         # Cache the converged solution
         self._cache_static_MN = (Ts, Ps)
 
-        # Reuse hs, gamma_s, R_s from last Newton iteration (already computed above)
+        # Retrieve properties from last Newton iteration
+        hs = cache['hs']
+        gamma_s = cache['gamma_s']
+        R_s = cache['R_s']
+
         # Only look up Cp and Cv which weren't needed for the Newton solve
         extra_values, _ = self._lookup_subset_si(Ts, Ps, FAR, ['Cp', 'Cv'], compute_derivative=False)
         Cp_s = extra_values['Cp']
@@ -1136,9 +1343,6 @@ class TabularThermo(ThermoInterface):
         float
             Temperature in SI (K)
         """
-        max_iter = 20
-        tol = 1e-10
-
         # Track solver stats
         if not _retry:
             self._solver_stats['T_from_SP']['calls'] += 1
@@ -1146,44 +1350,21 @@ class TabularThermo(ThermoInterface):
         # Apply initial guess if needed, otherwise use cached value
         if self._needs_guess_T_from_SP:
             # Empirical initial guess: mid-range temperature
-            T = 800.0
+            T0 = 800.0
             self._needs_guess_T_from_SP = False
             self._solver_stats['T_from_SP']['guesses'] += 1
         else:
-            T = self._cache_T_from_SP
+            T0 = self._cache_T_from_SP
 
-        converged = False
-        for _ in range(max_iter):
-            # Get S and dS/dT using bulk interpolator
+        # Closure for residual/Jacobian computation
+        def residual_and_jac(T):
             values, gradients = self._lookup_subset_si(T, P_si, FAR, ['S'], compute_derivative=True)
             S = values['S']
-            grad_S = gradients['S']  # (dS/dFAR, dS/dP, dS/dT)
-            dS_dT = grad_S[2]
+            dS_dT = gradients['S'][2]  # (dS/dFAR, dS/dP, dS/dT)
+            return S - S_target_si, dS_dT
 
-            # Residual
-            residual = S - S_target_si
-
-            # Check convergence (relative tolerance)
-            if abs(residual) < tol * abs(S_target_si) or abs(residual) < 1e-6:
-                converged = True
-                break
-
-            # Newton update
-            if abs(dS_dT) < 1e-30:
-                break  # Derivative too small
-
-            dT = -residual / dS_dT
-
-            # Update with bounds enforcement
-            T_new = T + dT
-            T_new = max(160.0, min(2400.0, T_new))
-
-            # Check for stagnation
-            if abs(T_new - T) < 1e-12:
-                T = T_new
-                break
-
-            T = T_new
+        # Solve using generic Newton solver (reuse the 1D solver instance)
+        T, converged, _ = self._newton_solver_1d.solve(residual_and_jac, T0, ref_value=S_target_si)
 
         # If not converged and haven't retried, reset guess flag and retry once
         if not converged and not _retry:
