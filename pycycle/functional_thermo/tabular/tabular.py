@@ -44,10 +44,11 @@ class TabularThermo(ThermoInterface):
         # Grid points: (FAR, P, T) - tables are in SI units
         points = (spec['FAR'], spec['P'], spec['T'])
 
+        # Use 3D-slinear for 3D grids - it's ~2.3x faster than generic slinear
         self._interps = {}
         for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
             self._interps[prop] = InterpND(
-                method='slinear',
+                method='3D-slinear',
                 points=points,
                 values=spec[prop],
                 extrapolate=True
@@ -64,9 +65,12 @@ class TabularThermo(ThermoInterface):
     # Linearization and JAX-compatible derivatives
     # =========================================================================
 
-    def linearize(self, T, P, FAR=None):
+    def linearize(self, T, P, FAR=None, props=None):
         """
-        Compute and cache property gradients at the given state.
+        Compute property values and cache gradients at the given state.
+
+        This combines the forward pass (property lookup) with linearization
+        (gradient computation) to avoid duplicate table accesses.
 
         Parameters
         ----------
@@ -76,6 +80,14 @@ class TabularThermo(ThermoInterface):
             Pressure (in input units)
         FAR : float, optional
             Fuel-to-air ratio. If None, uses the instance's FAR.
+        props : TotalProps, optional
+            Pre-computed property values from forward pass. If provided,
+            skips the table lookups and only computes gradients.
+
+        Returns
+        -------
+        TotalProps
+            Named tuple with (h, S, gamma, Cp, Cv, rho, R) in input units
         """
         if FAR is None:
             FAR = self.FAR
@@ -93,11 +105,23 @@ class TabularThermo(ThermoInterface):
         self._lin_T_si = T_si
         self._lin_P_si = P_si
 
-        # Compute and cache gradients for each property (in SI units)
+        # Compute gradients for each property (in SI units)
         # gradients are (dProp/dFAR, dProp/dP, dProp/dT)
         self._gradients_si = {}
         for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
             self._gradients_si[prop] = self._interps[prop].gradient(x)
+
+        # If props provided from forward pass, use those; otherwise lookup
+        if props is not None:
+            return props
+        else:
+            props_si = {}
+            for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
+                props_si[prop] = self._interps[prop].interpolate(x)[0]
+            return self._convert_total_props_from_si(TotalProps(
+                h=props_si['h'], S=props_si['S'], gamma=props_si['gamma'],
+                Cp=props_si['Cp'], Cv=props_si['Cv'], rho=props_si['rho'], R=props_si['R']
+            ))
 
     def jvp(self, T_dot, P_dot, FAR_dot=0.0):
         """
@@ -670,7 +694,7 @@ class TabularThermo(ThermoInterface):
         for k in cls._profile_static_MN:
             cls._profile_static_MN[k] = 0.0 if k != 'calls' else 0
 
-    def linearize_static_MN(self, Tt, Pt, MN, W, FAR=None):
+    def linearize_static_MN(self, Tt, Pt, MN, W, FAR=None, sprops=None):
         """
         Compute static properties and cache gradients for static_from_MN.
 
@@ -695,6 +719,9 @@ class TabularThermo(ThermoInterface):
             Mass flow rate (in input units)
         FAR : float, optional
             Fuel-to-air ratio. If None, uses the instance's FAR.
+        sprops : StaticProps, optional
+            Pre-computed static properties from forward pass. If provided,
+            skips the static property value lookups (only computes gradients).
 
         Returns
         -------
@@ -796,14 +823,24 @@ class TabularThermo(ThermoInterface):
         grad_rhos = self._interps['rho'].gradient(x_stat)
         p['grad_static'] += time.perf_counter() - t0
 
-        # Static property values - get all 7 properties for the return value
+        # Static property values - use sprops if provided, else look up
         t0 = time.perf_counter()
-        hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
-        Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
-        gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
-        Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
-        Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
-        R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
+        if sprops is not None:
+            # Use pre-computed values from forward pass (convert to SI)
+            hs_si = sprops.hs * self._h_to_si
+            Ss_si = sprops.S * self._S_to_si
+            gam_s = sprops.gamma  # dimensionless
+            Cp_s = sprops.Cp * self._S_to_si
+            Cv_s = sprops.Cv * self._S_to_si
+            R_s = sprops.R * self._S_to_si
+        else:
+            # Look up from tables
+            hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
+            Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
+            gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
+            Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
+            Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
+            R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
         p['lookup_total'] += time.perf_counter() - t0
 
         # Flow calculations
