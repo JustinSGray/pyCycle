@@ -15,6 +15,280 @@ from ..base import ThermoInterface, TotalProps, StaticProps
 TOTAL_PROPS = ('h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R')
 STATIC_PROPS = ('Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R')
 
+
+class MultiOutputTrilinearInterp:
+    """
+    Trilinear interpolator optimized for multiple outputs sharing the same grid.
+
+    Separates cell search from interpolation to allow bulk evaluation of
+    multiple properties at the same (FAR, P, T) point. This provides significant
+    speedup over calling separate InterpND instances for each property.
+
+    Parameters
+    ----------
+    grid : tuple of ndarray
+        (FAR_grid, P_grid, T_grid) - same for all properties
+    values_dict : dict of ndarray
+        {'h': h_table, 'S': S_table, ...} - one 3D array per property
+    """
+
+    def __init__(self, grid, values_dict):
+        self.grid = grid
+        self.values = values_dict
+        self.property_names = list(values_dict.keys())
+        self._n_props = len(self.property_names)
+        self._prop_idx = {name: i for i, name in enumerate(self.property_names)}
+
+        # Pre-stack all value tables for efficient bulk access
+        # Shape: (n_props, nFAR, nP, nT)
+        self._stacked_values = np.stack(
+            [values_dict[name] for name in self.property_names], axis=0
+        )
+
+        # Cache for bracketing results (last cell indices)
+        self._last_idx = [0, 0, 0]
+
+        # Cache for coefficient reuse when point hasn't changed
+        self._cache_key = None
+        self._cache_coeffs = None
+        self._cache_grid_terms = None
+
+    def bracket(self, x):
+        """
+        Find cell indices for the given point.
+
+        Parameters
+        ----------
+        x : ndarray or tuple
+            Point (FAR, P, T) to locate
+
+        Returns
+        -------
+        idx : tuple of int
+            Cell indices (i_FAR, i_P, i_T)
+        """
+        # Cell search using searchsorted
+        i_FAR = np.searchsorted(self.grid[0], x[0], side='left') - 1
+        i_P = np.searchsorted(self.grid[1], x[1], side='left') - 1
+        i_T = np.searchsorted(self.grid[2], x[2], side='left') - 1
+
+        # Clamp for extrapolation
+        nFAR, nP, nT = len(self.grid[0]), len(self.grid[1]), len(self.grid[2])
+        i_FAR = max(0, min(i_FAR, nFAR - 2))
+        i_P = max(0, min(i_P, nP - 2))
+        i_T = max(0, min(i_T, nT - 2))
+
+        self._last_idx = [i_FAR, i_P, i_T]
+        return (i_FAR, i_P, i_T)
+
+    def _compute_grid_terms(self, idx):
+        """Pre-compute grid spacing terms for coefficient calculation."""
+        i_FAR, i_P, i_T = idx
+
+        x0 = self.grid[0][i_FAR]
+        x1 = self.grid[0][i_FAR + 1]
+        y0 = self.grid[1][i_P]
+        y1 = self.grid[1][i_P + 1]
+        z0 = self.grid[2][i_T]
+        z1 = self.grid[2][i_T + 1]
+
+        rec_vol = 1.0 / ((x0 - x1) * (y0 - y1) * (z0 - z1))
+
+        return {
+            'x0': x0, 'x1': x1,
+            'y0': y0, 'y1': y1,
+            'z0': z0, 'z1': z1,
+            'rec_vol': rec_vol,
+        }
+
+    def _compute_coeffs_all(self, idx, grid_terms, dtype=np.float64):
+        """
+        Compute interpolation coefficients for ALL properties at once.
+
+        Returns
+        -------
+        ndarray
+            Shape (8, n_props) - 8 coefficients for each property
+        """
+        i_FAR, i_P, i_T = idx
+        x0, x1 = grid_terms['x0'], grid_terms['x1']
+        y0, y1 = grid_terms['y0'], grid_terms['y1']
+        z0, z1 = grid_terms['z0'], grid_terms['z1']
+        rec_vol = grid_terms['rec_vol']
+
+        # Extract ALL 8 corners for ALL properties at once
+        # Each corner has shape (n_props,)
+        c000 = self._stacked_values[:, i_FAR, i_P, i_T]
+        c100 = self._stacked_values[:, i_FAR + 1, i_P, i_T]
+        c010 = self._stacked_values[:, i_FAR, i_P + 1, i_T]
+        c001 = self._stacked_values[:, i_FAR, i_P, i_T + 1]
+        c110 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T]
+        c011 = self._stacked_values[:, i_FAR, i_P + 1, i_T + 1]
+        c101 = self._stacked_values[:, i_FAR + 1, i_P, i_T + 1]
+        c111 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T + 1]
+
+        # Compute coefficients for ALL properties at once
+        # a has shape (8, n_props)
+        a = np.empty((8, self._n_props), dtype=dtype)
+
+        a[0] = (-c000 * x1 * y1 * z1 + c001 * x1 * y1 * z0 +
+                c010 * x1 * y0 * z1 - c011 * x1 * y0 * z0 +
+                c100 * x0 * y1 * z1 - c101 * x0 * y1 * z0 -
+                c110 * x0 * y0 * z1 + c111 * x0 * y0 * z0) * rec_vol
+
+        a[1] = (c000 * y1 * z1 - c001 * y1 * z0 - c010 * y0 * z1 +
+                c011 * y0 * z0 - c100 * y1 * z1 + c101 * y1 * z0 +
+                c110 * y0 * z1 - c111 * y0 * z0) * rec_vol
+
+        a[2] = (c000 * x1 * z1 - c001 * x1 * z0 - c010 * x1 * z1 +
+                c011 * x1 * z0 - c100 * x0 * z1 + c101 * x0 * z0 +
+                c110 * x0 * z1 - c111 * x0 * z0) * rec_vol
+
+        a[3] = (c000 * x1 * y1 - c001 * x1 * y1 - c010 * x1 * y0 +
+                c011 * x1 * y0 - c100 * x0 * y1 + c101 * x0 * y1 +
+                c110 * x0 * y0 - c111 * x0 * y0) * rec_vol
+
+        a[4] = (-c000 * z1 + c001 * z0 + c010 * z1 - c011 * z0 +
+                c100 * z1 - c101 * z0 - c110 * z1 + c111 * z0) * rec_vol
+
+        a[5] = (-c000 * y1 + c001 * y1 + c010 * y0 - c011 * y0 +
+                c100 * y1 - c101 * y1 - c110 * y0 + c111 * y0) * rec_vol
+
+        a[6] = (-c000 * x1 + c001 * x1 + c010 * x1 - c011 * x1 +
+                c100 * x0 - c101 * x0 - c110 * x0 + c111 * x0) * rec_vol
+
+        a[7] = (c000 - c001 - c010 + c011 - c100 + c101 + c110 - c111) * rec_vol
+
+        return a
+
+    def interpolate_all(self, x, compute_derivative=True):
+        """
+        Interpolate ALL properties at once.
+
+        Parameters
+        ----------
+        x : ndarray or tuple
+            Point (FAR, P, T)
+        compute_derivative : bool
+            If True, also compute gradients
+
+        Returns
+        -------
+        values : dict
+            {property_name: interpolated_value}
+        gradients : dict or None
+            {property_name: ndarray([dv/dFAR, dv/dP, dv/dT])} if compute_derivative else None
+        """
+        # Create cache key from the point
+        cache_key = (x[0], x[1], x[2])
+
+        # Check if we can reuse cached coefficients
+        if self._cache_key == cache_key and self._cache_coeffs is not None:
+            a = self._cache_coeffs
+            grid_terms = self._cache_grid_terms
+            idx = self._last_idx
+        else:
+            # Do cell search and compute coefficients
+            idx = self.bracket(x)
+            grid_terms = self._compute_grid_terms(idx)
+            a = self._compute_coeffs_all(idx, grid_terms)
+
+            # Cache for reuse
+            self._cache_key = cache_key
+            self._cache_coeffs = a
+            self._cache_grid_terms = grid_terms
+
+        xv, yv, zv = x  # actual coordinates (FAR, P, T)
+
+        # Evaluate polynomial for ALL properties at once
+        # val has shape (n_props,)
+        val = (a[0] + (a[1] + (a[4] + a[7] * zv) * yv) * xv +
+               a[2] * yv + (a[3] + a[5] * xv + a[6] * yv) * zv)
+
+        # Package values as dict
+        values = {name: val[i] for i, name in enumerate(self.property_names)}
+
+        if compute_derivative:
+            # Compute gradients for ALL properties at once
+            # Each gradient component has shape (n_props,)
+            d_x = a[1] + yv * a[4] + zv * (a[5] + yv * a[7])  # d/dFAR
+            d_y = a[2] + xv * a[4] + zv * (a[6] + xv * a[7])  # d/dP
+            d_z = a[3] + xv * a[5] + yv * (a[6] + xv * a[7])  # d/dT
+
+            gradients = {name: np.array([d_x[i], d_y[i], d_z[i]])
+                         for i, name in enumerate(self.property_names)}
+            return values, gradients
+        else:
+            return values, None
+
+    def interpolate_subset(self, x, properties, compute_derivative=True):
+        """
+        Interpolate only specified properties.
+
+        This is optimized to compute all coefficients once (since they share
+        the same cell), then extract only the requested properties.
+
+        Parameters
+        ----------
+        x : ndarray or tuple
+            Point (FAR, P, T)
+        properties : list of str
+            Which properties to interpolate
+        compute_derivative : bool
+            If True, also compute gradients
+
+        Returns
+        -------
+        values : dict
+        gradients : dict or None
+        """
+        # Create cache key from the point
+        cache_key = (x[0], x[1], x[2])
+
+        # Check if we can reuse cached coefficients
+        if self._cache_key == cache_key and self._cache_coeffs is not None:
+            a = self._cache_coeffs
+        else:
+            # Do cell search and compute coefficients
+            idx = self.bracket(x)
+            grid_terms = self._compute_grid_terms(idx)
+            a = self._compute_coeffs_all(idx, grid_terms)
+
+            # Cache for reuse
+            self._cache_key = cache_key
+            self._cache_coeffs = a
+            self._cache_grid_terms = grid_terms
+
+        xv, yv, zv = x  # actual coordinates (FAR, P, T)
+
+        # Get property indices
+        prop_indices = [self._prop_idx[p] for p in properties]
+
+        # Evaluate polynomial for selected properties
+        values = {}
+        for prop, i in zip(properties, prop_indices):
+            ai = a[:, i]  # coefficients for this property
+            values[prop] = (ai[0] + (ai[1] + (ai[4] + ai[7] * zv) * yv) * xv +
+                           ai[2] * yv + (ai[3] + ai[5] * xv + ai[6] * yv) * zv)
+
+        if compute_derivative:
+            gradients = {}
+            for prop, i in zip(properties, prop_indices):
+                ai = a[:, i]
+                d_x = ai[1] + yv * ai[4] + zv * (ai[5] + yv * ai[7])  # d/dFAR
+                d_y = ai[2] + xv * ai[4] + zv * (ai[6] + xv * ai[7])  # d/dP
+                d_z = ai[3] + xv * ai[5] + yv * (ai[6] + xv * ai[7])  # d/dT
+                gradients[prop] = np.array([d_x, d_y, d_z])
+            return values, gradients
+        else:
+            return values, None
+
+    def invalidate_cache(self):
+        """Clear the coefficient cache (call when point will change)."""
+        self._cache_key = None
+        self._cache_coeffs = None
+        self._cache_grid_terms = None
+
 # Unit conversion factor mapping for jvp/vjp
 _PROP_UNIT_FACTORS = {
     'gamma': 'dimensionless',
@@ -59,7 +333,7 @@ class TabularThermo(ThermoInterface):
     _FAR_DERIVS = np.array([0.0, 0.0, 0.0, 0.0, 1.0])   # d/d[Tt, Pt, MN, W, FAR] for FAR
     _MN_DERIVS = np.array([0.0, 0.0, 1.0, 0.0, 0.0])    # d/d[Tt, Pt, MN, W, FAR] for MN
 
-    def __init__(self, FAR=0.0, spec=None, input_units='SI'):
+    def __init__(self, FAR=0.0, spec=None, input_units='SI', use_bulk_interp=True):
         # Register this instance
         TabularThermo._instances.append(self)
         from openmdao.components.interp_util.interp import InterpND
@@ -73,12 +347,23 @@ class TabularThermo(ThermoInterface):
         self.spec = spec
 
         self.FAR = FAR
+        self._use_bulk_interp = use_bulk_interp
 
         # Create interpolators for each property
         # Grid points: (FAR, P, T) - tables are in SI units
         points = (spec['FAR'], spec['P'], spec['T'])
 
-        # Use 3D-slinear for 3D grids - it's ~2.3x faster than generic slinear
+        # HYBRID APPROACH:
+        # - Bulk interpolator for props_TP and linearize (7 props at same point)
+        # - Separate InterpND for Newton loops (1-4 props at changing points)
+        # This gives optimal performance for both use cases
+
+        # Bulk multi-output interpolator for full property lookups
+        values_dict = {prop: spec[prop] for prop in TOTAL_PROPS}
+        self._bulk_interp = MultiOutputTrilinearInterp(points, values_dict)
+
+        # Separate InterpND instances for Newton loop lookups
+        # These are more efficient when points change frequently
         self._interps = {}
         for prop in TOTAL_PROPS:
             self._interps[prop] = InterpND(
@@ -93,6 +378,10 @@ class TabularThermo(ThermoInterface):
         self._cache_T_from_hP = None  # T (SI)
         self._cache_T_from_SP = None  # T (SI)
         self._cache_static_MN = None  # (Ts, Ps) in SI
+
+        # Cache for h value/gradient from T_from_hP to avoid redundant lookup in linearize
+        # Format: (T_si, P_si, FAR, h_si, grad_h) where grad_h is (dh/dFAR, dh/dP, dh/dT)
+        self._cache_h_for_linearize = None
 
         # Flags to control whether to apply empirical guess or use cached value
         self._needs_guess_T_from_hP = True
@@ -167,10 +456,52 @@ class TabularThermo(ThermoInterface):
         cls._instances = []
 
     def _lookup_si(self, prop, T_si, P_si, FAR=None):
-        """Internal lookup function in SI units."""
+        """Internal lookup function in SI units.
+        Uses separate InterpND (optimized for single property, changing points).
+        """
         FAR = self._get_FAR(FAR)
         x = np.array([FAR, P_si, T_si])
         return self._interps[prop].interpolate(x)[0]
+
+    def _lookup_si_with_grad(self, prop, T_si, P_si, FAR=None):
+        """Internal lookup function in SI units, returning value and gradient.
+        Uses separate InterpND (optimized for single property, changing points).
+        """
+        FAR = self._get_FAR(FAR)
+        x = np.array([FAR, P_si, T_si])
+        val, grad = self._interps[prop].interpolate(x, compute_derivative=True)
+        return val[0], grad[0]
+
+    def _lookup_all_si(self, T_si, P_si, FAR=None, compute_derivative=True):
+        """Lookup all properties at once in SI units.
+        Uses bulk interpolator (optimized for many properties at same point).
+        """
+        FAR = self._get_FAR(FAR)
+        x = np.array([FAR, P_si, T_si])
+        return self._bulk_interp.interpolate_all(x, compute_derivative=compute_derivative)
+
+    def _lookup_subset_si_bulk(self, T_si, P_si, FAR, properties, compute_derivative=True):
+        """Lookup a subset of properties using bulk interpolator.
+        Use when point is stable (same point multiple times).
+        """
+        x = np.array([FAR, P_si, T_si])
+        return self._bulk_interp.interpolate_subset(x, properties, compute_derivative=compute_derivative)
+
+    def _lookup_subset_si(self, T_si, P_si, FAR, properties, compute_derivative=True):
+        """Lookup a subset of properties using separate InterpND instances.
+        Use for Newton loops where point changes each iteration.
+        """
+        x = np.array([FAR, P_si, T_si])
+        values = {}
+        gradients = {} if compute_derivative else None
+        for prop in properties:
+            if compute_derivative:
+                val, grad = self._interps[prop].interpolate(x, compute_derivative=True)
+                values[prop] = val[0]
+                gradients[prop] = grad[0]
+            else:
+                values[prop] = self._interps[prop].interpolate(x)[0]
+        return values, gradients
 
     # =========================================================================
     # Linearization and JAX-compatible derivatives
@@ -206,8 +537,6 @@ class TabularThermo(ThermoInterface):
         T_si = self._convert_T_to_si(T)
         P_si = P * self._P_to_si
 
-        x = np.array([FAR, P_si, T_si])
-
         # Store the linearization point
         self._lin_T = T
         self._lin_P = P
@@ -215,14 +544,31 @@ class TabularThermo(ThermoInterface):
         self._lin_T_si = T_si
         self._lin_P_si = P_si
 
-        # Compute values and gradients together using compute_derivative=True
-        # This avoids redundant cell lookups
-        self._gradients_si = {}
-        props_si = {}
-        for prop in TOTAL_PROPS:
-            val, grad = self._interps[prop].interpolate(x, compute_derivative=True)
-            props_si[prop] = val[0]
-            self._gradients_si[prop] = grad[0]
+        # Check if we have cached h from a recent T_from_hP call at this point
+        h_cached = False
+        cached_h = None
+        cached_h_grad = None
+        if self._cache_h_for_linearize is not None:
+            cache_T, cache_P, cache_FAR, cache_h, cache_grad = self._cache_h_for_linearize
+            if (abs(T_si - cache_T) < 1e-10 and
+                abs(P_si - cache_P) < 1e-10 and
+                abs(FAR - cache_FAR) < 1e-10):
+                # Reuse cached h value and gradient from T_from_hP
+                cached_h = cache_h
+                cached_h_grad = cache_grad
+                h_cached = True
+            # Clear the cache after use (it's only valid for the immediate next call)
+            self._cache_h_for_linearize = None
+
+        # Bulk lookup: get all values and gradients in one call
+        props_si, gradients_si = self._lookup_all_si(T_si, P_si, FAR, compute_derivative=True)
+
+        # If we had cached h, use that instead
+        if h_cached:
+            props_si['h'] = cached_h
+            gradients_si['h'] = cached_h_grad
+
+        self._gradients_si = gradients_si
 
         # If props provided from forward pass, use those; otherwise use computed
         if props is not None:
@@ -365,15 +711,17 @@ class TabularThermo(ThermoInterface):
         T_si = self._convert_T_to_si(T)
         P_si = P * self._P_to_si
 
-        # Lookup in SI
+        # Bulk lookup in SI (single cell search, all properties at once)
+        values, _ = self._lookup_all_si(T_si, P_si, FAR, compute_derivative=False)
+
         props_si = TotalProps(
-            h=self._lookup_si('h', T_si, P_si, FAR),
-            S=self._lookup_si('S', T_si, P_si, FAR),
-            gamma=self._lookup_si('gamma', T_si, P_si, FAR),
-            Cp=self._lookup_si('Cp', T_si, P_si, FAR),
-            Cv=self._lookup_si('Cv', T_si, P_si, FAR),
-            rho=self._lookup_si('rho', T_si, P_si, FAR),
-            R=self._lookup_si('R', T_si, P_si, FAR)
+            h=values['h'],
+            S=values['S'],
+            gamma=values['gamma'],
+            Cp=values['Cp'],
+            Cv=values['Cv'],
+            rho=values['rho'],
+            R=values['R']
         )
 
         # Convert outputs from SI
@@ -480,13 +828,13 @@ class TabularThermo(ThermoInterface):
             T = self._cache_T_from_hP
 
         converged = False
+        grad_h = None
         for _ in range(max_iter):
-            x = np.array([FAR, P_si, T])
-
-            # Get h and dh/dT in single call (avoids redundant cell lookup)
-            h_arr, grad_h_2d = self._interps['h'].interpolate(x, compute_derivative=True)
-            h = h_arr[0]
-            dh_dT = grad_h_2d[0, 2]  # (dh/dFAR, dh/dP, dh/dT)
+            # Get h and dh/dT using bulk interpolator
+            values, gradients = self._lookup_subset_si(T, P_si, FAR, ['h'], compute_derivative=True)
+            h = values['h']
+            grad_h = gradients['h']  # (dh/dFAR, dh/dP, dh/dT)
+            dh_dT = grad_h[2]
 
             # Residual and derivative
             residual = h - h_target_si
@@ -521,6 +869,11 @@ class TabularThermo(ThermoInterface):
 
         # Cache the converged solution
         self._cache_T_from_hP = T
+
+        # Cache h value and gradient for reuse in linearize()
+        # This avoids redundant lookup when linearize is called right after T_from_hP
+        if grad_h is not None:
+            self._cache_h_for_linearize = (T, P_si, FAR, h, grad_h.copy())
 
         return T
 
@@ -609,10 +962,12 @@ class TabularThermo(ThermoInterface):
         """
         FAR = self._get_FAR(FAR)
 
-        # Get total properties
-        ht = self._lookup_si('h', Tt_si, Pt_si, FAR)
-        S_total = self._lookup_si('S', Tt_si, Pt_si, FAR)
-        gamma_t = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
+        # Get total properties using bulk lookup
+        tot_values, _ = self._lookup_subset_si(Tt_si, Pt_si, FAR, ['h', 'S', 'gamma'],
+                                                compute_derivative=False)
+        ht = tot_values['h']
+        S_total = tot_values['S']
+        gamma_t = tot_values['gamma']
 
         # Handle zero Mach number case (no flow, static = total)
         if MN < 1e-10:
@@ -620,9 +975,12 @@ class TabularThermo(ThermoInterface):
             Ts = Tt_si
             Ps = Pt_si
             gam_s = gamma_t
-            R_s = self._lookup_si('R', Ts, Ps, FAR)
-            Cp_s = self._lookup_si('Cp', Ts, Ps, FAR)
-            Cv_s = self._lookup_si('Cv', Ts, Ps, FAR)
+            # Get remaining properties
+            extra_values, _ = self._lookup_subset_si(Ts, Ps, FAR, ['R', 'Cp', 'Cv'],
+                                                      compute_derivative=False)
+            R_s = extra_values['R']
+            Cp_s = extra_values['Cp']
+            Cv_s = extra_values['Cv']
             rhos = Ps / (R_s * Ts)
             return StaticProps(Ts=Ts, Ps=Ps, hs=hs, rhos=rhos,
                               MN=MN, V=0.0, Vsonic=np.sqrt(gam_s * R_s * Ts), area=np.inf,
@@ -654,25 +1012,19 @@ class TabularThermo(ThermoInterface):
 
         converged = False
         for _ in range(max_iter):
-            # Evaluate properties and gradients at current (Ts, Ps)
-            x = np.array([FAR, Ps, Ts])
+            # Bulk lookup: Get all 4 properties needed for Newton in ONE call
+            values, gradients = self._lookup_subset_si(Ts, Ps, FAR, ['S', 'h', 'gamma', 'R'],
+                                                       compute_derivative=True)
 
-            # Get values AND gradients in single calls (avoids redundant cell lookups)
-            # Each call returns (value_array, gradient_2d_array)
-            S_arr, grad_S_2d = self._interps['S'].interpolate(x, compute_derivative=True)
-            h_arr, grad_h_2d = self._interps['h'].interpolate(x, compute_derivative=True)
-            gam_arr, grad_gam_2d = self._interps['gamma'].interpolate(x, compute_derivative=True)
-            R_arr, grad_R_2d = self._interps['R'].interpolate(x, compute_derivative=True)
+            S_s = values['S']
+            hs = values['h']
+            gamma_s = values['gamma']
+            R_s = values['R']
 
-            S_s = S_arr[0]
-            hs = h_arr[0]
-            gamma_s = gam_arr[0]
-            R_s = R_arr[0]
-
-            grad_S = grad_S_2d[0]
-            grad_h = grad_h_2d[0]
-            grad_gamma = grad_gam_2d[0]
-            grad_R = grad_R_2d[0]
+            grad_S = gradients['S']      # (dS/dFAR, dS/dP, dS/dT)
+            grad_h = gradients['h']      # (dh/dFAR, dh/dP, dh/dT)
+            grad_gamma = gradients['gamma']
+            grad_R = gradients['R']
 
             # Compute residuals
             # R1: entropy conservation (normalized)
@@ -744,8 +1096,9 @@ class TabularThermo(ThermoInterface):
 
         # Reuse hs, gamma_s, R_s from last Newton iteration (already computed above)
         # Only look up Cp and Cv which weren't needed for the Newton solve
-        Cp_s = self._lookup_si('Cp', Ts, Ps, FAR)
-        Cv_s = self._lookup_si('Cv', Ts, Ps, FAR)
+        extra_values, _ = self._lookup_subset_si(Ts, Ps, FAR, ['Cp', 'Cv'], compute_derivative=False)
+        Cp_s = extra_values['Cp']
+        Cv_s = extra_values['Cv']
 
         # Speed of sound and velocity (use static properties from Newton loop)
         Vsonic = np.sqrt(gamma_s * R_s * Ts)
@@ -801,12 +1154,11 @@ class TabularThermo(ThermoInterface):
 
         converged = False
         for _ in range(max_iter):
-            x = np.array([FAR, P_si, T])
-
-            # Get S and dS/dT in single call (avoids redundant cell lookup)
-            S_arr, grad_S_2d = self._interps['S'].interpolate(x, compute_derivative=True)
-            S = S_arr[0]
-            dS_dT = grad_S_2d[0, 2]  # (dS/dFAR, dS/dP, dS/dT)
+            # Get S and dS/dT using bulk interpolator
+            values, gradients = self._lookup_subset_si(T, P_si, FAR, ['S'], compute_derivative=True)
+            S = values['S']
+            grad_S = gradients['S']  # (dS/dFAR, dS/dP, dS/dT)
+            dS_dT = grad_S[2]
 
             # Residual
             residual = S - S_target_si
@@ -1105,34 +1457,30 @@ class TabularThermo(ThermoInterface):
             Ts_si = self._convert_T_to_si(props.Ts)
             Ps_si = props.Ps * self._P_to_si
 
-        # Get total properties and their gradients (combined call)
-        x_tot = np.array([FAR, Pt_si, Tt_si])
-        ht_arr, grad_ht_2d = self._interps['h'].interpolate(x_tot, compute_derivative=True)
-        St_arr, grad_St_2d = self._interps['S'].interpolate(x_tot, compute_derivative=True)
-        ht_si = ht_arr[0]
-        S_total = St_arr[0]
-        grad_ht_tot = grad_ht_2d[0]  # (dh/dFAR, dh/dP, dh/dT)
-        grad_S_tot = grad_St_2d[0]   # (dS/dFAR, dS/dP, dS/dT)
+        # Get total properties and their gradients (bulk call - h and S at total conditions)
+        tot_values, tot_grads = self._lookup_subset_si(Tt_si, Pt_si, FAR, ['h', 'S'],
+                                                        compute_derivative=True)
+        ht_si = tot_values['h']
+        S_total = tot_values['S']
+        grad_ht_tot = tot_grads['h']  # (dh/dFAR, dh/dP, dh/dT)
+        grad_S_tot = tot_grads['S']   # (dS/dFAR, dS/dP, dS/dT)
 
-        # Get static properties and their gradients at (Ts, Ps, FAR) (combined calls)
-        x_stat = np.array([FAR, Ps_si, Ts_si])
-        hs_arr, grad_hs_2d = self._interps['h'].interpolate(x_stat, compute_derivative=True)
-        Ss_arr, grad_Ss_2d = self._interps['S'].interpolate(x_stat, compute_derivative=True)
-        gams_arr, grad_gams_2d = self._interps['gamma'].interpolate(x_stat, compute_derivative=True)
-        Rs_arr, grad_Rs_2d = self._interps['R'].interpolate(x_stat, compute_derivative=True)
-        Cps_arr, grad_Cps_2d = self._interps['Cp'].interpolate(x_stat, compute_derivative=True)
-        Cvs_arr, grad_Cvs_2d = self._interps['Cv'].interpolate(x_stat, compute_derivative=True)
+        # Get static properties and their gradients at (Ts, Ps, FAR) (bulk call - all needed props)
+        stat_values, stat_grads = self._lookup_subset_si(
+            Ts_si, Ps_si, FAR, ['h', 'S', 'gamma', 'R', 'Cp', 'Cv'],
+            compute_derivative=True
+        )
 
-        hs_si = hs_arr[0]
-        gamma_s = gams_arr[0]
-        R_s = Rs_arr[0]
+        hs_si = stat_values['h']
+        gamma_s = stat_values['gamma']
+        R_s = stat_values['R']
 
-        grad_hs = grad_hs_2d[0]      # (dhs/dFAR, dhs/dPs, dhs/dTs)
-        grad_Ss = grad_Ss_2d[0]      # (dSs/dFAR, dSs/dPs, dSs/dTs)
-        grad_gams = grad_gams_2d[0]
-        grad_Rs = grad_Rs_2d[0]
-        grad_Cps = grad_Cps_2d[0]
-        grad_Cvs = grad_Cvs_2d[0]
+        grad_hs = stat_grads['h']      # (dhs/dFAR, dhs/dPs, dhs/dTs)
+        grad_Ss = stat_grads['S']      # (dSs/dFAR, dSs/dPs, dSs/dTs)
+        grad_gams = stat_grads['gamma']
+        grad_Rs = stat_grads['R']
+        grad_Cps = stat_grads['Cp']
+        grad_Cvs = stat_grads['Cv']
 
         MN_sq = MN ** 2
 
@@ -1505,19 +1853,24 @@ class TabularThermo(ThermoInterface):
         Ps_si = Ps * self._P_to_si
         W_si = W * self._W_to_si
 
-        # Get total properties in SI (J/kg for enthalpy)
-        ht_si = self._lookup_si('h', Tt_si, Pt_si, FAR)
-        S_total = self._lookup_si('S', Tt_si, Pt_si, FAR)
+        # Get total properties in SI (J/kg for enthalpy) using bulk lookup
+        tot_values, _ = self._lookup_subset_si(Tt_si, Pt_si, FAR, ['h', 'S'],
+                                                compute_derivative=False)
+        ht_si = tot_values['h']
+        S_total = tot_values['S']
 
         # Find Ts from entropy constraint: S(Ts, Ps) = S_total
         Ts_si = self._T_from_SP_si(S_total, Ps_si, FAR)
 
-        # Full static properties at (Ts, Ps) in SI
-        hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
-        gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
-        Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
-        Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
-        R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
+        # Full static properties at (Ts, Ps) in SI using bulk lookup
+        stat_values, _ = self._lookup_subset_si(Ts_si, Ps_si, FAR,
+                                                 ['h', 'gamma', 'Cp', 'Cv', 'R'],
+                                                 compute_derivative=False)
+        hs_si = stat_values['h']
+        gam_s = stat_values['gamma']
+        Cp_s = stat_values['Cp']
+        Cv_s = stat_values['Cv']
+        R_s = stat_values['R']
 
         # Speed of sound in SI (m/s)
         Vsonic_si = np.sqrt(gam_s * R_s * Ts_si)
