@@ -554,41 +554,88 @@ class JaxTabularThermo:
         h_to_si, h_from_si, P_to_si, T_to_si_scale, S_from_si, rho_from_si = self._unit_conversions
 
         # Additional conversion factors for static properties
-        # W: lbm/s -> kg/s
-        W_to_si = 0.45359237
-        # area: inch^2 -> m^2
-        area_to_si = 0.00064516
+        W_to_si = 0.45359237      # lbm/s -> kg/s
+        area_to_si = 0.00064516   # inch^2 -> m^2
         area_from_si = 1.0 / area_to_si
-        # velocity: m/s -> ft/s
-        V_from_si = 3.28084
-        # R: J/(kg*K) -> ft*lbf/(lbm*R) for Vsonic calc
-        # Actually for Vsonic = sqrt(gamma*R*T), R is in J/(kg*K), T in K, result in m/s
-        # So we convert Vsonic from m/s to ft/s at the end
+        V_from_si = 3.28084       # m/s -> ft/s
+
+        # =====================================================================
+        # Shared Helper Functions
+        # =====================================================================
 
         def props_at_TP_si(T_si, P_si, FAR):
             """Get properties at given T, P in SI units."""
             point = jnp.array([FAR, P_si, T_si])
-            props_si = interp.interpolate(point)
-            return props_si
+            return interp.interpolate(point)
 
         def props_at_TP_si_with_derivs(T_si, P_si, FAR):
-            """Get properties and analytical derivatives at given T, P in SI units.
-
-            Returns
-            -------
-            props : dict
-                Property values
-            dprops_dP : dict
-                Derivatives w.r.t. P (in SI units)
-            dprops_dT : dict
-                Derivatives w.r.t. T (in SI units)
-            """
+            """Get properties and analytical derivatives at given T, P in SI units."""
             point = jnp.array([FAR, P_si, T_si])
             return interp.interpolate_with_derivs(point)
 
+        def compute_isentropic_initial_guess(Tt_si, Pt_si, gamma_t, MN):
+            """Compute initial (Ts, Ps) guess using ideal gas isentropic relations."""
+            MN_sq = MN ** 2
+            Ps0_si = Pt_si * (1.0 + (gamma_t - 1.0) / 2.0 * MN_sq) ** (-gamma_t / (gamma_t - 1.0))
+            Ts0_si = Tt_si * (Ps0_si / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+            return Ts0_si, Ps0_si
+
+        def compute_R1_R2_jacobian(Ts_si, MN_sq, gamma_s, R_s,
+                                    dS_dT, dS_dP, dh_dT, dh_dP,
+                                    dgamma_dT, dgamma_dP, dR_dT, dR_dP):
+            """
+            Compute Jacobian entries for R1 (entropy) and R2 (energy) residuals.
+
+            Returns (dR1_dT, dR1_dP, dR2_dT, dR2_dP) - the 2x2 Jacobian for the
+            entropy and energy equations w.r.t. (Ts, Ps).
+            """
+            # R1 = S - S_total
+            dR1_dT = dS_dT
+            dR1_dP = dS_dP
+
+            # R2 = hs + 0.5*MN²*γ*R*Ts - ht
+            # V² = MN² * Vsonic² = MN² * γ * R * Ts
+            dVsq_dT = MN_sq * (dgamma_dT * R_s * Ts_si + gamma_s * dR_dT * Ts_si + gamma_s * R_s)
+            dVsq_dP = MN_sq * (dgamma_dP * R_s * Ts_si + gamma_s * dR_dP * Ts_si)
+            dR2_dT = dh_dT + 0.5 * dVsq_dT
+            dR2_dP = dh_dP + 0.5 * dVsq_dP
+
+            return dR1_dT, dR1_dP, dR2_dT, dR2_dP
+
+        def solve_2x2(J11, J12, J21, J22, R1, R2):
+            """Solve 2x2 linear system: J * dx = -R, returns (dx1, dx2)."""
+            det = J11 * J22 - J12 * J21
+            det = jnp.where(jnp.abs(det) < 1e-20, 1e-20, det)
+            dx1 = (-R1 * J22 + R2 * J12) / det
+            dx2 = (-R2 * J11 + R1 * J21) / det
+            return dx1, dx2
+
+        def convert_static_to_english(Ts_si, Ps_si, hs_si, rho_s, MN, V_s, Vsonic_s,
+                                       area_s, gamma_s, Cp_s, Cv_s, S_s, R_s):
+            """Convert static properties from SI to English units."""
+            return jnp.array([
+                Ts_si / T_to_si_scale,      # Ts (degR)
+                Ps_si / P_to_si,            # Ps (psi)
+                hs_si * h_from_si,          # hs (Btu/lbm)
+                rho_s * rho_from_si,        # rhos (lbm/ft³)
+                MN,                         # MN (dimensionless)
+                V_s * V_from_si,            # V (ft/s)
+                Vsonic_s * V_from_si,       # Vsonic (ft/s)
+                area_s * area_from_si,      # area (in²)
+                gamma_s,                    # gamma (dimensionless)
+                Cp_s * S_from_si,           # Cp (Btu/(lbm·R))
+                Cv_s * S_from_si,           # Cv (Btu/(lbm·R))
+                S_s * S_from_si,            # S (Btu/(lbm·R))
+                R_s * S_from_si,            # R (Btu/(lbm·R))
+            ])
+
+        # =====================================================================
+        # static_from_MN: 2D Newton solver for (Ts, Ps) given MN
+        # =====================================================================
+
         def static_from_MN_impl(Tt, Pt, MN, W, FAR):
-            """Pure JAX static_from_MN implementation."""
-            # Convert to SI
+            """Pure JAX static_from_MN: solve for (Ts, Ps) given MN."""
+            # Convert inputs to SI
             Tt_si = Tt * T_to_si_scale
             Pt_si = Pt * P_to_si
             W_si = W * W_to_si
@@ -602,170 +649,101 @@ class JaxTabularThermo:
             Cp_t = tot_props['Cp']
             Cv_t = tot_props['Cv']
 
-            # Clamp MN to avoid numerical issues (but still run Newton solver)
+            # Clamp MN
             MN_clamped = jnp.maximum(MN, 1e-10)
             MN_sq = MN_clamped ** 2
 
-            # Initial guess using ideal gas isentropic relations
-            Ps0_si = Pt_si * (1.0 + (gamma_t - 1.0) / 2.0 * MN_sq) ** (-gamma_t / (gamma_t - 1.0))
-            Ts0_si = Tt_si * (Ps0_si / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+            # Initial guess
+            Ts0_si, Ps0_si = compute_isentropic_initial_guess(Tt_si, Pt_si, gamma_t, MN_clamped)
 
-            # 2D Newton solver for (Ts, Ps) using while_loop
-            # Residuals:
-            #   R1 = S(Ts, Ps) - S_total  (entropy conservation)
-            #   R2 = hs + MN²·γ·R·Ts/2 - ht  (energy conservation)
-            #
-            # State carries props and derivatives to avoid redundant lookups.
-            # State indices:
-            #   0: Ts_si, 1: Ps_si, 2: R1, 3: R2,
-            #   4: S, 5: h, 6: gamma, 7: R,
-            #   8: dS_dT, 9: dS_dP, 10: dh_dT, 11: dh_dP,
-            #   12: dgamma_dT, 13: dgamma_dP, 14: dR_dT, 15: dR_dP,
-            #   16: iteration
-
-            def compute_state_from_TP(Ts_si, Ps_si, i):
-                """Compute full state including props, derivs, and residuals."""
+            # 2D Newton state: [Ts, Ps, R1, R2, S, hs, gamma, R,
+            #                   dS_dT, dS_dP, dh_dT, dh_dP, dgamma_dT, dgamma_dP, dR_dT, dR_dP, iter]
+            def compute_state_2d(Ts_si, Ps_si, i):
                 props_s, dprops_dP, dprops_dT = props_at_TP_si_with_derivs(Ts_si, Ps_si, FAR)
-                S_s = props_s['S']
-                hs_si = props_s['h']
-                gamma_s = props_s['gamma']
-                R_s = props_s['R']
+                S_s, hs_si, gamma_s, R_s = props_s['S'], props_s['h'], props_s['gamma'], props_s['R']
 
-                # Residuals
                 Vsonic_sq = gamma_s * R_s * Ts_si
-                V_sq = MN_sq * Vsonic_sq
                 R1 = S_s - S_total
-                R2 = hs_si + 0.5 * V_sq - ht_si
+                R2 = hs_si + 0.5 * MN_sq * Vsonic_sq - ht_si
 
                 return jnp.array([
                     Ts_si, Ps_si, R1, R2,
                     S_s, hs_si, gamma_s, R_s,
-                    dprops_dT['S'], dprops_dP['S'],
-                    dprops_dT['h'], dprops_dP['h'],
-                    dprops_dT['gamma'], dprops_dP['gamma'],
-                    dprops_dT['R'], dprops_dP['R'],
+                    dprops_dT['S'], dprops_dP['S'], dprops_dT['h'], dprops_dP['h'],
+                    dprops_dT['gamma'], dprops_dP['gamma'], dprops_dT['R'], dprops_dP['R'],
                     i
                 ])
 
             def cond_fn_2d(state):
                 R1, R2, i = state[2], state[3], state[16]
-                residual_norm = jnp.sqrt(R1**2 + R2**2)
-                return (residual_norm > 1e-8) & (i < 20)
+                return (jnp.sqrt(R1**2 + R2**2) > 1e-8) & (i < 20)
 
             def body_fn_2d(state):
-                # Unpack state - props and derivs already computed
                 Ts_si, Ps_si = state[0], state[1]
                 R1, R2 = state[2], state[3]
                 gamma_s, R_s = state[6], state[7]
-                dS_dT, dS_dP = state[8], state[9]
-                dh_dT, dh_dP = state[10], state[11]
-                dgamma_dT, dgamma_dP = state[12], state[13]
-                dR_dT, dR_dP = state[14], state[15]
                 i = state[16]
 
-                # Analytical Jacobian (no interpolation needed - already have derivs!)
-                dR1_dT = dS_dT
-                dR1_dP = dS_dP
+                dR1_dT, dR1_dP, dR2_dT, dR2_dP = compute_R1_R2_jacobian(
+                    Ts_si, MN_sq, gamma_s, R_s,
+                    state[8], state[9], state[10], state[11],
+                    state[12], state[13], state[14], state[15]
+                )
 
-                dVsq_dT = MN_sq * (dgamma_dT * R_s * Ts_si + gamma_s * dR_dT * Ts_si + gamma_s * R_s)
-                dVsq_dP = MN_sq * (dgamma_dP * R_s * Ts_si + gamma_s * dR_dP * Ts_si)
+                dTs, dPs = solve_2x2(dR1_dT, dR1_dP, dR2_dT, dR2_dP, R1, R2)
 
-                dR2_dT = dh_dT + 0.5 * dVsq_dT
-                dR2_dP = dh_dP + 0.5 * dVsq_dP
-
-                # Solve 2x2 system: J * dx = -R
-                det = dR1_dT * dR2_dP - dR1_dP * dR2_dT
-                det = jnp.where(jnp.abs(det) < 1e-20, 1e-20, det)
-
-                dTs = (-R1 * dR2_dP + R2 * dR1_dP) / det
-                dPs = (-R2 * dR1_dT + R1 * dR2_dT) / det
-
-                # Clamp updates
                 Ts_new = jnp.clip(Ts_si + dTs, 160.0, 2400.0)
                 Ps_new = jnp.clip(Ps_si + dPs, 100.0, 1e8)
+                return compute_state_2d(Ts_new, Ps_new, i + 1)
 
-                # Compute new state (ONE interpolation call for next iteration)
-                return compute_state_from_TP(Ts_new, Ps_new, i + 1)
-
-            # Initialize state with ONE interpolation call
-            init_state = compute_state_from_TP(Ts0_si, Ps0_si, 0.0)
-
-            # Run 2D Newton iteration
+            # Run 2D Newton
+            init_state = compute_state_2d(Ts0_si, Ps0_si, 0.0)
             final_state = jax.lax.while_loop(cond_fn_2d, body_fn_2d, init_state)
 
-            # Extract results from Newton solver
-            Ts_newton = final_state[0]
-            Ps_newton = final_state[1]
-            S_newton = final_state[4]
-            hs_newton = final_state[5]
-            gamma_newton = final_state[6]
-            R_newton = final_state[7]
+            # Extract solution
+            Ts_newton, Ps_newton = final_state[0], final_state[1]
+            S_newton, hs_newton = final_state[4], final_state[5]
+            gamma_newton, R_newton = final_state[6], final_state[7]
 
-            # Only Cp and Cv need a final lookup (not in state)
+            # Get Cp, Cv (not in state)
             props_final = props_at_TP_si(Ts_newton, Ps_newton, FAR)
-            Cp_newton = props_final['Cp']
-            Cv_newton = props_final['Cv']
+            Cp_newton, Cv_newton = props_final['Cp'], props_final['Cv']
 
-            # Compute derived quantities for Newton solution
+            # Compute derived quantities
             rhos_newton = Ps_newton / (R_newton * Ts_newton)
             Vsonic_newton = jnp.sqrt(gamma_newton * R_newton * Ts_newton)
             V_newton = MN_clamped * Vsonic_newton
             area_newton = W_si / (rhos_newton * V_newton)
 
             # === Compute darea/dMN via implicit differentiation ===
-            # Extract Jacobian entries from final state
-            dS_dT_final = final_state[8]
-            dS_dP_final = final_state[9]
-            dh_dT_final = final_state[10]
-            dh_dP_final = final_state[11]
-            dgamma_dT_final = final_state[12]
-            dgamma_dP_final = final_state[13]
-            dR_dT_final = final_state[14]
-            dR_dP_final = final_state[15]
-
-            # Recompute dR2_dT and dR2_dP at converged point
             Vsonic_sq_newton = gamma_newton * R_newton * Ts_newton
-            dVsq_dT_final = MN_sq * (dgamma_dT_final * R_newton * Ts_newton
-                                     + gamma_newton * dR_dT_final * Ts_newton
-                                     + gamma_newton * R_newton)
-            dVsq_dP_final = MN_sq * (dgamma_dP_final * R_newton * Ts_newton
-                                     + gamma_newton * dR_dP_final * Ts_newton)
-            dR2_dT_final = dh_dT_final + 0.5 * dVsq_dT_final
-            dR2_dP_final = dh_dP_final + 0.5 * dVsq_dP_final
+            dR1_dT, dR1_dP, dR2_dT, dR2_dP = compute_R1_R2_jacobian(
+                Ts_newton, MN_sq, gamma_newton, R_newton,
+                final_state[8], final_state[9], final_state[10], final_state[11],
+                final_state[12], final_state[13], final_state[14], final_state[15]
+            )
 
-            # Solve 2x2 system for dTs/dMN and dPs/dMN:
-            # [dS_dT   dS_dP ] [dTs/dMN]   [     0      ]
-            # [dR2_dT  dR2_dP] [dPs/dMN] = [-MN*Vsonic²]
-            det_final = dS_dT_final * dR2_dP_final - dS_dP_final * dR2_dT_final
-            det_final = jnp.where(jnp.abs(det_final) < 1e-30, 1e-30, det_final)
+            # Solve for dTs/dMN, dPs/dMN: J * [dTs/dMN; dPs/dMN] = [0; -MN*Vsonic²]
+            det = dR1_dT * dR2_dP - dR1_dP * dR2_dT
+            det = jnp.where(jnp.abs(det) < 1e-30, 1e-30, det)
+            rhs_MN = -MN_clamped * Vsonic_sq_newton
+            dTs_dMN = (-rhs_MN * dR1_dP) / det
+            dPs_dMN = (dR1_dT * rhs_MN) / det
 
-            rhs_MN = -MN_clamped * Vsonic_sq_newton  # ∂R2/∂MN = MN * Vsonic²
-            dTs_dMN = (0.0 * dR2_dP_final - rhs_MN * dS_dP_final) / det_final
-            dPs_dMN = (dS_dT_final * rhs_MN - 0.0 * dR2_dT_final) / det_final
+            # Chain rule for derived quantities
+            dgamma_dT, dgamma_dP = final_state[12], final_state[13]
+            dR_dT, dR_dP = final_state[14], final_state[15]
+            dgamma_dMN = dgamma_dT * dTs_dMN + dgamma_dP * dPs_dMN
+            dR_dMN = dR_dT * dTs_dMN + dR_dP * dPs_dMN
 
-            # Chain rule for gamma and R
-            dgamma_dMN = dgamma_dT_final * dTs_dMN + dgamma_dP_final * dPs_dMN
-            dR_dMN = dR_dT_final * dTs_dMN + dR_dP_final * dPs_dMN
+            drho_dMN = rhos_newton * (dPs_dMN / Ps_newton - dR_dMN / R_newton - dTs_dMN / Ts_newton)
+            dVsonic_dMN = 0.5 * Vsonic_newton * (dgamma_dMN / gamma_newton + dR_dMN / R_newton + dTs_dMN / Ts_newton)
+            darea_dMN_newton = area_newton * (-1.0 / MN_clamped - drho_dMN / rhos_newton - dVsonic_dMN / Vsonic_newton)
 
-            # Derivatives of rho and Vsonic (in SI units)
-            # rho = Ps / (R * Ts)
-            drho_dMN_newton = rhos_newton * (dPs_dMN / Ps_newton - dR_dMN / R_newton - dTs_dMN / Ts_newton)
-
-            # Vsonic = sqrt(gamma * R * Ts)
-            dVsonic_dMN_newton = 0.5 * Vsonic_newton * (dgamma_dMN / gamma_newton + dR_dMN / R_newton + dTs_dMN / Ts_newton)
-
-            # darea/dMN in SI units: area = W / (rho * MN * Vsonic)
-            darea_dMN_newton = area_newton * (-1.0 / MN_clamped - drho_dMN_newton / rhos_newton - dVsonic_dMN_newton / Vsonic_newton)
-
-            # Zero MN case: static = total (cheap to compute)
+            # Handle zero MN case
+            is_zero_MN = MN < 1e-10
             rhos_zero = Pt_si / (R_t * Tt_si)
             Vsonic_zero = jnp.sqrt(gamma_t * R_t * Tt_si)
-
-            # Use jnp.where to blend results (avoids tracing both lax.cond branches)
-            is_zero_MN = MN < 1e-10
-
-            # For zero MN case, derivative is undefined/infinite, use large value
-            darea_dMN_si = jnp.where(is_zero_MN, -1e30, darea_dMN_newton)
 
             Ts_si = jnp.where(is_zero_MN, Tt_si, Ts_newton)
             Ps_si = jnp.where(is_zero_MN, Pt_si, Ps_newton)
@@ -780,49 +758,23 @@ class JaxTabularThermo:
             Cv_out = jnp.where(is_zero_MN, Cv_t, Cv_newton)
             S_out = jnp.where(is_zero_MN, S_total, S_newton)
             R_out = jnp.where(is_zero_MN, R_t, R_newton)
+            darea_dMN_si = jnp.where(is_zero_MN, -1e30, darea_dMN_newton)
 
-            result_si = jnp.array([Ts_si, Ps_si, hs_si, rhos_si, MN_out, V_si, Vsonic_si,
-                                   area_si, gamma_out, Cp_out, Cv_out, S_out, R_out])
-
-            # Convert back to English units
-            Ts = result_si[0] / T_to_si_scale
-            Ps = result_si[1] / P_to_si
-            hs = result_si[2] * h_from_si
-            rhos = result_si[3] * rho_from_si
-            MN_out = result_si[4]
-            V = result_si[5] * V_from_si
-            Vsonic = result_si[6] * V_from_si
-            area = result_si[7] * area_from_si
-            gamma_out = result_si[8]
-            Cp = result_si[9] * S_from_si
-            Cv = result_si[10] * S_from_si
-            S = result_si[11] * S_from_si
-            R = result_si[12] * S_from_si
-
-            # Convert darea_dMN to English units (area_from_si, MN is dimensionless)
+            # Convert to English and return
+            result = convert_static_to_english(
+                Ts_si, Ps_si, hs_si, rhos_si, MN_out, V_si, Vsonic_si,
+                area_si, gamma_out, Cp_out, Cv_out, S_out, R_out
+            )
             darea_dMN = darea_dMN_si * area_from_si
+            return jnp.concatenate([result, jnp.array([darea_dMN])])
 
-            return jnp.array([Ts, Ps, hs, rhos, MN_out, V, Vsonic, area,
-                              gamma_out, Cp, Cv, S, R, darea_dMN])
+        # =====================================================================
+        # static_from_area: 3D Newton solver for (Ts, Ps, MN) given area
+        # =====================================================================
 
         def static_from_area_impl(Tt, Pt, area, W, FAR):
-            """
-            Pure JAX static_from_area using unified 3D Newton on (Ts, Ps, MN).
-
-            Instead of nested Newton loops (outer on MN, inner 2D on Ts/Ps),
-            this solves all three unknowns simultaneously in a single Newton loop.
-
-            Residuals:
-                R1 = S(Ts, Ps) - S_total        (entropy conservation)
-                R2 = hs + 0.5*MN²*γ*R*Ts - ht   (energy conservation)
-                R3 = area_computed - area        (mass continuity)
-
-            Jacobian (3x3):
-                [dS_dT      dS_dP      0           ]
-                [dR2_dT     dR2_dP     MN*γ*R*Ts   ]
-                [dR3_dT     dR3_dP     -area/MN    ]
-            """
-            # Convert to SI
+            """Pure JAX static_from_area: solve for (Ts, Ps, MN) given area."""
+            # Convert inputs to SI
             Tt_si = Tt * T_to_si_scale
             Pt_si = Pt * P_to_si
             W_si = W * W_to_si
@@ -833,180 +785,107 @@ class JaxTabularThermo:
             ht_si = tot_props['h']
             S_total = tot_props['S']
             gamma_t = tot_props['gamma']
-            R_t = tot_props['R']
 
-            # Initial guesses using ideal gas isentropic relations
+            # Initial guess
             MN0 = 0.5
-            MN_sq = MN0 ** 2
-            Ps0_si = Pt_si * (1.0 + (gamma_t - 1.0) / 2.0 * MN_sq) ** (-gamma_t / (gamma_t - 1.0))
-            Ts0_si = Tt_si * (Ps0_si / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+            Ts0_si, Ps0_si = compute_isentropic_initial_guess(Tt_si, Pt_si, gamma_t, MN0)
 
-            # 3D Newton solver for (Ts, Ps, MN) using while_loop
-            # State indices:
-            #   0: Ts_si, 1: Ps_si, 2: MN
-            #   3: R1, 4: R2, 5: R3 (residuals)
-            #   6: S, 7: hs, 8: gamma, 9: R (properties)
-            #   10: dS_dT, 11: dS_dP, 12: dh_dT, 13: dh_dP
-            #   14: dgamma_dT, 15: dgamma_dP, 16: dR_dT, 17: dR_dP
-            #   18: area_computed, 19: Vsonic_sq
-            #   20: iteration count
-
+            # 3D Newton state: [Ts, Ps, MN, R1, R2, R3, S, hs, gamma, R,
+            #                   dS_dT, dS_dP, dh_dT, dh_dP, dgamma_dT, dgamma_dP, dR_dT, dR_dP,
+            #                   area_computed, Vsonic_sq, iter]
             def compute_state_3d(Ts_si, Ps_si, MN, i):
-                """Compute full 3D state including props, derivs, and all three residuals."""
-                # Get properties and derivatives from interpolator
                 props_s, dprops_dP, dprops_dT = props_at_TP_si_with_derivs(Ts_si, Ps_si, FAR)
-                S_s = props_s['S']
-                hs_si = props_s['h']
-                gamma_s = props_s['gamma']
-                R_s = props_s['R']
+                S_s, hs_si, gamma_s, R_s = props_s['S'], props_s['h'], props_s['gamma'], props_s['R']
 
-                # Clamp MN for numerical stability
                 MN_clamped = jnp.maximum(MN, 1e-10)
                 MN_sq = MN_clamped ** 2
-
-                # Derived quantities
                 Vsonic_sq = gamma_s * R_s * Ts_si
-                V_sq = MN_sq * Vsonic_sq
                 rho_s = Ps_si / (R_s * Ts_si)
                 V_s = MN_clamped * jnp.sqrt(Vsonic_sq)
                 area_computed = W_si / (rho_s * V_s)
 
-                # Residuals
                 R1 = S_s - S_total
-                R2 = hs_si + 0.5 * V_sq - ht_si
+                R2 = hs_si + 0.5 * MN_sq * Vsonic_sq - ht_si
                 R3 = area_computed - area_si
 
                 return jnp.array([
-                    Ts_si, Ps_si, MN,
-                    R1, R2, R3,
+                    Ts_si, Ps_si, MN, R1, R2, R3,
                     S_s, hs_si, gamma_s, R_s,
-                    dprops_dT['S'], dprops_dP['S'],
-                    dprops_dT['h'], dprops_dP['h'],
-                    dprops_dT['gamma'], dprops_dP['gamma'],
-                    dprops_dT['R'], dprops_dP['R'],
-                    area_computed, Vsonic_sq,
-                    i
+                    dprops_dT['S'], dprops_dP['S'], dprops_dT['h'], dprops_dP['h'],
+                    dprops_dT['gamma'], dprops_dP['gamma'], dprops_dT['R'], dprops_dP['R'],
+                    area_computed, Vsonic_sq, i
                 ])
 
             def cond_fn_3d(state):
                 R1, R2, R3, i = state[3], state[4], state[5], state[20]
-                residual_norm = jnp.sqrt(R1**2 + R2**2 + R3**2)
-                return (residual_norm > 1e-8) & (i < 30)
+                return (jnp.sqrt(R1**2 + R2**2 + R3**2) > 1e-8) & (i < 30)
 
             def body_fn_3d(state):
-                # Unpack state
                 Ts_si, Ps_si, MN = state[0], state[1], state[2]
                 R1, R2, R3 = state[3], state[4], state[5]
                 gamma_s, R_s = state[8], state[9]
-                dS_dT, dS_dP = state[10], state[11]
-                dh_dT, dh_dP = state[12], state[13]
-                dgamma_dT, dgamma_dP = state[14], state[15]
-                dR_dT, dR_dP = state[16], state[17]
                 area_computed, Vsonic_sq = state[18], state[19]
                 i = state[20]
 
                 MN_clamped = jnp.maximum(MN, 1e-10)
                 MN_sq = MN_clamped ** 2
 
-                # === Build 3x3 Jacobian ===
-                # Row 1: dR1/d(Ts, Ps, MN) - entropy residual
-                J11 = dS_dT  # dR1/dTs
-                J12 = dS_dP  # dR1/dPs
-                J13 = 0.0    # dR1/dMN (S doesn't depend on MN directly)
+                # Jacobian rows 1 & 2 (shared with 2D solver)
+                dR1_dT, dR1_dP, dR2_dT, dR2_dP = compute_R1_R2_jacobian(
+                    Ts_si, MN_sq, gamma_s, R_s,
+                    state[10], state[11], state[12], state[13],
+                    state[14], state[15], state[16], state[17]
+                )
+                dR2_dMN = MN_clamped * Vsonic_sq  # dR2/dMN = MN * γ * R * Ts
 
-                # Row 2: dR2/d(Ts, Ps, MN) - energy residual
-                # R2 = hs + 0.5*MN²*γ*R*Ts - ht
-                dVsq_dT = MN_sq * (dgamma_dT * R_s * Ts_si + gamma_s * dR_dT * Ts_si + gamma_s * R_s)
-                dVsq_dP = MN_sq * (dgamma_dP * R_s * Ts_si + gamma_s * dR_dP * Ts_si)
-                J21 = dh_dT + 0.5 * dVsq_dT  # dR2/dTs
-                J22 = dh_dP + 0.5 * dVsq_dP  # dR2/dPs
-                J23 = MN_clamped * Vsonic_sq  # dR2/dMN = MN * γ * R * Ts
+                # Jacobian row 3 (area residual)
+                dgamma_dT, dgamma_dP = state[14], state[15]
+                dR_dT, dR_dP = state[16], state[17]
+                dR3_dT = 0.5 * area_computed * (dR_dT / R_s + 1.0 / Ts_si - dgamma_dT / gamma_s)
+                dR3_dP = area_computed * (-1.0 / Ps_si + 0.5 * dR_dP / R_s - 0.5 * dgamma_dP / gamma_s)
+                dR3_dMN = -area_computed / MN_clamped
 
-                # Row 3: dR3/d(Ts, Ps, MN) - area residual
-                # area = W / (ρ * V) = W / (ρ * MN * Vsonic)
-                # Using logarithmic differentiation:
-                # d(ln area)/dTs = 0.5*(dR_dT/R + 1/Ts - dgamma_dT/γ)
-                # d(ln area)/dPs = -1/Ps + 0.5*(dR_dP/R - dgamma_dP/γ)
-                # d(ln area)/dMN = -1/MN
-                J31 = 0.5 * area_computed * (dR_dT / R_s + 1.0 / Ts_si - dgamma_dT / gamma_s)
-                J32 = area_computed * (-1.0 / Ps_si + 0.5 * dR_dP / R_s - 0.5 * dgamma_dP / gamma_s)
-                J33 = -area_computed / MN_clamped  # dR3/dMN
+                # Solve 3x3 via block elimination (exploiting dR1_dMN = 0)
+                J11_safe = jnp.where(jnp.abs(dR1_dT) < 1e-20, 1e-20, dR1_dT)
+                J22_mod = dR2_dP - dR2_dT * dR1_dP / J11_safe
+                J32_mod = dR3_dP - dR3_dT * dR1_dP / J11_safe
+                R2_mod = -R2 + dR2_dT * R1 / J11_safe
+                R3_mod = -R3 + dR3_dT * R1 / J11_safe
 
-                # === Solve 3x3 system J * dx = -R using block elimination ===
-                # Since J13 = 0, we can reduce to 2x2 + back-substitution
-                #
-                # Row 1: J11*dTs + J12*dPs = -R1
-                # Row 2: J21*dTs + J22*dPs + J23*dMN = -R2
-                # Row 3: J31*dTs + J32*dPs + J33*dMN = -R3
-                #
-                # From Row 1: dTs = (-R1 - J12*dPs) / J11
-                # Substitute into Rows 2 & 3 to get 2x2 system for (dPs, dMN)
-
-                J11_safe = jnp.where(jnp.abs(J11) < 1e-20, 1e-20, J11)
-
-                # Modified coefficients for 2x2 system
-                J22_mod = J22 - J21 * J12 / J11_safe
-                J32_mod = J32 - J31 * J12 / J11_safe
-                R2_mod = -R2 + J21 * R1 / J11_safe
-                R3_mod = -R3 + J31 * R1 / J11_safe
-
-                # Solve 2x2: [J22_mod, J23; J32_mod, J33] * [dPs; dMN] = [R2_mod; R3_mod]
-                det2 = J22_mod * J33 - J23 * J32_mod
+                det2 = J22_mod * dR3_dMN - dR2_dMN * J32_mod
                 det2_safe = jnp.where(jnp.abs(det2) < 1e-20, 1e-20, det2)
-
-                dPs = (R2_mod * J33 - J23 * R3_mod) / det2_safe
+                dPs = (R2_mod * dR3_dMN - dR2_dMN * R3_mod) / det2_safe
                 dMN = (J22_mod * R3_mod - R2_mod * J32_mod) / det2_safe
+                dTs = (-R1 - dR1_dP * dPs) / J11_safe
 
-                # Back-substitute to get dTs
-                dTs = (-R1 - J12 * dPs) / J11_safe
-
-                # Apply updates with bounds
                 Ts_new = jnp.clip(Ts_si + dTs, 160.0, 2400.0)
                 Ps_new = jnp.clip(Ps_si + dPs, 100.0, 1e8)
-                MN_new = jnp.clip(MN + dMN, 0.01, 0.99)  # Subsonic only
-
+                MN_new = jnp.clip(MN + dMN, 0.01, 0.99)
                 return compute_state_3d(Ts_new, Ps_new, MN_new, i + 1)
 
-            # Initialize and run Newton iteration
+            # Run 3D Newton
             init_state = compute_state_3d(Ts0_si, Ps0_si, MN0, 0.0)
             final_state = jax.lax.while_loop(cond_fn_3d, body_fn_3d, init_state)
 
-            # Extract converged solution
-            Ts_si = final_state[0]
-            Ps_si = final_state[1]
-            MN_final = final_state[2]
-            hs_si = final_state[7]
-            gamma_s = final_state[8]
-            R_s = final_state[9]
-            S_s = final_state[6]
+            # Extract solution
+            Ts_si, Ps_si, MN_final = final_state[0], final_state[1], final_state[2]
+            S_s, hs_si, gamma_s, R_s = final_state[6], final_state[7], final_state[8], final_state[9]
 
-            # Compute remaining properties
+            # Compute derived quantities
             rho_s = Ps_si / (R_s * Ts_si)
             Vsonic = jnp.sqrt(gamma_s * R_s * Ts_si)
             V_s = MN_final * Vsonic
             area_final = W_si / (rho_s * V_s)
 
-            # Get Cp and Cv (not in state)
+            # Get Cp, Cv
             props_final = props_at_TP_si(Ts_si, Ps_si, FAR)
-            Cp_s = props_final['Cp']
-            Cv_s = props_final['Cv']
+            Cp_s, Cv_s = props_final['Cp'], props_final['Cv']
 
-            # Convert to English units
-            Ts = Ts_si / T_to_si_scale
-            Ps = Ps_si / P_to_si
-            hs = hs_si * h_from_si
-            rhos = rho_s * rho_from_si
-            V = V_s * V_from_si
-            Vsonic_eng = Vsonic * V_from_si
-            area_eng = area_final * area_from_si
-            gamma_out = gamma_s
-            Cp = Cp_s * S_from_si
-            Cv = Cv_s * S_from_si
-            S = S_s * S_from_si
-            R_out = R_s * S_from_si
-
-            return jnp.array([Ts, Ps, hs, rhos, MN_final, V, Vsonic_eng, area_eng,
-                              gamma_out, Cp, Cv, S, R_out])
+            # Convert to English and return
+            return convert_static_to_english(
+                Ts_si, Ps_si, hs_si, rho_s, MN_final, V_s, Vsonic,
+                area_final, gamma_s, Cp_s, Cv_s, S_s, R_s
+            )
 
         # JIT compile
         self._static_from_MN_jit = jax.jit(static_from_MN_impl)
