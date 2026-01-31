@@ -43,7 +43,8 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('inlet', pyc.Inlet())
 
 
-        duct_class=pyc.NewDuct
+        # duct_class=pyc.NewDuct
+        duct_class=pyc.Duct
 
         # Note variable promotion for the fan --
         # the LP spool speed and the fan speed are INPUTS that are promoted:
