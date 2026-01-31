@@ -79,6 +79,17 @@ class TabularThermo(ThermoInterface):
                 extrapolate=True
             )
 
+        # Caches for solver initial guesses (store previous converged solutions)
+        # These allow warm-starting Newton solvers from the last solution
+        self._cache_T_from_hP = None  # T (SI)
+        self._cache_T_from_SP = None  # T (SI)
+        self._cache_static_MN = None  # (Ts, Ps) in SI
+
+        # Flags to control whether to apply empirical guess or use cached value
+        self._needs_guess_T_from_hP = True
+        self._needs_guess_T_from_SP = True
+        self._needs_guess_static_MN = True
+
     def _get_FAR(self, FAR):
         """Return FAR if provided, else instance default."""
         return FAR if FAR is not None else self.FAR
@@ -358,10 +369,11 @@ class TabularThermo(ThermoInterface):
         # Convert output from SI
         return self._convert_T_from_si(T_si)
 
-    def _T_from_hP_si(self, h_target_si, P_si, FAR):
+    def _T_from_hP_si(self, h_target_si, P_si, FAR, _retry=False):
         """Solve for temperature given enthalpy and pressure (SI units).
 
-        Uses Newton's method with analytical derivatives.
+        Uses Newton's method with analytical derivatives. Uses cached solution
+        from previous solve as initial guess when available.
 
         Parameters
         ----------
@@ -371,20 +383,26 @@ class TabularThermo(ThermoInterface):
             Pressure in SI (Pa)
         FAR : float
             Fuel-to-air ratio
+        _retry : bool
+            Internal flag to prevent infinite recursion on retry
 
         Returns
         -------
         float
             Temperature in SI (K)
         """
-        # Initial guess: use Cp to estimate T from enthalpy
-        # h ≈ Cp * T, so T ≈ h / Cp
-        # Use a mid-range Cp estimate (~1000 J/kg/K for air)
-        T = max(300.0, min(2000.0, abs(h_target_si) / 1000.0 + 300.0))
-
         max_iter = 20
         tol = 1e-10
 
+        # Apply initial guess if needed, otherwise use cached value
+        if self._needs_guess_T_from_hP:
+            # Empirical initial guess: h ≈ Cp * T, so T ≈ h / Cp
+            T = max(300.0, min(2000.0, abs(h_target_si) / 1000.0 + 300.0))
+            self._needs_guess_T_from_hP = False
+        else:
+            T = self._cache_T_from_hP
+
+        converged = False
         for _ in range(max_iter):
             x = np.array([FAR, float(P_si), float(T)])
 
@@ -398,6 +416,7 @@ class TabularThermo(ThermoInterface):
 
             # Check convergence (relative tolerance)
             if abs(residual) < tol * abs(h_target_si) or abs(residual) < 1e-6:
+                converged = True
                 break
 
             # Newton update
@@ -416,6 +435,14 @@ class TabularThermo(ThermoInterface):
                 break
 
             T = T_new
+
+        # If not converged and haven't retried, reset guess flag and retry once
+        if not converged and not _retry:
+            self._needs_guess_T_from_hP = True
+            return self._T_from_hP_si(h_target_si, P_si, FAR, _retry=True)
+
+        # Cache the converged solution
+        self._cache_T_from_hP = T
 
         return T
 
@@ -476,7 +503,7 @@ class TabularThermo(ThermoInterface):
         temp_ratio = 1.0 / (1.0 + gm1 / 2.0 * MN**2)
         return Pt * temp_ratio ** (gamma / gm1)
 
-    def _static_from_MN_si(self, Tt_si, Pt_si, MN, W_si, FAR=None):
+    def _static_from_MN_si(self, Tt_si, Pt_si, MN, W_si, FAR=None, _retry=False):
         """Compute static properties in SI units.
 
         Uses the same physics as the original pyCycle:
@@ -484,7 +511,8 @@ class TabularThermo(ThermoInterface):
         2. Entropy conservation: S(Ts, Ps) = S_total (isentropic process)
 
         Uses a 2D Newton solver on (Ts, Ps) with analytical Jacobians for
-        fast quadratic convergence.
+        fast quadratic convergence. Uses cached solution from previous solve
+        as initial guess when available.
 
         Parameters
         ----------
@@ -498,6 +526,8 @@ class TabularThermo(ThermoInterface):
             Mass flow rate in SI (kg/s)
         FAR : float, optional
             Fuel-to-air ratio. If None, uses the instance's FAR.
+        _retry : bool
+            Internal flag to prevent infinite recursion on retry
         """
         FAR = self._get_FAR(FAR)
 
@@ -520,23 +550,25 @@ class TabularThermo(ThermoInterface):
                               MN=MN, V=0.0, Vsonic=np.sqrt(gam_s * R_s * Ts), area=np.inf,
                               gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
 
-        # Initial guesses using ideal gas isentropic relations
-        Ps_guess = self._ideal_gas_Ps_guess(Tt_si, Pt_si, MN, gamma_t)
-        # Ts from isentropic relation: Ts/Tt = (Ps/Pt)^((gamma-1)/gamma)
-        Ts_guess = Tt_si * (Ps_guess / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
-
         MN_sq = MN ** 2
+        max_iter = 20
+        tol = 1e-10
+
+        # Apply initial guess if needed, otherwise use cached values
+        if self._needs_guess_static_MN:
+            # Initial guesses using ideal gas isentropic relations
+            Ps = self._ideal_gas_Ps_guess(Tt_si, Pt_si, MN, gamma_t)
+            # Ts from isentropic relation: Ts/Tt = (Ps/Pt)^((gamma-1)/gamma)
+            Ts = Tt_si * (Ps / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+            self._needs_guess_static_MN = False
+        else:
+            Ts, Ps = self._cache_static_MN
 
         # 2D Newton solver for coupled (Ts, Ps) system
         # Residuals:
         #   R1 = S(Ts, Ps) - S_total = 0  (entropy conservation)
         #   R2 = hs + MN²·γ·R·Ts/2 - ht = 0  (energy conservation)
-        Ts = Ts_guess
-        Ps = Ps_guess
-
-        max_iter = 20
-        tol = 1e-10
-
+        converged = False
         for _ in range(max_iter):
             # Evaluate properties and gradients at current (Ts, Ps)
             x = np.array([FAR, float(Ps), float(Ts)])
@@ -559,6 +591,7 @@ class TabularThermo(ThermoInterface):
 
             # Check convergence
             if abs(R1) < tol and abs(R2) < tol:
+                converged = True
                 break
 
             # Get gradients: (d/dFAR, d/dPs, d/dTs)
@@ -588,7 +621,7 @@ class TabularThermo(ThermoInterface):
             # Solve 2x2 linear system: J @ [dTs, dPs]^T = -[R1, R2]^T
             det = dR1_dTs * dR2_dPs - dR1_dPs * dR2_dTs
             if abs(det) < 1e-30:
-                # Jacobian is singular, fall back to brentq
+                # Jacobian is singular
                 break
 
             # Cramer's rule
@@ -611,6 +644,14 @@ class TabularThermo(ThermoInterface):
 
             Ts, Ps = Ts_new, Ps_new
 
+        # If not converged and haven't retried, reset guess flag and retry once
+        if not converged and not _retry:
+            self._needs_guess_static_MN = True
+            return self._static_from_MN_si(Tt_si, Pt_si, MN, W_si, FAR, _retry=True)
+
+        # Cache the converged solution
+        self._cache_static_MN = (Ts, Ps)
+
         # Compute all static properties at converged (Ts, Ps)
         hs = self._lookup_si('h', Ts, Ps, FAR)
         gam_s = self._lookup_si('gamma', Ts, Ps, FAR)
@@ -632,10 +673,11 @@ class TabularThermo(ThermoInterface):
                           MN=MN, V=V, Vsonic=Vsonic, area=area,
                           gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
 
-    def _T_from_SP_si(self, S_target_si, P_si, FAR):
+    def _T_from_SP_si(self, S_target_si, P_si, FAR, _retry=False):
         """Solve for temperature given entropy and pressure (SI units).
 
-        Uses Newton's method with analytical derivatives.
+        Uses Newton's method with analytical derivatives. Uses cached solution
+        from previous solve as initial guess when available.
 
         Parameters
         ----------
@@ -645,18 +687,26 @@ class TabularThermo(ThermoInterface):
             Pressure in SI (Pa)
         FAR : float
             Fuel-to-air ratio
+        _retry : bool
+            Internal flag to prevent infinite recursion on retry
 
         Returns
         -------
         float
             Temperature in SI (K)
         """
-        # Initial guess: mid-range temperature
-        T = 800.0
-
         max_iter = 20
         tol = 1e-10
 
+        # Apply initial guess if needed, otherwise use cached value
+        if self._needs_guess_T_from_SP:
+            # Empirical initial guess: mid-range temperature
+            T = 800.0
+            self._needs_guess_T_from_SP = False
+        else:
+            T = self._cache_T_from_SP
+
+        converged = False
         for _ in range(max_iter):
             x = np.array([FAR, float(P_si), float(T)])
 
@@ -670,6 +720,7 @@ class TabularThermo(ThermoInterface):
 
             # Check convergence (relative tolerance)
             if abs(residual) < tol * abs(S_target_si) or abs(residual) < 1e-6:
+                converged = True
                 break
 
             # Newton update
@@ -688,6 +739,14 @@ class TabularThermo(ThermoInterface):
                 break
 
             T = T_new
+
+        # If not converged and haven't retried, reset guess flag and retry once
+        if not converged and not _retry:
+            self._needs_guess_T_from_SP = True
+            return self._T_from_SP_si(S_target_si, P_si, FAR, _retry=True)
+
+        # Cache the converged solution
+        self._cache_T_from_SP = T
 
         return T
 
