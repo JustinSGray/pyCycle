@@ -6,40 +6,12 @@ It uses JaxTabularThermo for thermodynamic calculations and provides
 analytical derivatives via JAX automatic differentiation.
 """
 
-import time
 import jax.numpy as jnp
 
 from pycycle.jax_element_base import JaxElement
 from pycycle.functional_thermo.jax_wrappers import (
     TotalPropsIdx as TPI, StaticPropsIdx as SPI
 )
-
-# Module-level timing accumulators
-_new_duct_timing_stats = {
-    'compute_calls': 0,
-    'compute_time': 0.0,
-    'partials_calls': 0,
-    'partials_time': 0.0,
-}
-
-def reset_new_duct_timing_stats():
-    """Reset all timing statistics."""
-    for key in _new_duct_timing_stats:
-        _new_duct_timing_stats[key] = 0.0 if 'time' in key else 0
-
-def print_new_duct_timing_stats():
-    """Print timing statistics."""
-    stats = _new_duct_timing_stats
-    print("\n=== NewDuct Timing Stats ===")
-    print(f"  compute() calls: {stats['compute_calls']}")
-    print(f"  compute() total time: {stats['compute_time']*1000:.3f} ms")
-    if stats['compute_calls'] > 0:
-        print(f"  compute() avg time: {stats['compute_time']*1000/stats['compute_calls']:.3f} ms")
-    print(f"  compute_partials() calls: {stats['partials_calls']}")
-    print(f"  compute_partials() total time: {stats['partials_time']*1000:.3f} ms")
-    if stats['partials_calls'] > 0:
-        print(f"  compute_partials() avg time: {stats['partials_time']*1000/stats['partials_calls']:.3f} ms")
-    print("============================\n")
 
 
 class NewDuct(JaxElement):
@@ -228,62 +200,3 @@ class NewDuct(JaxElement):
             ])
 
         return tuple(outputs)
-
-    def compute(self, inputs, outputs):
-        """Timed wrapper around base class compute."""
-        t_start = time.perf_counter()
-
-        super().compute(inputs, outputs)
-
-        _new_duct_timing_stats['compute_calls'] += 1
-        _new_duct_timing_stats['compute_time'] += (time.perf_counter() - t_start)
-
-    def compute_partials(self, inputs, partials):
-        """Timed wrapper around base class compute_partials."""
-        t_start = time.perf_counter()
-
-        super().compute_partials(inputs, partials)
-
-        _new_duct_timing_stats['partials_calls'] += 1
-        _new_duct_timing_stats['partials_time'] += (time.perf_counter() - t_start)
-
-
-# Backward compatibility alias
-Duct = NewDuct
-
-
-if __name__ == "__main__":
-    import openmdao.api as om
-    from pycycle.mp_cycle import Cycle
-    from pycycle.elements.flow_start import FlowStart
-    from pycycle.thermo.cea import species_data
-
-    p = om.Problem()
-    cycle = p.model = Cycle()
-    cycle.options['thermo_method'] = 'CEA'
-    cycle.options['thermo_data'] = species_data.janaf
-
-    cycle.add_subsystem('flow_start', FlowStart(), promotes=['MN', 'P', 'T'])
-    cycle.add_subsystem('duct', NewDuct(), promotes=['MN'])
-
-    cycle.pyc_connect_flow('flow_start.Fl_O', 'duct.Fl_I')
-
-    cycle.set_input_defaults('MN', 0.5)
-    cycle.set_input_defaults('duct.dPqP', 0.02)
-    cycle.set_input_defaults('P', 17., units='psi')
-    cycle.set_input_defaults('T', 500., units='degR')
-    cycle.set_input_defaults('flow_start.W', 500., units='lbm/s')
-
-    p.setup(check=False, force_alloc_complex=True)
-    p.set_solver_print(level=-1)
-
-    p.run_model()
-
-    print("NewDuct test:")
-    print(f"  Pt_out = {p['duct.Fl_O:tot:P'][0]:.4f} psi")
-    print(f"  Tt_out = {p['duct.Fl_O:tot:T'][0]:.4f} degR")
-    print(f"  ht_out = {p['duct.Fl_O:tot:h'][0]:.4f} Btu/lbm")
-
-    print("\nChecking partials...")
-    partial_data = p.check_partials(method='fd', compact_print=True,
-                                    includes=['duct.*'], excludes=['*.base_thermo.*'])
