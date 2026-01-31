@@ -6,8 +6,24 @@ eliminating the need for pure_callback and enabling efficient JIT compilation.
 """
 
 import time
+from collections import namedtuple
+
 import jax
 import jax.numpy as jnp
+
+
+# =============================================================================
+# Named Tuples for Property Returns
+# =============================================================================
+
+# Import from base to ensure consistency
+from pycycle.functional_thermo.base import TotalProps, StaticProps
+
+StaticPropsWithDeriv = namedtuple('StaticPropsWithDeriv', [
+    'Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+    'gamma', 'Cp', 'Cv', 'S', 'R', 'darea_dMN'
+])
+"""Static properties plus darea/dMN derivative (for static_from_MN)."""
 
 
 # =============================================================================
@@ -346,15 +362,15 @@ class JaxTabularThermo:
             point = jnp.array([FAR, P_si, T_si])
             props_si = interp.interpolate(point)
 
-            h = props_si['h'] * h_from_si
-            S = props_si['S'] * S_from_si
-            gamma = props_si['gamma']
-            Cp = props_si['Cp'] * S_from_si
-            Cv = props_si['Cv'] * S_from_si
-            rho = props_si['rho'] * rho_from_si
-            R = props_si['R'] * S_from_si
-
-            return jnp.array([h, S, gamma, Cp, Cv, rho, R])
+            return TotalProps(
+                h=props_si['h'] * h_from_si,
+                S=props_si['S'] * S_from_si,
+                gamma=props_si['gamma'],
+                Cp=props_si['Cp'] * S_from_si,
+                Cv=props_si['Cv'] * S_from_si,
+                rho=props_si['rho'] * rho_from_si,
+                R=props_si['R'] * S_from_si,
+            )
 
         @jax.jit
         def _T_from_hP_jit(h_target, P, FAR):
@@ -613,21 +629,21 @@ class JaxTabularThermo:
         def convert_static_to_english(Ts_si, Ps_si, hs_si, rho_s, MN, V_s, Vsonic_s,
                                        area_s, gamma_s, Cp_s, Cv_s, S_s, R_s):
             """Convert static properties from SI to English units."""
-            return jnp.array([
-                Ts_si / T_to_si_scale,      # Ts (degR)
-                Ps_si / P_to_si,            # Ps (psi)
-                hs_si * h_from_si,          # hs (Btu/lbm)
-                rho_s * rho_from_si,        # rhos (lbm/ft³)
-                MN,                         # MN (dimensionless)
-                V_s * V_from_si,            # V (ft/s)
-                Vsonic_s * V_from_si,       # Vsonic (ft/s)
-                area_s * area_from_si,      # area (in²)
-                gamma_s,                    # gamma (dimensionless)
-                Cp_s * S_from_si,           # Cp (Btu/(lbm·R))
-                Cv_s * S_from_si,           # Cv (Btu/(lbm·R))
-                S_s * S_from_si,            # S (Btu/(lbm·R))
-                R_s * S_from_si,            # R (Btu/(lbm·R))
-            ])
+            return StaticProps(
+                Ts=Ts_si / T_to_si_scale,
+                Ps=Ps_si / P_to_si,
+                hs=hs_si * h_from_si,
+                rhos=rho_s * rho_from_si,
+                MN=MN,
+                V=V_s * V_from_si,
+                Vsonic=Vsonic_s * V_from_si,
+                area=area_s * area_from_si,
+                gamma=gamma_s,
+                Cp=Cp_s * S_from_si,
+                Cv=Cv_s * S_from_si,
+                S=S_s * S_from_si,
+                R=R_s * S_from_si,
+            )
 
         # =====================================================================
         # static_from_MN: 2D Newton solver for (Ts, Ps) given MN
@@ -761,12 +777,17 @@ class JaxTabularThermo:
             darea_dMN_si = jnp.where(is_zero_MN, -1e30, darea_dMN_newton)
 
             # Convert to English and return
-            result = convert_static_to_english(
+            static = convert_static_to_english(
                 Ts_si, Ps_si, hs_si, rhos_si, MN_out, V_si, Vsonic_si,
                 area_si, gamma_out, Cp_out, Cv_out, S_out, R_out
             )
             darea_dMN = darea_dMN_si * area_from_si
-            return jnp.concatenate([result, jnp.array([darea_dMN])])
+            return StaticPropsWithDeriv(
+                Ts=static.Ts, Ps=static.Ps, hs=static.hs, rhos=static.rhos,
+                MN=static.MN, V=static.V, Vsonic=static.Vsonic, area=static.area,
+                gamma=static.gamma, Cp=static.Cp, Cv=static.Cv, S=static.S, R=static.R,
+                darea_dMN=darea_dMN,
+            )
 
         # =====================================================================
         # static_from_area: 3D Newton solver for (Ts, Ps, MN) given area

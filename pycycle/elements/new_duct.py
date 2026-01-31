@@ -9,9 +9,6 @@ analytical derivatives via JAX automatic differentiation.
 import jax.numpy as jnp
 
 from pycycle.jax_element_base import JaxElement
-from pycycle.functional_thermo.jax_wrappers import (
-    TotalPropsIdx as TPI, StaticPropsIdx as SPI
-)
 
 # Threshold for treating expMN as effectively zero
 _EXPMN_THRESHOLD = 1e-10
@@ -180,8 +177,8 @@ class NewDuct(JaxElement):
         # Build output list - must match add_primal_output order
         outputs = [
             Pt_out, Tt_out, ht_out,
-            props[TPI.S], props[TPI.gamma], props[TPI.Cp],
-            props[TPI.Cv], props[TPI.rho], props[TPI.R],
+            props.S, props.gamma, props.Cp,
+            props.Cv, props.rho, props.R,
             W_in,  # Mass flow passthrough
         ]
 
@@ -200,11 +197,11 @@ class NewDuct(JaxElement):
             Wc = W_in * jnp.sqrt(Tt_out / _T_REF) / (Pt_out / _P_REF)
 
             outputs.extend([
-                static_props[SPI.hs], static_props[SPI.Ts], static_props[SPI.Ps],
-                static_props[SPI.rhos], static_props[SPI.gamma], static_props[SPI.Cp],
-                static_props[SPI.Cv], static_props[SPI.S], static_props[SPI.R],
-                static_props[SPI.V], static_props[SPI.Vsonic], static_props[SPI.MN],
-                static_props[SPI.area], Wc,
+                static_props.hs, static_props.Ts, static_props.Ps,
+                static_props.rhos, static_props.gamma, static_props.Cp,
+                static_props.Cv, static_props.S, static_props.R,
+                static_props.V, static_props.Vsonic, static_props.MN,
+                static_props.area, Wc,
             ])
 
         return tuple(outputs)
