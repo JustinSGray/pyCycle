@@ -55,6 +55,10 @@ class TabularThermo(ThermoInterface):
     # Class-level registry of all instances for stats collection
     _instances = []
 
+    # Class-level constant arrays (never change, shared across instances)
+    _FAR_DERIVS = np.array([0.0, 0.0, 0.0, 0.0, 1.0])   # d/d[Tt, Pt, MN, W, FAR] for FAR
+    _MN_DERIVS = np.array([0.0, 0.0, 1.0, 0.0, 0.0])    # d/d[Tt, Pt, MN, W, FAR] for MN
+
     def __init__(self, FAR=0.0, spec=None, input_units='SI'):
         # Register this instance
         TabularThermo._instances.append(self)
@@ -165,7 +169,7 @@ class TabularThermo(ThermoInterface):
     def _lookup_si(self, prop, T_si, P_si, FAR=None):
         """Internal lookup function in SI units."""
         FAR = self._get_FAR(FAR)
-        x = np.array([FAR, float(P_si), float(T_si)])
+        x = np.array([FAR, P_si, T_si])
         return self._interps[prop].interpolate(x)[0]
 
     # =========================================================================
@@ -202,7 +206,7 @@ class TabularThermo(ThermoInterface):
         T_si = self._convert_T_to_si(T)
         P_si = P * self._P_to_si
 
-        x = np.array([FAR, float(P_si), float(T_si)])
+        x = np.array([FAR, P_si, T_si])
 
         # Store the linearization point
         self._lin_T = T
@@ -211,19 +215,19 @@ class TabularThermo(ThermoInterface):
         self._lin_T_si = T_si
         self._lin_P_si = P_si
 
-        # Compute gradients for each property (in SI units)
-        # gradients are (dProp/dFAR, dProp/dP, dProp/dT)
+        # Compute values and gradients together using compute_derivative=True
+        # This avoids redundant cell lookups
         self._gradients_si = {}
+        props_si = {}
         for prop in TOTAL_PROPS:
-            self._gradients_si[prop] = self._interps[prop].gradient(x)
+            val, grad = self._interps[prop].interpolate(x, compute_derivative=True)
+            props_si[prop] = val[0]
+            self._gradients_si[prop] = grad[0]
 
-        # If props provided from forward pass, use those; otherwise lookup
+        # If props provided from forward pass, use those; otherwise use computed
         if props is not None:
             return props
         else:
-            props_si = {}
-            for prop in TOTAL_PROPS:
-                props_si[prop] = self._interps[prop].interpolate(x)[0]
             return self._convert_total_props_from_si(TotalProps(
                 h=props_si['h'], S=props_si['S'], gamma=props_si['gamma'],
                 Cp=props_si['Cp'], Cv=props_si['Cv'], rho=props_si['rho'], R=props_si['R']
@@ -477,12 +481,12 @@ class TabularThermo(ThermoInterface):
 
         converged = False
         for _ in range(max_iter):
-            x = np.array([FAR, float(P_si), float(T)])
+            x = np.array([FAR, P_si, T])
 
-            # Get h and dh/dT
-            h = self._interps['h'].interpolate(x)[0]
-            grad_h = self._interps['h'].gradient(x)  # (dh/dFAR, dh/dP, dh/dT)
-            dh_dT = grad_h[2]
+            # Get h and dh/dT in single call (avoids redundant cell lookup)
+            h_arr, grad_h_2d = self._interps['h'].interpolate(x, compute_derivative=True)
+            h = h_arr[0]
+            dh_dT = grad_h_2d[0, 2]  # (dh/dFAR, dh/dP, dh/dT)
 
             # Residual and derivative
             residual = h - h_target_si
@@ -647,16 +651,28 @@ class TabularThermo(ThermoInterface):
         # Residuals:
         #   R1 = S(Ts, Ps) - S_total = 0  (entropy conservation)
         #   R2 = hs + MN²·γ·R·Ts/2 - ht = 0  (energy conservation)
+
         converged = False
         for _ in range(max_iter):
             # Evaluate properties and gradients at current (Ts, Ps)
-            x = np.array([FAR, float(Ps), float(Ts)])
+            x = np.array([FAR, Ps, Ts])
 
-            # Get values
-            S_s = self._interps['S'].interpolate(x)[0]
-            hs = self._interps['h'].interpolate(x)[0]
-            gamma_s = self._interps['gamma'].interpolate(x)[0]
-            R_s = self._interps['R'].interpolate(x)[0]
+            # Get values AND gradients in single calls (avoids redundant cell lookups)
+            # Each call returns (value_array, gradient_2d_array)
+            S_arr, grad_S_2d = self._interps['S'].interpolate(x, compute_derivative=True)
+            h_arr, grad_h_2d = self._interps['h'].interpolate(x, compute_derivative=True)
+            gam_arr, grad_gam_2d = self._interps['gamma'].interpolate(x, compute_derivative=True)
+            R_arr, grad_R_2d = self._interps['R'].interpolate(x, compute_derivative=True)
+
+            S_s = S_arr[0]
+            hs = h_arr[0]
+            gamma_s = gam_arr[0]
+            R_s = R_arr[0]
+
+            grad_S = grad_S_2d[0]
+            grad_h = grad_h_2d[0]
+            grad_gamma = grad_gam_2d[0]
+            grad_R = grad_R_2d[0]
 
             # Compute residuals
             # R1: entropy conservation (normalized)
@@ -672,12 +688,6 @@ class TabularThermo(ThermoInterface):
             if abs(R1) < tol and abs(R2) < tol:
                 converged = True
                 break
-
-            # Get gradients: (d/dFAR, d/dPs, d/dTs)
-            grad_S = self._interps['S'].gradient(x)
-            grad_h = self._interps['h'].gradient(x)
-            grad_gamma = self._interps['gamma'].gradient(x)
-            grad_R = self._interps['R'].gradient(x)
 
             # Jacobian of residuals w.r.t. (Ts, Ps)
             # dR1/dTs = (dS/dTs) / S_total
@@ -793,12 +803,12 @@ class TabularThermo(ThermoInterface):
 
         converged = False
         for _ in range(max_iter):
-            x = np.array([FAR, float(P_si), float(T)])
+            x = np.array([FAR, P_si, T])
 
-            # Get S and dS/dT
-            S = self._interps['S'].interpolate(x)[0]
-            grad_S = self._interps['S'].gradient(x)  # (dS/dFAR, dS/dP, dS/dT)
-            dS_dT = grad_S[2]
+            # Get S and dS/dT in single call (avoids redundant cell lookup)
+            S_arr, grad_S_2d = self._interps['S'].interpolate(x, compute_derivative=True)
+            S = S_arr[0]
+            dS_dT = grad_S_2d[0, 2]  # (dS/dFAR, dS/dP, dS/dT)
 
             # Residual
             residual = S - S_target_si
@@ -1097,26 +1107,34 @@ class TabularThermo(ThermoInterface):
             Ts_si = self._convert_T_to_si(props.Ts)
             Ps_si = props.Ps * self._P_to_si
 
-        # Get total properties and their gradients
-        x_tot = np.array([FAR, float(Pt_si), float(Tt_si)])
-        ht_si = self._interps['h'].interpolate(x_tot)[0]
-        S_total = self._interps['S'].interpolate(x_tot)[0]
+        # Get total properties and their gradients (combined call)
+        x_tot = np.array([FAR, Pt_si, Tt_si])
+        ht_arr, grad_ht_2d = self._interps['h'].interpolate(x_tot, compute_derivative=True)
+        St_arr, grad_St_2d = self._interps['S'].interpolate(x_tot, compute_derivative=True)
+        ht_si = ht_arr[0]
+        S_total = St_arr[0]
+        grad_ht_tot = grad_ht_2d[0]  # (dh/dFAR, dh/dP, dh/dT)
+        grad_S_tot = grad_St_2d[0]   # (dS/dFAR, dS/dP, dS/dT)
 
-        grad_ht_tot = self._interps['h'].gradient(x_tot)  # (dh/dFAR, dh/dP, dh/dT)
-        grad_S_tot = self._interps['S'].gradient(x_tot)   # (dS/dFAR, dS/dP, dS/dT)
+        # Get static properties and their gradients at (Ts, Ps, FAR) (combined calls)
+        x_stat = np.array([FAR, Ps_si, Ts_si])
+        hs_arr, grad_hs_2d = self._interps['h'].interpolate(x_stat, compute_derivative=True)
+        Ss_arr, grad_Ss_2d = self._interps['S'].interpolate(x_stat, compute_derivative=True)
+        gams_arr, grad_gams_2d = self._interps['gamma'].interpolate(x_stat, compute_derivative=True)
+        Rs_arr, grad_Rs_2d = self._interps['R'].interpolate(x_stat, compute_derivative=True)
+        Cps_arr, grad_Cps_2d = self._interps['Cp'].interpolate(x_stat, compute_derivative=True)
+        Cvs_arr, grad_Cvs_2d = self._interps['Cv'].interpolate(x_stat, compute_derivative=True)
 
-        # Get static properties and their gradients at (Ts, Ps, FAR)
-        x_stat = np.array([FAR, float(Ps_si), float(Ts_si)])
-        hs_si = self._interps['h'].interpolate(x_stat)[0]
-        gamma_s = self._interps['gamma'].interpolate(x_stat)[0]
-        R_s = self._interps['R'].interpolate(x_stat)[0]
+        hs_si = hs_arr[0]
+        gamma_s = gams_arr[0]
+        R_s = Rs_arr[0]
 
-        grad_hs = self._interps['h'].gradient(x_stat)      # (dhs/dFAR, dhs/dPs, dhs/dTs)
-        grad_Ss = self._interps['S'].gradient(x_stat)      # (dSs/dFAR, dSs/dPs, dSs/dTs)
-        grad_gams = self._interps['gamma'].gradient(x_stat)
-        grad_Rs = self._interps['R'].gradient(x_stat)
-        grad_Cps = self._interps['Cp'].gradient(x_stat)
-        grad_Cvs = self._interps['Cv'].gradient(x_stat)
+        grad_hs = grad_hs_2d[0]      # (dhs/dFAR, dhs/dPs, dhs/dTs)
+        grad_Ss = grad_Ss_2d[0]      # (dSs/dFAR, dSs/dPs, dSs/dTs)
+        grad_gams = grad_gams_2d[0]
+        grad_Rs = grad_Rs_2d[0]
+        grad_Cps = grad_Cps_2d[0]
+        grad_Cvs = grad_Cvs_2d[0]
 
         MN_sq = MN ** 2
 
@@ -1141,77 +1159,60 @@ class TabularThermo(ThermoInterface):
             grad_gams[1] * R_s * Ts_si + gamma_s * grad_Rs[1] * Ts_si
         )
 
-        # Constraint Jacobian matrix
-        J_constraint = np.array([[dF_dTs, dF_dPs],
-                                  [dG_dTs, dG_dPs]])
-
-        # Invert the constraint Jacobian
+        # Invert the constraint Jacobian using Cramer's rule
         det = dF_dTs * dG_dPs - dF_dPs * dG_dTs
         if abs(det) > 1e-20:
-            J_inv = np.array([[dG_dPs, -dF_dPs],
-                              [-dG_dTs, dF_dTs]]) / det
+            inv_det = 1.0 / det
+            J_inv_00 = dG_dPs * inv_det
+            J_inv_01 = -dF_dPs * inv_det
+            J_inv_10 = -dG_dTs * inv_det
+            J_inv_11 = dF_dTs * inv_det
         else:
-            J_inv = np.zeros((2, 2))
+            J_inv_00 = J_inv_01 = J_inv_10 = J_inv_11 = 0.0
 
         # Compute dTs, dPs w.r.t. each input using implicit function theorem:
         # [dTs/dx, dPs/dx]^T = -J_inv @ [dF/dx, dG/dx]^T
 
         # Derivatives w.r.t. Tt (in input units):
-        # dF/dTt = -dS_tot/dTt = -grad_S_tot[2] * T_to_si
-        # dG/dTt = -dht/dTt = -grad_ht_tot[2] * T_to_si
         dF_dTt = -grad_S_tot[2] * self._T_to_si
         dG_dTt = -grad_ht_tot[2] * self._T_to_si
-        d_dTt = -J_inv @ np.array([dF_dTt, dG_dTt])
-        dTs_dTt_si, dPs_dTt_si = d_dTt[0], d_dTt[1]
+        dTs_dTt_si = -(J_inv_00 * dF_dTt + J_inv_01 * dG_dTt)
+        dPs_dTt_si = -(J_inv_10 * dF_dTt + J_inv_11 * dG_dTt)
 
         # Derivatives w.r.t. Pt (in input units):
         dF_dPt = -grad_S_tot[1] * self._P_to_si
         dG_dPt = -grad_ht_tot[1] * self._P_to_si
-        d_dPt = -J_inv @ np.array([dF_dPt, dG_dPt])
-        dTs_dPt_si, dPs_dPt_si = d_dPt[0], d_dPt[1]
+        dTs_dPt_si = -(J_inv_00 * dF_dPt + J_inv_01 * dG_dPt)
+        dPs_dPt_si = -(J_inv_10 * dF_dPt + J_inv_11 * dG_dPt)
 
         # Derivatives w.r.t. MN:
-        # dF/dMN = 0
-        # dG/dMN = MN * gamma_s * R_s * Ts
-        dF_dMN = 0.0
         dG_dMN = MN * gamma_s * R_s * Ts_si
-        d_dMN = -J_inv @ np.array([dF_dMN, dG_dMN])
-        dTs_dMN_si, dPs_dMN_si = d_dMN[0], d_dMN[1]
+        dTs_dMN_si = -(J_inv_01 * dG_dMN)
+        dPs_dMN_si = -(J_inv_11 * dG_dMN)
 
-        # Derivatives w.r.t. W:
-        # Neither F nor G depends on W directly
+        # Derivatives w.r.t. W: Neither F nor G depends on W directly
         dTs_dW_si, dPs_dW_si = 0.0, 0.0
 
         # Derivatives w.r.t. FAR:
-        # dF/dFAR = dSs/dFAR - dS_tot/dFAR = grad_Ss[0] - grad_S_tot[0]
-        # dG/dFAR = dhs/dFAR + MN²/2*(dgamma/dFAR*R*Ts + gamma*dR/dFAR*Ts) - dht/dFAR
         dF_dFAR = grad_Ss[0] - grad_S_tot[0]
         dG_dFAR = (grad_hs[0] +
                    MN_sq / 2.0 * (grad_gams[0] * R_s * Ts_si + gamma_s * grad_Rs[0] * Ts_si) -
                    grad_ht_tot[0])
-        d_dFAR = -J_inv @ np.array([dF_dFAR, dG_dFAR])
-        dTs_dFAR_si, dPs_dFAR_si = d_dFAR[0], d_dFAR[1]
+        dTs_dFAR_si = -(J_inv_00 * dF_dFAR + J_inv_01 * dG_dFAR)
+        dPs_dFAR_si = -(J_inv_10 * dF_dFAR + J_inv_11 * dG_dFAR)
 
         # Build derivative arrays for Ts and Ps in input units
         # [d/dTt, d/dPt, d/dMN, d/dW, d/dFAR]
-        dTs_d = np.array([dTs_dTt_si * self._T_from_si,
-                          dTs_dPt_si * self._T_from_si,
-                          dTs_dMN_si * self._T_from_si,
-                          dTs_dW_si * self._T_from_si,
-                          dTs_dFAR_si * self._T_from_si])
-        dPs_d = np.array([dPs_dTt_si * self._P_from_si,
-                          dPs_dPt_si * self._P_from_si,
-                          dPs_dMN_si * self._P_from_si,
-                          dPs_dW_si * self._P_from_si,
-                          dPs_dFAR_si * self._P_from_si])
+        dTs_d = np.array([dTs_dTt_si, dTs_dPt_si, dTs_dMN_si, dTs_dW_si, dTs_dFAR_si]) * self._T_from_si
+        dPs_d = np.array([dPs_dTt_si, dPs_dPt_si, dPs_dMN_si, dPs_dW_si, dPs_dFAR_si]) * self._P_from_si
 
-        # Now compute derivatives of all other properties using chain rule
-        # Property(Ts, Ps, FAR) -> dProp/dx = dProp/dTs * dTs/dx + dProp/dPs * dPs/dx + dProp/dFAR * dFAR/dx
-        FAR_derivs = np.array([0.0, 0.0, 0.0, 0.0, 1.0])
-
-        # Convert dTs_d and dPs_d to SI for chain rule with SI gradients
+        # SI versions for chain rule
         dTs_d_si = np.array([dTs_dTt_si, dTs_dPt_si, dTs_dMN_si, dTs_dW_si, dTs_dFAR_si])
         dPs_d_si = np.array([dPs_dTt_si, dPs_dPt_si, dPs_dMN_si, dPs_dW_si, dPs_dFAR_si])
+
+        # Chain rule for property derivatives
+        # Property(Ts, Ps, FAR) -> dProp/dx = dProp/dTs * dTs/dx + dProp/dPs * dPs/dx + dProp/dFAR * dFAR/dx
+        FAR_derivs = self._FAR_DERIVS
 
         def chain_rule(grad):
             """grad is (dProp/dFAR, dProp/dPs, dProp/dTs) in SI"""
@@ -1236,9 +1237,8 @@ class TabularThermo(ThermoInterface):
         dVsonic_d = dVsonic_d_si * self._V_from_si
 
         # V = MN * Vsonic
-        dMN_d = np.array([0.0, 0.0, 1.0, 0.0, 0.0])
         V_si = MN * Vsonic_si
-        dV_d_si = dMN_d * Vsonic_si + MN * dVsonic_d_si
+        dV_d_si = self._MN_DERIVS * Vsonic_si + MN * dVsonic_d_si
         dV_d = dV_d_si * self._V_from_si
 
         # rhos = Ps / (R_s * Ts)
@@ -1265,7 +1265,7 @@ class TabularThermo(ThermoInterface):
             'Ps': dPs_d,
             'hs': dhs_d,
             'rhos': drhos_d,
-            'MN': dMN_d,
+            'MN': self._MN_DERIVS,
             'V': dV_d,
             'Vsonic': dVsonic_d,
             'area': darea_d,
@@ -1405,7 +1405,6 @@ class TabularThermo(ThermoInterface):
         # Total derivative = partial via MN path
         # d(output)/d(input) = d(output)/dMN * dMN/d(input) for [Tt, Pt, area, W, FAR]
         # where MN implicitly depends on [Tt, Pt, area, W, FAR]
-        dMN_d = np.array([dMN_dTt, dMN_dPt, dMN_darea, dMN_dW, dMN_dFAR])
 
         self._jacobian_static_area = {}
         for prop in STATIC_PROPS:
