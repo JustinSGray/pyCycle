@@ -293,7 +293,14 @@ class JaxTabularThermo:
             # Initial guess
             T_si_init = jnp.clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 2000.0)
 
-            def h_interp(T_si):
+            def h_and_deriv(T_si):
+                """Get h and dh/dT using analytical derivatives from interpolator."""
+                point = jnp.array([FAR, P_si, T_si])
+                props, _, dprops_dT = interp.interpolate_with_derivs(point)
+                return props['h'], dprops_dT['h']
+
+            def h_only(T_si):
+                """Get h value only (more efficient for residual check)."""
                 point = jnp.array([FAR, P_si, T_si])
                 return interp.interpolate_single(point, 0)  # h is at index 0
 
@@ -303,13 +310,10 @@ class JaxTabularThermo:
 
             def body_fn(state):
                 T_si, _, i = state
-                h_si = h_interp(T_si)
-                residual = h_si - h_target_si
 
-                # dh/dT via finite difference
-                eps = 1.0
-                h_plus = h_interp(T_si + eps)
-                dh_dT = (h_plus - h_si) / eps
+                # Get h and analytical dh/dT from interpolator
+                h_si, dh_dT = h_and_deriv(T_si)
+                residual = h_si - h_target_si
                 dh_dT = jnp.where(jnp.abs(dh_dT) < 1e-20, 1e-20, dh_dT)
 
                 # Newton step with bounds
@@ -317,11 +321,11 @@ class JaxTabularThermo:
                 T_si_new = jnp.clip(T_si + dx, 160.0, 2400.0)
 
                 # Compute new residual for convergence check
-                residual_new = h_interp(T_si_new) - h_target_si
+                residual_new = h_only(T_si_new) - h_target_si
                 return (T_si_new, residual_new, i + 1)
 
             # Initialize state: (T_si, residual, iteration)
-            residual_init = h_interp(T_si_init) - h_target_si
+            residual_init = h_only(T_si_init) - h_target_si
             init_state = (T_si_init, residual_init, 0)
 
             # Run Newton iteration
@@ -593,12 +597,61 @@ class JaxTabularThermo:
             V_newton = MN_clamped * Vsonic_newton
             area_newton = W_si / (rhos_newton * V_newton)
 
+            # === Compute darea/dMN via implicit differentiation ===
+            # Extract Jacobian entries from final state
+            dS_dT_final = final_state[8]
+            dS_dP_final = final_state[9]
+            dh_dT_final = final_state[10]
+            dh_dP_final = final_state[11]
+            dgamma_dT_final = final_state[12]
+            dgamma_dP_final = final_state[13]
+            dR_dT_final = final_state[14]
+            dR_dP_final = final_state[15]
+
+            # Recompute dR2_dT and dR2_dP at converged point
+            Vsonic_sq_newton = gamma_newton * R_newton * Ts_newton
+            dVsq_dT_final = MN_sq * (dgamma_dT_final * R_newton * Ts_newton
+                                     + gamma_newton * dR_dT_final * Ts_newton
+                                     + gamma_newton * R_newton)
+            dVsq_dP_final = MN_sq * (dgamma_dP_final * R_newton * Ts_newton
+                                     + gamma_newton * dR_dP_final * Ts_newton)
+            dR2_dT_final = dh_dT_final + 0.5 * dVsq_dT_final
+            dR2_dP_final = dh_dP_final + 0.5 * dVsq_dP_final
+
+            # Solve 2x2 system for dTs/dMN and dPs/dMN:
+            # [dS_dT   dS_dP ] [dTs/dMN]   [     0      ]
+            # [dR2_dT  dR2_dP] [dPs/dMN] = [-MN*Vsonic²]
+            det_final = dS_dT_final * dR2_dP_final - dS_dP_final * dR2_dT_final
+            det_final = jnp.where(jnp.abs(det_final) < 1e-30, 1e-30, det_final)
+
+            rhs_MN = -MN_clamped * Vsonic_sq_newton  # ∂R2/∂MN = MN * Vsonic²
+            dTs_dMN = (0.0 * dR2_dP_final - rhs_MN * dS_dP_final) / det_final
+            dPs_dMN = (dS_dT_final * rhs_MN - 0.0 * dR2_dT_final) / det_final
+
+            # Chain rule for gamma and R
+            dgamma_dMN = dgamma_dT_final * dTs_dMN + dgamma_dP_final * dPs_dMN
+            dR_dMN = dR_dT_final * dTs_dMN + dR_dP_final * dPs_dMN
+
+            # Derivatives of rho and Vsonic (in SI units)
+            # rho = Ps / (R * Ts)
+            drho_dMN_newton = rhos_newton * (dPs_dMN / Ps_newton - dR_dMN / R_newton - dTs_dMN / Ts_newton)
+
+            # Vsonic = sqrt(gamma * R * Ts)
+            dVsonic_dMN_newton = 0.5 * Vsonic_newton * (dgamma_dMN / gamma_newton + dR_dMN / R_newton + dTs_dMN / Ts_newton)
+
+            # darea/dMN in SI units: area = W / (rho * MN * Vsonic)
+            darea_dMN_newton = area_newton * (-1.0 / MN_clamped - drho_dMN_newton / rhos_newton - dVsonic_dMN_newton / Vsonic_newton)
+
             # Zero MN case: static = total (cheap to compute)
             rhos_zero = Pt_si / (R_t * Tt_si)
             Vsonic_zero = jnp.sqrt(gamma_t * R_t * Tt_si)
 
             # Use jnp.where to blend results (avoids tracing both lax.cond branches)
             is_zero_MN = MN < 1e-10
+
+            # For zero MN case, derivative is undefined/infinite, use large value
+            darea_dMN_si = jnp.where(is_zero_MN, -1e30, darea_dMN_newton)
+
             Ts_si = jnp.where(is_zero_MN, Tt_si, Ts_newton)
             Ps_si = jnp.where(is_zero_MN, Pt_si, Ps_newton)
             hs_si = jnp.where(is_zero_MN, ht_si, hs_newton)
@@ -631,31 +684,18 @@ class JaxTabularThermo:
             S = result_si[11] * S_from_si
             R = result_si[12] * S_from_si
 
+            # Convert darea_dMN to English units (area_from_si, MN is dimensionless)
+            darea_dMN = darea_dMN_si * area_from_si
+
             return jnp.array([Ts, Ps, hs, rhos, MN_out, V, Vsonic, area,
-                              gamma_out, Cp, Cv, S, R])
+                              gamma_out, Cp, Cv, S, R, darea_dMN])
 
         def static_from_area_impl(Tt, Pt, area, W, FAR):
             """Pure JAX static_from_area implementation using while_loop Newton."""
-            # Convert to SI
-            Tt_si = Tt * T_to_si_scale
-            Pt_si = Pt * P_to_si
-            W_si = W * W_to_si
-            area_si = area * area_to_si
-
-            # Get total properties for initial guess
-            tot_props = props_at_TP_si(Tt_si, Pt_si, FAR)
-            gamma_t = tot_props['gamma']
-
-            # Initial MN guess using ideal gas relations
-            # Start with subsonic guess
+            # Initial MN guess - start with subsonic guess
             MN0 = 0.5
 
-            # Newton iteration on MN to match area using while_loop
-            def area_residual(MN_val):
-                # Compute static props at this MN
-                static_result = static_from_MN_impl(Tt, Pt, MN_val, W, FAR)
-                area_computed = static_result[7]  # area is at index 7
-                return area_computed - area
+            # Newton iteration on MN to match area using analytical derivative
 
             def cond_fn_MN(state):
                 # state = [MN, residual, i]
@@ -665,27 +705,35 @@ class JaxTabularThermo:
             def body_fn_MN(state):
                 MN_val, _, i = state[0], state[1], state[2]
 
-                # Use forward-mode AD (jvp) for derivative - works through while_loop
-                # jax.grad uses reverse-mode which doesn't work with while_loop
-                res, dres_dMN = jax.jvp(area_residual, (MN_val,), (1.0,))
+                # Compute static props at this MN (includes darea_dMN at index 13)
+                static_result = static_from_MN_impl(Tt, Pt, MN_val, W, FAR)
+                area_computed = static_result[7]   # area is at index 7
+                darea_dMN = static_result[13]      # darea_dMN is at index 13
+
+                res = area_computed - area
+                dres_dMN = darea_dMN  # d(residual)/dMN = d(area_computed)/dMN
                 dres_dMN = jnp.where(jnp.abs(dres_dMN) < 1e-20, 1e-20, dres_dMN)
+
                 dMN = -res / dres_dMN
                 MN_new = jnp.clip(MN_val + dMN, 0.01, 0.99)  # Subsonic only
 
                 # Compute new residual
-                res_new = area_residual(MN_new)
+                static_result_new = static_from_MN_impl(Tt, Pt, MN_new, W, FAR)
+                res_new = static_result_new[7] - area
                 return jnp.array([MN_new, res_new, i + 1])
 
             # Initialize state: [MN, residual, iteration]
-            res_init = area_residual(MN0)
+            static_result_init = static_from_MN_impl(Tt, Pt, MN0, W, FAR)
+            res_init = static_result_init[7] - area
             init_state = jnp.array([MN0, res_init, 0.0])
 
             # Run Newton iteration
             final_state = jax.lax.while_loop(cond_fn_MN, body_fn_MN, init_state)
             MN = final_state[0]
 
-            # Final computation with solved MN
-            return static_from_MN_impl(Tt, Pt, MN, W, FAR)
+            # Final computation with solved MN (return first 13 elements, without darea_dMN)
+            result = static_from_MN_impl(Tt, Pt, MN, W, FAR)
+            return result[:13]
 
         # JIT compile
         self._static_from_MN_jit = jax.jit(static_from_MN_impl)

@@ -185,7 +185,7 @@ class JaxElement(om.ExplicitComponent):
 
     def _get_shared_jax_thermo(self):
         """
-        Get or create a shared JaxThermo for this configuration.
+        Get or create a shared JaxTabularThermo for this configuration.
 
         Uses class-level cache keyed by (thermo_method, thermo_data).
         """
@@ -194,10 +194,10 @@ class JaxElement(om.ExplicitComponent):
         key = (thermo_method, id(thermo_data))
 
         if key not in JaxElement._shared_thermos:
-            # Create new JaxThermo and cache at class level
+            # Create new JaxTabularThermo and cache at class level
             spec = self._get_thermo_spec()
-            from pycycle.functional_thermo.jax_wrappers import JaxThermo
-            JaxElement._shared_thermos[key] = JaxThermo(spec)
+            from pycycle.functional_thermo.jax_tabular import JaxTabularThermo
+            JaxElement._shared_thermos[key] = JaxTabularThermo(spec)
 
         return JaxElement._shared_thermos[key]
 

@@ -2,8 +2,8 @@
 NewDuct - A duct element using JaxElement for automatic differentiation.
 
 This is a single ExplicitComponent that replaces the Duct Group.
-It uses JaxThermo with tabular thermo data and provides analytical
-derivatives via JAX automatic differentiation.
+It uses JaxTabularThermo for thermodynamic calculations and provides
+analytical derivatives via JAX automatic differentiation.
 """
 
 import time
@@ -158,8 +158,7 @@ class NewDuct(JaxElement):
         MN_in : float
             Inlet Mach number
         composition : array
-            Flow composition. For TABULAR, composition[0] = FAR.
-            For CEA, this is elemental fractions.
+            Flow composition. composition[0] = FAR (fuel-to-air ratio).
         Q_dot : float
             Heat flow rate
         dPqP_or_s : float
@@ -175,7 +174,10 @@ class NewDuct(JaxElement):
         design = self.options['design']
         statics = self.options['statics']
         expMN = self.options['expMN']
-        jt = self.jax_thermo
+        thermo = self.jax_thermo
+
+        # Extract FAR from composition array
+        FAR = composition[0]
 
         # Pressure loss calculation
         if expMN > 1e-10:
@@ -189,11 +191,11 @@ class NewDuct(JaxElement):
             dPqP = dPqP_or_s
             s_dPqP = 0.0
 
-        # Total properties - pass composition through (thermo extracts FAR internally)
+        # Total properties
         Pt_out = Pt_in * (1.0 - dPqP)
         ht_out = jnp.where(W_in > 1e-10, ht_in + Q_dot / W_in, ht_in)
-        Tt_out = jt.T_from_hP(ht_out, Pt_out, composition)
-        props = jt.props_TP(Tt_out, Pt_out, composition)
+        Tt_out = thermo.T_from_hP(ht_out, Pt_out, FAR)
+        props = thermo.props_TP(Tt_out, Pt_out, FAR)
 
         # Build output list - must match add_primal_output order
         outputs = [
@@ -207,12 +209,12 @@ class NewDuct(JaxElement):
         if expMN > 1e-10:
             outputs.append(s_dPqP if design else dPqP)
 
-        # Static properties - pass composition through
+        # Static properties
         if statics:
             if design:
-                static_props = jt.static_from_MN(Tt_out, Pt_out, MN_or_area, W_in, composition)
+                static_props = thermo.static_from_MN(Tt_out, Pt_out, MN_or_area, W_in, FAR)
             else:
-                static_props = jt.static_from_area(Tt_out, Pt_out, MN_or_area, W_in, composition)
+                static_props = thermo.static_from_area(Tt_out, Pt_out, MN_or_area, W_in, FAR)
 
             # Corrected flow
             Wc = W_in * jnp.sqrt(Tt_out / 518.67) / (Pt_out / 14.696)
