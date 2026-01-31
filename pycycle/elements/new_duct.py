@@ -60,6 +60,21 @@ class NewDuct(JaxElement):
 
         self.default_des_od_conns = [('Fl_O:stat:area', 'area')]
 
+    def _get_jit_config_key(self):
+        """
+        Return config key including NewDuct-specific options.
+
+        Includes design, statics, expMN, and jax_thermo identity to ensure
+        instances with different configurations get separate JIT compilations.
+        """
+        return (
+            type(self).__name__,
+            self.options['design'],
+            self.options['statics'],
+            self.options['expMN'],
+            id(self._jax_thermo) if self._jax_thermo is not None else None,
+        )
+
     def pyc_setup_output_ports(self):
         self.copy_flow('Fl_I', 'Fl_O')
 

@@ -142,7 +142,7 @@ class JaxThermo:
     JAX functions while maintaining separate operating-point state.
     """
 
-    def __init__(self, thermo):
+    def __init__(self, thermo, use_pure_jax=True):
         self._thermo = thermo
         self._cache = {}  # Linearization cache - can be pointed to external dict via set_cache()
 
@@ -150,6 +150,16 @@ class JaxThermo:
         # TabularThermo has FAR as a direct parameter; CEAThermo uses composition
         from pycycle.functional_thermo.tabular import TabularThermo
         self._supports_FAR = isinstance(thermo, TabularThermo)
+
+        # Use pure JAX for primal computation (eliminates pure_callback overhead)
+        # Only available for TabularThermo
+        self._use_pure_jax = use_pure_jax and self._supports_FAR
+        self._jax_thermo = None
+
+        if self._use_pure_jax:
+            # Create pure JAX thermo for primal computation
+            from pycycle.functional_thermo.jax_tabular import JaxTabularThermo
+            self._jax_thermo = JaxTabularThermo(thermo.spec)
 
         self._setup_wrappers()
 
@@ -341,15 +351,77 @@ class JaxThermo:
     def _setup_wrappers(self):
         """Create fully JAX-traceable wrappers for thermo methods."""
         thermo = self._thermo
+        supports_FAR = self._supports_FAR
+        extract_FAR = self._extract_FAR
+        jax_thermo = self._jax_thermo
+        use_pure_jax = self._use_pure_jax
+
+        # ---------------------------------------------------------------------
+        # For pure JAX mode (TabularThermo): Use plain JAX functions
+        # JAX autodiff will trace through the pure JAX implementations
+        # No @custom_jvp needed - eliminates decorator overhead entirely
+        # ---------------------------------------------------------------------
+        if use_pure_jax and jax_thermo is not None:
+            self._setup_pure_jax_wrappers()
+            return
+
+        # ---------------------------------------------------------------------
+        # For callback mode (CEAThermo): Use @custom_jvp with pure_callback
+        # This is the original implementation with analytic derivatives
+        # ---------------------------------------------------------------------
+        self._setup_callback_wrappers()
+
+    def _setup_pure_jax_wrappers(self):
+        """
+        Create pure JAX wrappers for TabularThermo.
+
+        These use plain JAX functions that JAX can differentiate through directly.
+        No @custom_jvp decorator - eliminates overhead entirely.
+        """
+        jax_thermo = self._jax_thermo
+
+        # T_from_hP: Pure JAX, composition[0] = FAR
+        def T_from_hP_pure(h, P, composition):
+            FAR = composition[0]
+            return jax_thermo.T_from_hP(h, P, FAR)
+
+        # props_TP: Pure JAX, composition[0] = FAR
+        def props_TP_pure(T, P, composition):
+            FAR = composition[0]
+            return jax_thermo.props_TP(T, P, FAR)
+
+        # static_from_MN: Pure JAX
+        def static_from_MN_pure(Tt, Pt, MN, W, composition):
+            FAR = composition[0]
+            return jax_thermo.static_from_MN(Tt, Pt, MN, W, FAR)
+
+        # static_from_area: Pure JAX
+        def static_from_area_pure(Tt, Pt, area, W, composition):
+            FAR = composition[0]
+            return jax_thermo.static_from_area(Tt, Pt, area, W, FAR)
+
+        # Assign the pure JAX functions
+        self.T_from_hP = T_from_hP_pure
+        self.props_TP = props_TP_pure
+        self.static_from_MN = static_from_MN_pure
+        self.static_from_area = static_from_area_pure
+
+    def _setup_callback_wrappers(self):
+        """
+        Create @custom_jvp wrappers with pure_callback for CEAThermo.
+
+        This is the original implementation that uses callbacks for both
+        primal and derivative computations.
+        """
+        thermo = self._thermo
+        supports_FAR = self._supports_FAR
+        extract_FAR = self._extract_FAR
 
         # ---------------------------------------------------------------------
         # T_from_hP wrapper - accepts composition as third argument
         # For TabularThermo: FAR = composition[0], affects properties and derivatives
         # For CEAThermo: FAR is ignored (composition is elemental fractions)
         # ---------------------------------------------------------------------
-        supports_FAR = self._supports_FAR
-        extract_FAR = self._extract_FAR
-
         def _T_from_hP_impl(args):
             """Pure Python implementation - called via pure_callback."""
             h, P = float(args[0]), float(args[1])
@@ -401,7 +473,6 @@ class JaxThermo:
 
         @custom_jvp
         def T_from_hP_jax(h, P, composition):
-            # Pack h, P, and composition into a single array for pure_callback
             args = jnp.concatenate([jnp.array([h, P]), composition])
             result = pure_callback(_T_from_hP_impl,
                                    jax.ShapeDtypeStruct((1,), jnp.float64),
@@ -413,7 +484,6 @@ class JaxThermo:
             h, P, composition = primals
             h_dot, P_dot, composition_dot = tangents
 
-            # Pack args for callback
             args = jnp.concatenate([jnp.array([h, P]), composition])
             result = pure_callback(_T_from_hP_derivs,
                                    jax.ShapeDtypeStruct((4,), jnp.float64),
@@ -423,10 +493,7 @@ class JaxThermo:
             dT_dP = result[2]
             dT_dFAR = result[3]
 
-            # For TABULAR: FAR = composition[0], so FAR_dot = composition_dot[0]
-            # For CEA: dT_dFAR = 0, so this term vanishes regardless
             FAR_dot = composition_dot[0] if supports_FAR else 0.0
-
             T_dot = dT_dh * h_dot + dT_dP * P_dot + dT_dFAR * FAR_dot
             return T, T_dot
 
@@ -505,10 +572,7 @@ class JaxThermo:
             dprops_dP = result[14:21]
             dprops_dFAR = result[21:28]
 
-            # For TABULAR: FAR = composition[0], so FAR_dot = composition_dot[0]
-            # For CEA: dprops_dFAR = 0, so this term vanishes regardless
             FAR_dot = composition_dot[0] if supports_FAR else 0.0
-
             props_dot = dprops_dT * T_dot + dprops_dP * P_dot + dprops_dFAR * FAR_dot
             return primal, props_dot
 

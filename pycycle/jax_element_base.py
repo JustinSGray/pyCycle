@@ -30,12 +30,23 @@ _jax_element_timing_stats = {
     'post_linearize_time': 0.0,
     'jvp_calls': 0,
     'jvp_time': 0.0,
+    'jit_cache_hits': 0,
+    'jit_cache_misses': 0,
 }
 
 def reset_timing_stats():
     """Reset all JaxElement timing statistics."""
     for key in _jax_element_timing_stats:
         _jax_element_timing_stats[key] = 0.0 if 'time' in key else 0
+
+
+def clear_jit_cache():
+    """Clear the class-level JIT function cache.
+
+    This forces recompilation on the next compute_partials call.
+    Useful for testing or when thermo objects have changed.
+    """
+    JaxElement._jit_jvp_cache.clear()
 
 def print_timing_stats():
     """Print detailed JaxElement timing statistics."""
@@ -65,6 +76,14 @@ def print_timing_stats():
     print(f"    total time: {stats['post_linearize_time']*1000:.3f} ms")
     if stats['post_linearize_calls'] > 0:
         print(f"    avg time: {stats['post_linearize_time']*1000/stats['post_linearize_calls']:.3f} ms")
+
+    # JIT cache stats
+    print(f"  JIT function cache:")
+    print(f"    cache hits: {stats['jit_cache_hits']}")
+    print(f"    cache misses (compilations): {stats['jit_cache_misses']}")
+    total_lookups = stats['jit_cache_hits'] + stats['jit_cache_misses']
+    if total_lookups > 0:
+        print(f"    hit rate: {100*stats['jit_cache_hits']/total_lookups:.1f}%")
 
     # Summary
     total_time = (stats['pre_linearize_time'] + stats['jacobian_compute_time'] +
@@ -124,6 +143,9 @@ class JaxElement(om.ExplicitComponent):
     (thermo_method, thermo_data) to avoid redundant JAX tracing. The linearization
     cache is kept per-instance to allow different operating points.
 
+    JIT-compiled JVP functions are cached at the class level to avoid redundant
+    JAX tracing/compilation across instances with the same configuration.
+
     Example
     -------
     class MyDuct(JaxElement):
@@ -144,6 +166,11 @@ class JaxElement(om.ExplicitComponent):
     # Value: JaxThermo instance
     _shared_thermos = {}
 
+    # Class-level cache for JIT-compiled JVP functions
+    # Key: configuration tuple from _get_jit_config_key()
+    # Value: JIT-compiled jvp_wrapper function
+    _jit_jvp_cache = {}
+
     def initialize(self):
 
         self._jax_thermo = None
@@ -151,7 +178,7 @@ class JaxElement(om.ExplicitComponent):
         self._primal_input_names = []  # Maps primal arg name -> OpenMDAO input name
         self._primal_output_names = []  # Maps primal return index -> OpenMDAO output name
         self._cached_args = None
-        self._jit_jvp_fn = None  # Cached JIT-compiled JVP function
+        self._jit_jacfwd_fn = None  # Cached JIT-compiled full Jacobian function
 
         # For compatibility with Cycle's flow graph
         self.Fl_I_data = {}
@@ -377,6 +404,27 @@ class JaxElement(om.ExplicitComponent):
             self._jax_thermo.clear_cache()
             self._thermo_cache.clear()
 
+    def _get_jit_config_key(self):
+        """
+        Return a hashable key for JIT function caching.
+
+        This key identifies the configuration that affects compute_physics behavior.
+        Instances with the same key can share the same JIT-compiled JVP function,
+        avoiding redundant JAX tracing.
+
+        Subclasses should override to include any options that affect compute_physics.
+
+        Returns
+        -------
+        tuple
+            Hashable configuration key
+        """
+        return (
+            type(self).__name__,
+            self.options.get('design', True),
+            id(self._jax_thermo) if self._jax_thermo is not None else None,
+        )
+
     def _is_array_primal(self, om_name):
         """
         Check if an OpenMDAO variable should be treated as an array primal.
@@ -473,20 +521,35 @@ class JaxElement(om.ExplicitComponent):
         _jax_element_timing_stats['post_linearize_time'] += (time.perf_counter() - t_start)
 
     def _compute_jacobian_fwd(self, args):
-        """Compute Jacobian using forward-mode with sequential JIT-compiled JVP calls."""
+        """Compute Jacobian using forward-mode with cached JIT-compiled JVP calls.
+
+        JIT-compiled functions are cached at the class level, keyed by configuration.
+        This allows instances with the same config to share the compiled function,
+        avoiding redundant JAX tracing which is expensive.
+        """
         n_inputs = len(args)
         n_outputs = len(self._primal_output_names)
         jacs = [np.zeros(n_outputs) for _ in range(n_inputs)]
         args_tuple = tuple(args)
 
-        # Create JIT-compiled single-direction JVP function on first call
-        if self._jit_jvp_fn is None:
+        # Get config key for class-level cache lookup
+        config_key = self._get_jit_config_key()
+
+        # Get or create JIT-compiled JVP function for this configuration
+        if config_key not in JaxElement._jit_jvp_cache:
+            # First instance with this config creates the JIT function
+            # The function captures self.compute_physics which uses the shared jax_thermo
+            _jax_element_timing_stats['jit_cache_misses'] += 1
             compute_physics = self.compute_physics
             def jvp_wrapper(args_tuple, tangents_tuple):
                 _, jvp_out = jax.jvp(compute_physics, args_tuple, tangents_tuple)
                 return jnp.array(jvp_out)
-            # JIT compile - this caches the traced function
-            self._jit_jvp_fn = jax.jit(jvp_wrapper)
+            # JIT compile and cache at class level
+            JaxElement._jit_jvp_cache[config_key] = jax.jit(jvp_wrapper)
+        else:
+            _jax_element_timing_stats['jit_cache_hits'] += 1
+
+        jit_fn = JaxElement._jit_jvp_cache[config_key]
 
         for j in range(n_inputs):
             # Create tangent with same structure as args (handle arrays)
@@ -504,7 +567,7 @@ class JaxElement(om.ExplicitComponent):
                         tangents.append(0.0)
 
             t_jvp = time.perf_counter()
-            jvp_out = self._jit_jvp_fn(args_tuple, tuple(tangents))
+            jvp_out = jit_fn(args_tuple, tuple(tangents))
             _jax_element_timing_stats['jvp_calls'] += 1
             _jax_element_timing_stats['jvp_time'] += (time.perf_counter() - t_jvp)
 

@@ -477,8 +477,8 @@ if __name__ == "__main__":
         prob['OD_part_pwr.fc.MN'] = MN
         prob['OD_part_pwr.fc.alt'] = alt
 
-        # for PC in [1, 0.9, 0.8, .7]:
-        for PC in [1,]:
+        for PC in [1, 0.9, 0.8, .7]:
+        # for PC in [1,]:
             print(f'## PC = {PC}')
             prob['OD_part_pwr.PC'] = PC
             prob.run_model()
