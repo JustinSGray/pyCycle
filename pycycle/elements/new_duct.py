@@ -13,6 +13,13 @@ from pycycle.functional_thermo.jax_wrappers import (
     TotalPropsIdx as TPI, StaticPropsIdx as SPI
 )
 
+# Threshold for treating expMN as effectively zero
+_EXPMN_THRESHOLD = 1e-10
+
+# Standard reference conditions for corrected flow calculation
+_T_REF = 518.67   # Reference temperature (degR)
+_P_REF = 14.696   # Reference pressure (psi)
+
 
 class NewDuct(JaxElement):
     """
@@ -70,7 +77,7 @@ class NewDuct(JaxElement):
                        desc='Heat flow rate into (positive) or out of (negative) the air')
         self.add_primal_input('Q_dot', 'Q_dot')
 
-        if expMN > 1e-10:
+        if expMN > _EXPMN_THRESHOLD:
             if design:
                 self.add_input('dPqP', val=0.0,
                                desc='Pressure differential as fraction of inlet pressure')
@@ -100,7 +107,7 @@ class NewDuct(JaxElement):
         self.add_flow_total_primal_outputs('Fl_O')
         self.add_primal_output('Fl_O:stat:W', 'W_out')
 
-        if expMN > 1e-10:
+        if expMN > _EXPMN_THRESHOLD:
             if design:
                 self.add_output('s_dPqP', val=0.0, desc='Pressure loss scalar')
                 self.add_primal_output('s_dPqP', 's_dPqP_out')
@@ -134,7 +141,8 @@ class NewDuct(JaxElement):
         Q_dot : float
             Heat flow rate
         dPqP_or_s : float
-            Pressure loss (dPqP in design, s_dPqP in off-design)
+            Pressure loss parameter. When expMN > 0: dPqP in design mode,
+            s_dPqP in off-design mode. When expMN == 0: always dPqP.
         MN_or_area : float, optional
             Exit Mach number (design) or exit area (off-design)
 
@@ -152,10 +160,10 @@ class NewDuct(JaxElement):
         FAR = composition[0]
 
         # Pressure loss calculation
-        if expMN > 1e-10:
+        if expMN > _EXPMN_THRESHOLD:
             if design:
                 dPqP = dPqP_or_s
-                s_dPqP = jnp.where(MN_in > 1e-10, dPqP / MN_in**expMN, 0.0)
+                s_dPqP = jnp.where(MN_in > _EXPMN_THRESHOLD, dPqP / MN_in**expMN, 0.0)
             else:
                 s_dPqP = dPqP_or_s
                 dPqP = s_dPqP * MN_in**expMN
@@ -165,7 +173,7 @@ class NewDuct(JaxElement):
 
         # Total properties
         Pt_out = Pt_in * (1.0 - dPqP)
-        ht_out = jnp.where(W_in > 1e-10, ht_in + Q_dot / W_in, ht_in)
+        ht_out = jnp.where(W_in > _EXPMN_THRESHOLD, ht_in + Q_dot / W_in, ht_in)
         Tt_out = thermo.T_from_hP(ht_out, Pt_out, FAR)
         props = thermo.props_TP(Tt_out, Pt_out, FAR)
 
@@ -178,7 +186,7 @@ class NewDuct(JaxElement):
         ]
 
         # s_dPqP or dPqP output (if expMN > 0)
-        if expMN > 1e-10:
+        if expMN > _EXPMN_THRESHOLD:
             outputs.append(s_dPqP if design else dPqP)
 
         # Static properties
@@ -188,8 +196,8 @@ class NewDuct(JaxElement):
             else:
                 static_props = thermo.static_from_area(Tt_out, Pt_out, MN_or_area, W_in, FAR)
 
-            # Corrected flow
-            Wc = W_in * jnp.sqrt(Tt_out / 518.67) / (Pt_out / 14.696)
+            # Corrected flow (normalized to standard day conditions)
+            Wc = W_in * jnp.sqrt(Tt_out / _T_REF) / (Pt_out / _P_REF)
 
             outputs.extend([
                 static_props[SPI.hs], static_props[SPI.Ts], static_props[SPI.Ps],

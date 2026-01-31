@@ -20,7 +20,7 @@ try:
 except ImportError:
     JAX_AVAILABLE = False
 
-from pycycle.constants import TAB_AIR_FUEL_COMPOSITION, AIR_JETA_TAB_SPEC
+from pycycle.constants import TAB_AIR_FUEL_COMPOSITION
 
 
 # Named tuple for returning mixed flow results (matches OpenMDAO outputs)
@@ -57,8 +57,6 @@ class ThermoAdd:
         Default is 'FAR'.
     mix_names : str or list, optional
         Name(s) for the mix streams. Default is 'mix'.
-    spec : dict, optional
-        Tabular data specification. Default is AIR_JETA_TAB_SPEC.
 
     Examples
     --------
@@ -77,14 +75,11 @@ class ThermoAdd:
     """
 
     def __init__(self, inflow_composition=None, mix_mode='reactant',
-                 mix_composition='FAR', mix_names='mix', spec=None):
+                 mix_composition='FAR', mix_names='mix'):
 
         if inflow_composition is None:
             inflow_composition = TAB_AIR_FUEL_COMPOSITION
-        if spec is None:
-            spec = AIR_JETA_TAB_SPEC
 
-        self.spec = spec
         self.mix_mode = mix_mode
 
         # Store inflow composition as sorted list of keys and values
@@ -110,6 +105,89 @@ class ThermoAdd:
     def inflow_composition_vec(self):
         """Return the default inflow composition as an array."""
         return np.array([self.inflow_composition[k] for k in self.sorted_compo])
+
+    def _mix_core(self, W, h, compo_in, ratio_or_W_mix_arr, h_mix_arr, comp_mix_flat, xp):
+        """
+        Core mixing logic that works with both NumPy and JAX arrays.
+
+        Parameters
+        ----------
+        W : scalar
+            Inflow mass flow rate (kg/s)
+        h : scalar
+            Inflow total enthalpy (J/kg)
+        compo_in : array
+            Inflow composition
+        ratio_or_W_mix_arr : array (num_mix,)
+            For reactant mode: ratios. For flow mode: W_mix values.
+        h_mix_arr : array (num_mix,)
+            Enthalpies of mix streams (J/kg)
+        comp_mix_flat : array or None
+            For flow mode: flattened mix compositions (num_mix * num_composition,)
+        xp : module
+            Array module (np or jnp)
+
+        Returns
+        -------
+        tuple
+            (mass_avg_h, W_out, composition_out, W_mix_out)
+        """
+        n_compo = self.num_composition
+        num_mix = len(self.mix_names)
+
+        # Composition vector is given as vector of <something>-to-air ratios
+        # W_air_in is the mass of pure air in the inflow
+        W_air_in = W / (1 + xp.sum(compo_in))
+        W_other_in = W_air_in * compo_in
+
+        W_out = W
+        W_other_out = W_other_in
+        W_air_out = W_air_in
+        W_times_h = W * h
+
+        W_mix_out = xp.zeros(num_mix)
+
+        if self.mix_mode == 'reactant':
+            for idx in range(num_mix):
+                r = ratio_or_W_mix_arr[idx]
+                # For reactant mode, ratio is relative to air mass
+                W_other_mix = W_air_in * r
+
+                if xp is jnp:
+                    W_mix_out = W_mix_out.at[idx].set(W_other_mix)
+                    W_other_out = W_other_out.at[self.idx_compo].add(W_other_mix)
+                else:
+                    W_mix_out[idx] = W_other_mix
+                    W_other_out[self.idx_compo] += W_other_mix
+
+                W_out = W_out + W_other_mix
+                W_times_h = W_times_h + W_other_mix * h_mix_arr[idx]
+
+            composition_out = W_other_out / W_air_in
+
+        else:  # flow mode
+            for idx in range(num_mix):
+                W_stream = ratio_or_W_mix_arr[idx]
+
+                if xp is jnp:
+                    W_mix_out = W_mix_out.at[idx].set(W_stream)
+                else:
+                    W_mix_out[idx] = W_stream
+
+                # Get composition from flattened array
+                compo_mix = comp_mix_flat[idx * n_compo:(idx + 1) * n_compo]
+
+                W_air_mix = W_stream / (1 + xp.sum(compo_mix))
+                W_other_out = W_other_out + W_air_mix * compo_mix
+                W_out = W_out + W_stream
+                W_air_out = W_air_out + W_air_mix
+                W_times_h = W_times_h + W_stream * h_mix_arr[idx]
+
+            composition_out = W_other_out / W_air_out
+
+        mass_avg_h = W_times_h / W_out
+
+        return mass_avg_h, W_out, composition_out, W_mix_out
 
     def compute(self, W, h, composition, ratio=None, W_mix=None, h_mix=None, composition_mix=None):
         """
@@ -138,68 +216,36 @@ class ThermoAdd:
             Named tuple with (mass_avg_h, Wout, composition_out, W_mix).
             W_mix is an array ordered by self.mix_names.
         """
+        # Convert dict inputs to arrays
         if h_mix is None:
             h_mix = {name: 0.0 for name in self.mix_names}
+        h_mix_arr = np.array([h_mix.get(name, 0.0) for name in self.mix_names])
 
-        compo_in = np.asarray(composition)
-        n_compo = len(compo_in)
-
-        # Composition vector is given as vector of <something>-to-air ratios
-        # W_air_in is the mass of pure air in the inflow
-        W_air_in = W / (1 + np.sum(compo_in))
-        W_other_in = W_air_in * compo_in
-
-        W_out = float(W)
-        W_other_out = W_other_in.copy()
-        W_air_out = W_air_in
-
-        W_times_h = W * h
-
-        # Array to store computed mix mass flows
-        W_mix_out = np.zeros(len(self.mix_names))
+        compo_in = np.asarray(composition).copy()  # copy for in-place updates in reactant mode
 
         if self.mix_mode == 'reactant':
             if ratio is None:
                 ratio = {name: 0.0 for name in self.mix_names}
-
-            for idx, mix_name in enumerate(self.mix_names):
-                r = ratio.get(mix_name, 0.0)
-
-                # For reactant mode, ratio is relative to air mass
-                W_other_mix = W_air_in * r
-                W_mix_out[idx] = W_other_mix
-
-                W_other_out[self.idx_compo] += W_other_mix
-                W_out += W_other_mix
-                W_times_h += W_other_mix * h_mix.get(mix_name, 0.0)
-
-            composition_out = W_other_out / W_air_in
-
-        else:  # flow mode
+            ratio_arr = np.array([ratio.get(name, 0.0) for name in self.mix_names])
+            comp_mix_flat = None
+        else:
             if W_mix is None:
                 W_mix = {name: 0.0 for name in self.mix_names}
             if composition_mix is None:
                 composition_mix = {name: self.inflow_composition_vec for name in self.mix_names}
+            ratio_arr = np.array([W_mix.get(name, 0.0) for name in self.mix_names])
+            comp_mix_flat = np.concatenate([
+                np.asarray(composition_mix.get(name, self.inflow_composition_vec))
+                for name in self.mix_names
+            ])
 
-            for idx, mix_name in enumerate(self.mix_names):
-                compo_mix_arr = np.asarray(composition_mix.get(mix_name, self.inflow_composition_vec))
-
-                W_stream = W_mix.get(mix_name, 0.0)
-                W_mix_out[idx] = W_stream
-
-                W_air_mix = W_stream / (1 + np.sum(compo_mix_arr))
-                W_other_out += W_air_mix * compo_mix_arr
-                W_out += W_stream
-                W_air_out += W_air_mix
-                W_times_h += W_stream * h_mix.get(mix_name, 0.0)
-
-            composition_out = W_other_out / W_air_out
-
-        mass_avg_h = W_times_h / W_out
+        mass_avg_h, W_out, composition_out, W_mix_out = self._mix_core(
+            W, h, compo_in, ratio_arr, h_mix_arr, comp_mix_flat, np
+        )
 
         return ThermoAddOutput(
             mass_avg_h=mass_avg_h,
-            Wout=W_out,
+            Wout=float(W_out),
             composition_out=composition_out,
             W_mix=W_mix_out
         )
@@ -236,54 +282,7 @@ class ThermoAdd:
         if not JAX_AVAILABLE:
             raise ImportError("JAX is required for _compute_jax. Install with: pip install jax jaxlib")
 
-        xp = jnp
-
-        compo_in = composition
-        n_compo = self.num_composition
-
-        W_air_in = W / (1 + xp.sum(compo_in))
-        W_other_in = W_air_in * compo_in
-
-        W_out = W
-        W_other_out = W_other_in
-        W_air_out = W_air_in
-
-        W_times_h = W * h
-
-        num_mix = len(self.mix_names)
-        W_mix_out = xp.zeros(num_mix)
-
-        if self.mix_mode == 'reactant':
-            for idx, mix_name in enumerate(self.mix_names):
-                r = ratio_or_W_mix[idx]
-                W_other_mix = W_air_in * r
-                W_mix_out = W_mix_out.at[idx].set(W_other_mix)
-
-                W_other_out = W_other_out.at[self.idx_compo].add(W_other_mix)
-                W_out = W_out + W_other_mix
-                W_times_h = W_times_h + W_other_mix * h_mix[idx]
-
-            composition_out = W_other_out / W_air_in
-
-        else:  # flow mode
-            for idx, mix_name in enumerate(self.mix_names):
-                W_stream = ratio_or_W_mix[idx]
-                W_mix_out = W_mix_out.at[idx].set(W_stream)
-
-                # Get composition from flattened array
-                compo_mix = composition_mix_flat[idx * n_compo:(idx + 1) * n_compo]
-
-                W_air_mix = W_stream / (1 + xp.sum(compo_mix))
-                W_other_out = W_other_out + W_air_mix * compo_mix
-                W_out = W_out + W_stream
-                W_air_out = W_air_out + W_air_mix
-                W_times_h = W_times_h + W_stream * h_mix[idx]
-
-            composition_out = W_other_out / W_air_out
-
-        mass_avg_h = W_times_h / W_out
-
-        return mass_avg_h, W_out, composition_out, W_mix_out
+        return self._mix_core(W, h, composition, ratio_or_W_mix, h_mix, composition_mix_flat, jnp)
 
     def _flatten_inputs(self, W, h, composition, ratio=None, W_mix=None, h_mix=None, composition_mix=None):
         """Convert dict-based inputs to flat arrays for JAX."""
@@ -326,19 +325,10 @@ class ThermoAdd:
         if not JAX_AVAILABLE:
             raise ImportError("JAX is required for linearize(). Install with: pip install jax jaxlib")
 
-        # Store the linearization point
-        self._lin_W = W
-        self._lin_h = h
-        self._lin_composition = np.asarray(composition)
-
         # Flatten inputs
         W, h, composition, ratio_or_W_mix, h_mix_arr, comp_mix_flat = self._flatten_inputs(
             W, h, composition, ratio, W_mix, h_mix, composition_mix
         )
-
-        self._lin_ratio_or_W_mix = ratio_or_W_mix
-        self._lin_h_mix = h_mix_arr
-        self._lin_comp_mix_flat = comp_mix_flat
 
         # Define the function to differentiate
         if self.mix_mode == 'reactant':
