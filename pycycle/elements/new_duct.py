@@ -54,9 +54,6 @@ class NewDuct(JaxElement):
             id(self._jax_thermo) if self._jax_thermo is not None else None,
         )
 
-    def pyc_setup_output_ports(self):
-        self.copy_flow('Fl_I', 'Fl_O')
-
     def setup(self):
         design = self.options['design']
         statics = self.options['statics']

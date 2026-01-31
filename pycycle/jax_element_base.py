@@ -360,6 +360,16 @@ class JaxElement(om.ExplicitComponent):
         # Call pure computation
         result = self.compute_physics(*args)
 
+        # Validate output count matches registration
+        expected = len(self._primal_output_names)
+        actual = len(result)
+        if actual != expected:
+            raise ValueError(
+                f"{type(self).__name__}.compute_physics returned {actual} outputs, "
+                f"but {expected} were registered via add_primal_output. "
+                f"Ensure compute_physics return order matches add_primal_output call order."
+            )
+
         # Assign outputs in registered order
         for i, (primal_name, om_name) in enumerate(self._primal_output_names):
             outputs[om_name] = float(result[i])
