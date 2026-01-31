@@ -491,10 +491,9 @@ if __name__ == "__main__":
             viewer(prob, 'OD_part_pwr', file=viewer_file)
 
         # run throttle back up to full power
-        # for PC in [1, 0.85]:
-        # for PC in [1,]:
-        #     prob['OD_part_pwr.PC'] = PC
-        #     prob.run_model()
+        for PC in [1, 0.85]:
+            prob['OD_part_pwr.PC'] = PC
+            prob.run_model()
 
 
 
@@ -506,5 +505,5 @@ if __name__ == "__main__":
     # print_jax_thermo_timing()  # JaxThermo internal timing
     # print_duct_timing_stats()  # Original Duct timing
 
-    print_timing_stats()
-    print_thermo_stats() 
+    # print_timing_stats()
+    # print_thermo_stats() 
