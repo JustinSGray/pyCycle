@@ -13,6 +13,8 @@ from pycycle.functional_thermo.jax_wrappers import print_jax_thermo_timing, rese
 from pycycle.functional_thermo.tabular import TabularThermo
 
 
+from pycycle.jax_element_base import reset_timing_stats, print_timing_stats       
+
 class HBTF(pyc.Cycle):
 
     def initialize(self):
@@ -504,4 +506,7 @@ if __name__ == "__main__":
     # print_duct_timing_stats()  # Original Duct timing
 
 
-    TabularThermo.print_all_solver_stats()  
+    # TabularThermo.print_all_solver_stats()  
+
+    print_timing_stats()
+    print_jax_thermo_timing()

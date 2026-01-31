@@ -34,22 +34,47 @@ def reset_duct_timing_stats():
 
 def print_duct_timing_stats():
     """Print timing statistics."""
+    stats = _duct_timing_stats
+
+    # Calculate totals across all sub-components
+    total_compute_calls = (stats['mach_loss_compute_calls'] +
+                          stats['p_loss_compute_calls'] +
+                          stats['q_calc_compute_calls'])
+    total_compute_time = (stats['mach_loss_compute_time'] +
+                         stats['p_loss_compute_time'] +
+                         stats['q_calc_compute_time'])
+    total_partials_calls = (stats['mach_loss_partials_calls'] +
+                           stats['p_loss_partials_calls'] +
+                           stats['q_calc_partials_calls'])
+    total_partials_time = (stats['mach_loss_partials_time'] +
+                          stats['p_loss_partials_time'] +
+                          stats['q_calc_partials_time'])
+
     print("\n=== Original Duct Timing Stats ===")
     print("MachPressureLossMap:")
-    print(f"  compute() calls: {_duct_timing_stats['mach_loss_compute_calls']}")
-    print(f"  compute() total time: {_duct_timing_stats['mach_loss_compute_time']*1000:.3f} ms")
-    print(f"  compute_partials() calls: {_duct_timing_stats['mach_loss_partials_calls']}")
-    print(f"  compute_partials() total time: {_duct_timing_stats['mach_loss_partials_time']*1000:.3f} ms")
+    print(f"  compute() calls: {stats['mach_loss_compute_calls']}")
+    print(f"  compute() total time: {stats['mach_loss_compute_time']*1000:.3f} ms")
+    print(f"  compute_partials() calls: {stats['mach_loss_partials_calls']}")
+    print(f"  compute_partials() total time: {stats['mach_loss_partials_time']*1000:.3f} ms")
     print("PressureLoss:")
-    print(f"  compute() calls: {_duct_timing_stats['p_loss_compute_calls']}")
-    print(f"  compute() total time: {_duct_timing_stats['p_loss_compute_time']*1000:.3f} ms")
-    print(f"  compute_partials() calls: {_duct_timing_stats['p_loss_partials_calls']}")
-    print(f"  compute_partials() total time: {_duct_timing_stats['p_loss_partials_time']*1000:.3f} ms")
+    print(f"  compute() calls: {stats['p_loss_compute_calls']}")
+    print(f"  compute() total time: {stats['p_loss_compute_time']*1000:.3f} ms")
+    print(f"  compute_partials() calls: {stats['p_loss_partials_calls']}")
+    print(f"  compute_partials() total time: {stats['p_loss_partials_time']*1000:.3f} ms")
     print("qCalc:")
-    print(f"  compute() calls: {_duct_timing_stats['q_calc_compute_calls']}")
-    print(f"  compute() total time: {_duct_timing_stats['q_calc_compute_time']*1000:.3f} ms")
-    print(f"  compute_partials() calls: {_duct_timing_stats['q_calc_partials_calls']}")
-    print(f"  compute_partials() total time: {_duct_timing_stats['q_calc_partials_time']*1000:.3f} ms")
+    print(f"  compute() calls: {stats['q_calc_compute_calls']}")
+    print(f"  compute() total time: {stats['q_calc_compute_time']*1000:.3f} ms")
+    print(f"  compute_partials() calls: {stats['q_calc_partials_calls']}")
+    print(f"  compute_partials() total time: {stats['q_calc_partials_time']*1000:.3f} ms")
+    print("--- Totals (sub-components only) ---")
+    print(f"  compute() calls: {total_compute_calls}")
+    print(f"  compute() total time: {total_compute_time*1000:.3f} ms")
+    if total_compute_calls > 0:
+        print(f"  compute() avg time: {total_compute_time*1000/total_compute_calls:.3f} ms")
+    print(f"  compute_partials() calls: {total_partials_calls}")
+    print(f"  compute_partials() total time: {total_partials_time*1000:.3f} ms")
+    if total_partials_calls > 0:
+        print(f"  compute_partials() avg time: {total_partials_time*1000/total_partials_calls:.3f} ms")
     print("==================================\n")
 
 class MachPressureLossMap(om.ExplicitComponent):

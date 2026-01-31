@@ -6,12 +6,40 @@ It uses functional thermo interfaces (CEAThermo or TabularThermo) and
 provides analytical derivatives via JAX automatic differentiation.
 """
 
+import time
 import jax.numpy as jnp
 
 from pycycle.jax_element_base import JaxElement
 from pycycle.functional_thermo.jax_wrappers import (
     TotalPropsIdx as TPI, StaticPropsIdx as SPI
 )
+
+# Module-level timing accumulators
+_new_duct_timing_stats = {
+    'compute_calls': 0,
+    'compute_time': 0.0,
+    'partials_calls': 0,
+    'partials_time': 0.0,
+}
+
+def reset_new_duct_timing_stats():
+    """Reset all timing statistics."""
+    for key in _new_duct_timing_stats:
+        _new_duct_timing_stats[key] = 0.0 if 'time' in key else 0
+
+def print_new_duct_timing_stats():
+    """Print timing statistics."""
+    stats = _new_duct_timing_stats
+    print("\n=== NewDuct Timing Stats ===")
+    print(f"  compute() calls: {stats['compute_calls']}")
+    print(f"  compute() total time: {stats['compute_time']*1000:.3f} ms")
+    if stats['compute_calls'] > 0:
+        print(f"  compute() avg time: {stats['compute_time']*1000/stats['compute_calls']:.3f} ms")
+    print(f"  compute_partials() calls: {stats['partials_calls']}")
+    print(f"  compute_partials() total time: {stats['partials_time']*1000:.3f} ms")
+    if stats['partials_calls'] > 0:
+        print(f"  compute_partials() avg time: {stats['partials_time']*1000/stats['partials_calls']:.3f} ms")
+    print("============================\n")
 
 
 class NewDuct(JaxElement):
@@ -187,6 +215,24 @@ class NewDuct(JaxElement):
             ])
 
         return tuple(outputs)
+
+    def compute(self, inputs, outputs):
+        """Timed wrapper around base class compute."""
+        t_start = time.perf_counter()
+
+        super().compute(inputs, outputs)
+
+        _new_duct_timing_stats['compute_calls'] += 1
+        _new_duct_timing_stats['compute_time'] += (time.perf_counter() - t_start)
+
+    def compute_partials(self, inputs, partials):
+        """Timed wrapper around base class compute_partials."""
+        t_start = time.perf_counter()
+
+        super().compute_partials(inputs, partials)
+
+        _new_duct_timing_stats['partials_calls'] += 1
+        _new_duct_timing_stats['partials_time'] += (time.perf_counter() - t_start)
 
 
 # Backward compatibility alias

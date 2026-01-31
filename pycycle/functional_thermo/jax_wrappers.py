@@ -28,23 +28,45 @@ _jax_thermo_timing = {
     'linearize_T_from_hP_time': 0.0,
     'linearize_props_TP_time': 0.0,
     'linearize_static_time': 0.0,
+    # Cache hit/miss counters
+    'T_from_hP_cache_hits': 0,
+    'T_from_hP_cache_misses': 0,
+    'props_TP_cache_hits': 0,
+    'props_TP_cache_misses': 0,
+    'static_MN_cache_hits': 0,
+    'static_MN_cache_misses': 0,
+    'static_area_cache_hits': 0,
+    'static_area_cache_misses': 0,
 }
 
 def print_jax_thermo_timing():
     """Print timing stats."""
+    stats = _jax_thermo_timing
     print("\n=== JaxThermo Timing ===")
-    print(f"  linearize_at() calls: {_jax_thermo_timing['linearize_at_calls']}")
-    print(f"  linearize_at() total time: {_jax_thermo_timing['linearize_at_time']*1000:.3f} ms")
-    if _jax_thermo_timing['linearize_at_calls'] > 0:
-        print(f"  linearize_at() avg time: {_jax_thermo_timing['linearize_at_time']/_jax_thermo_timing['linearize_at_calls']*1000:.3f} ms")
+    print(f"  linearize_at() calls: {stats['linearize_at_calls']}")
+    print(f"  linearize_at() total time: {stats['linearize_at_time']*1000:.3f} ms")
+    if stats['linearize_at_calls'] > 0:
+        print(f"  linearize_at() avg time: {stats['linearize_at_time']/stats['linearize_at_calls']*1000:.3f} ms")
     print(f"  linearize_at() breakdown:")
-    print(f"    T_from_hP: {_jax_thermo_timing['linearize_T_from_hP_time']*1000:.3f} ms")
-    if 'T_solve_time' in _jax_thermo_timing:
-        print(f"      T_solve: {_jax_thermo_timing['T_solve_time']*1000:.3f} ms")
-        print(f"      linearize: {_jax_thermo_timing['linearize_call_time']*1000:.3f} ms")
-        print(f"      jvp_calls: {_jax_thermo_timing['jvp_calls_time']*1000:.3f} ms")
-    print(f"    props_TP: {_jax_thermo_timing['linearize_props_TP_time']*1000:.3f} ms")
-    print(f"    static: {_jax_thermo_timing['linearize_static_time']*1000:.3f} ms")
+    print(f"    T_from_hP: {stats['linearize_T_from_hP_time']*1000:.3f} ms")
+    if 'T_solve_time' in stats:
+        print(f"      T_solve: {stats['T_solve_time']*1000:.3f} ms")
+        print(f"      linearize: {stats['linearize_call_time']*1000:.3f} ms")
+        print(f"      jvp_calls: {stats['jvp_calls_time']*1000:.3f} ms")
+    print(f"    props_TP: {stats['linearize_props_TP_time']*1000:.3f} ms")
+    print(f"    static: {stats['linearize_static_time']*1000:.3f} ms")
+    print(f"  --- Cache Hit/Miss Stats ---")
+    print(f"    T_from_hP: {stats['T_from_hP_cache_hits']} hits, {stats['T_from_hP_cache_misses']} misses")
+    print(f"    props_TP: {stats['props_TP_cache_hits']} hits, {stats['props_TP_cache_misses']} misses")
+    print(f"    static_MN: {stats['static_MN_cache_hits']} hits, {stats['static_MN_cache_misses']} misses")
+    print(f"    static_area: {stats['static_area_cache_hits']} hits, {stats['static_area_cache_misses']} misses")
+    total_hits = (stats['T_from_hP_cache_hits'] + stats['props_TP_cache_hits'] +
+                  stats['static_MN_cache_hits'] + stats['static_area_cache_hits'])
+    total_misses = (stats['T_from_hP_cache_misses'] + stats['props_TP_cache_misses'] +
+                    stats['static_MN_cache_misses'] + stats['static_area_cache_misses'])
+    total = total_hits + total_misses
+    if total > 0:
+        print(f"    TOTAL: {total_hits} hits ({100*total_hits/total:.1f}%), {total_misses} misses ({100*total_misses/total:.1f}%)")
     print("========================\n")
 
 def reset_jax_thermo_timing():
@@ -348,8 +370,10 @@ class JaxThermo:
             if 'T_from_hP' in self._cache:
                 ch, cP, cFAR, T, dT_dh, dT_dP, dT_dFAR = self._cache['T_from_hP']
                 if abs(ch - h) < 1e-10 and abs(cP - P) < 1e-10 and abs(cFAR - FAR) < 1e-10:
+                    _jax_thermo_timing['T_from_hP_cache_hits'] += 1
                     return np.array([T, dT_dh, dT_dP, dT_dFAR])
 
+            _jax_thermo_timing['T_from_hP_cache_misses'] += 1
             # Compute fresh (fallback)
             if supports_FAR:
                 T = thermo.T_from_hP(h, P, FAR)
@@ -434,8 +458,10 @@ class JaxThermo:
             if 'props_TP' in self._cache:
                 cT, cP, cFAR, props_arr, dprops_dT, dprops_dP, dprops_dFAR = self._cache['props_TP']
                 if abs(cT - T) < 1e-10 and abs(cP - P) < 1e-10 and (cFAR is None or abs(cFAR - FAR) < 1e-10):
+                    _jax_thermo_timing['props_TP_cache_hits'] += 1
                     return np.concatenate([props_arr, dprops_dT, dprops_dP, dprops_dFAR])
 
+            _jax_thermo_timing['props_TP_cache_misses'] += 1
             # Compute fresh (fallback)
             if supports_FAR:
                 props = thermo.props_TP(T, P, FAR)
@@ -517,8 +543,10 @@ class JaxThermo:
                 cTt, cPt, cMN, cW, cFAR, sprops_arr, dTt, dPt, dMN, dW, dFAR = self._cache['static_MN']
                 if (abs(cTt - Tt) < 1e-10 and abs(cPt - Pt) < 1e-10 and
                     abs(cMN - MN) < 1e-10 and abs(cW - W) < 1e-10 and (cFAR is None or abs(cFAR - FAR) < 1e-10)):
+                    _jax_thermo_timing['static_MN_cache_hits'] += 1
                     return np.concatenate([sprops_arr, dTt, dPt, dMN, dW, dFAR])
 
+            _jax_thermo_timing['static_MN_cache_misses'] += 1
             # Compute fresh (fallback)
             if supports_FAR:
                 props = thermo.static_from_MN(Tt, Pt, MN, W, FAR)
@@ -644,8 +672,10 @@ class JaxThermo:
                 cTt, cPt, carea, cW, cFAR, sprops_arr, dTt, dPt, darea, dW, dFAR = self._cache['static_area']
                 if (abs(cTt - Tt) < 1e-10 and abs(cPt - Pt) < 1e-10 and
                     abs(carea - area) < 1e-10 and abs(cW - W) < 1e-10 and (cFAR is None or abs(cFAR - FAR) < 1e-10)):
+                    _jax_thermo_timing['static_area_cache_hits'] += 1
                     return np.concatenate([sprops_arr, dTt, dPt, darea, dW, dFAR])
 
+            _jax_thermo_timing['static_area_cache_misses'] += 1
             # Compute fresh (fallback)
             if supports_FAR:
                 props = thermo.static_from_area(Tt, Pt, area, W, FAR=FAR)

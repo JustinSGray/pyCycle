@@ -15,15 +15,68 @@ from pycycle.constants import (ALLOWED_THERMOS, CEA_AIR_COMPOSITION,
                                TAB_AIR_FUEL_COMPOSITION, AIR_JETA_TAB_SPEC)
 
 # =============================================================================
-# Optional timing stats (no-op by default, can be enabled for profiling)
+# Detailed timing stats for compute_partials breakdown
 # =============================================================================
+import time
+
+_jax_element_timing_stats = {
+    'pre_linearize_calls': 0,
+    'pre_linearize_time': 0.0,
+    'jacobian_compute_calls': 0,
+    'jacobian_compute_time': 0.0,
+    'jacobian_assign_calls': 0,
+    'jacobian_assign_time': 0.0,
+    'post_linearize_calls': 0,
+    'post_linearize_time': 0.0,
+    'jvp_calls': 0,
+    'jvp_time': 0.0,
+}
+
 def reset_timing_stats():
-    """No-op stub for backward compatibility."""
-    pass
+    """Reset all JaxElement timing statistics."""
+    for key in _jax_element_timing_stats:
+        _jax_element_timing_stats[key] = 0.0 if 'time' in key else 0
 
 def print_timing_stats():
-    """No-op stub for backward compatibility."""
-    pass
+    """Print detailed JaxElement timing statistics."""
+    stats = _jax_element_timing_stats
+    print("\n=== JaxElement compute_partials Breakdown ===")
+    print(f"  _pre_linearize():")
+    print(f"    calls: {stats['pre_linearize_calls']}")
+    print(f"    total time: {stats['pre_linearize_time']*1000:.3f} ms")
+    if stats['pre_linearize_calls'] > 0:
+        print(f"    avg time: {stats['pre_linearize_time']*1000/stats['pre_linearize_calls']:.3f} ms")
+    print(f"  Jacobian computation (JAX JVP):")
+    print(f"    calls: {stats['jacobian_compute_calls']}")
+    print(f"    total time: {stats['jacobian_compute_time']*1000:.3f} ms")
+    if stats['jacobian_compute_calls'] > 0:
+        print(f"    avg time: {stats['jacobian_compute_time']*1000/stats['jacobian_compute_calls']:.3f} ms")
+    print(f"    individual jvp calls: {stats['jvp_calls']}")
+    print(f"    individual jvp total time: {stats['jvp_time']*1000:.3f} ms")
+    if stats['jvp_calls'] > 0:
+        print(f"    individual jvp avg time: {stats['jvp_time']*1000/stats['jvp_calls']:.3f} ms")
+    print(f"  Jacobian assignment to partials:")
+    print(f"    calls: {stats['jacobian_assign_calls']}")
+    print(f"    total time: {stats['jacobian_assign_time']*1000:.3f} ms")
+    if stats['jacobian_assign_calls'] > 0:
+        print(f"    avg time: {stats['jacobian_assign_time']*1000/stats['jacobian_assign_calls']:.3f} ms")
+    print(f"  _post_linearize():")
+    print(f"    calls: {stats['post_linearize_calls']}")
+    print(f"    total time: {stats['post_linearize_time']*1000:.3f} ms")
+    if stats['post_linearize_calls'] > 0:
+        print(f"    avg time: {stats['post_linearize_time']*1000/stats['post_linearize_calls']:.3f} ms")
+
+    # Summary
+    total_time = (stats['pre_linearize_time'] + stats['jacobian_compute_time'] +
+                  stats['jacobian_assign_time'] + stats['post_linearize_time'])
+    print(f"  --- Summary ---")
+    print(f"    Total tracked time: {total_time*1000:.3f} ms")
+    if total_time > 0:
+        print(f"    pre_linearize: {100*stats['pre_linearize_time']/total_time:.1f}%")
+        print(f"    jacobian compute: {100*stats['jacobian_compute_time']/total_time:.1f}%")
+        print(f"    jacobian assign: {100*stats['jacobian_assign_time']/total_time:.1f}%")
+        print(f"    post_linearize: {100*stats['post_linearize_time']/total_time:.1f}%")
+    print("=============================================\n")
 
 
 # =============================================================================
@@ -98,6 +151,7 @@ class JaxElement(om.ExplicitComponent):
         self._primal_input_names = []  # Maps primal arg name -> OpenMDAO input name
         self._primal_output_names = []  # Maps primal return index -> OpenMDAO output name
         self._cached_args = None
+        self._jit_jvp_fn = None  # Cached JIT-compiled JVP function
 
         # For compatibility with Cycle's flow graph
         self.Fl_I_data = {}
@@ -371,18 +425,25 @@ class JaxElement(om.ExplicitComponent):
         """Compute partial derivatives using JAX autodiff."""
         # Pre-linearization hook (for thermo caching)
         # Use OpenMDAO's internal _outputs dict for current output values
-        # JSG: _outputs being used for speed here. But might be risky. Check with OpenMDAO devs. 
+        # JSG: _outputs being used for speed here. But might be risky. Check with OpenMDAO devs.
+        t_start = time.perf_counter()
         self._pre_linearize(inputs, self._outputs)
+        _jax_element_timing_stats['pre_linearize_calls'] += 1
+        _jax_element_timing_stats['pre_linearize_time'] += (time.perf_counter() - t_start)
 
         args = self._cached_args
 
         # Compute Jacobian (subclass can override compute_jacobian for efficiency)
+        t_start = time.perf_counter()
         if hasattr(self, 'compute_jacobian'):
             jacs = self.compute_jacobian(args)
         else:
             jacs = self._compute_jacobian_fwd(args)
+        _jax_element_timing_stats['jacobian_compute_calls'] += 1
+        _jax_element_timing_stats['jacobian_compute_time'] += (time.perf_counter() - t_start)
 
         # Assign to partials dict, handling array primals
+        t_start = time.perf_counter()
         for j, (_, in_name) in enumerate(self._primal_input_names):
             for i, (_, out_name) in enumerate(self._primal_output_names):
                 deriv = jacs[j][i]
@@ -402,9 +463,14 @@ class JaxElement(om.ExplicitComponent):
                     partials[dst, src] = 1.0
                 else:
                     partials[dst, src] = np.eye(len(src_val))
+        _jax_element_timing_stats['jacobian_assign_calls'] += 1
+        _jax_element_timing_stats['jacobian_assign_time'] += (time.perf_counter() - t_start)
 
         # Post-linearization hook (cleanup)
+        t_start = time.perf_counter()
         self._post_linearize()
+        _jax_element_timing_stats['post_linearize_calls'] += 1
+        _jax_element_timing_stats['post_linearize_time'] += (time.perf_counter() - t_start)
 
     def _compute_jacobian_fwd(self, args):
         """Compute Jacobian using forward-mode with sequential JVP calls."""
@@ -412,6 +478,16 @@ class JaxElement(om.ExplicitComponent):
         n_outputs = len(self._primal_output_names)
         jacs = [np.zeros(n_outputs) for _ in range(n_inputs)]
         args_tuple = tuple(args)
+
+        # Create JIT-compiled single-direction JVP function on first call
+        if self._jit_jvp_fn is None:
+            # Wrap compute_physics to return a JAX array
+            compute_physics = self.compute_physics
+            def jvp_wrapper(args_tuple, tangents_tuple):
+                _, jvp_out = jax.jvp(compute_physics, args_tuple, tangents_tuple)
+                return jnp.array(jvp_out)
+            # JIT compile - this caches the traced function
+            self._jit_jvp_fn = jax.jit(jvp_wrapper)
 
         for j in range(n_inputs):
             # Create tangent with same structure as args (handle arrays)
@@ -428,7 +504,11 @@ class JaxElement(om.ExplicitComponent):
                     else:
                         tangents.append(0.0)
 
-            _, jvp_out = jax.jvp(self.compute_physics, args_tuple, tuple(tangents))
+            t_jvp = time.perf_counter()
+            jvp_out = self._jit_jvp_fn(args_tuple, tuple(tangents))
+            _jax_element_timing_stats['jvp_calls'] += 1
+            _jax_element_timing_stats['jvp_time'] += (time.perf_counter() - t_jvp)
+
             jacs[j][:] = np.array(jvp_out)
 
         return jacs
