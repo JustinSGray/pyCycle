@@ -672,7 +672,10 @@ class TabularThermo(ThermoInterface):
 
     def linearize_static_MN(self, Tt, Pt, MN, W, FAR=None):
         """
-        Compute and cache gradients for static_from_MN at the given state.
+        Compute static properties and cache gradients for static_from_MN.
+
+        This combines the forward pass and linearization into one call,
+        avoiding duplicate lookups when both are needed.
 
         The static_from_MN calculation is explicit (no solver), so we can
         differentiate directly using the chain rule through:
@@ -692,6 +695,11 @@ class TabularThermo(ThermoInterface):
             Mass flow rate (in input units)
         FAR : float, optional
             Fuel-to-air ratio. If None, uses the instance's FAR.
+
+        Returns
+        -------
+        StaticProps
+            Named tuple with static properties in input units
         """
         import time
         t_start = time.perf_counter()
@@ -788,10 +796,13 @@ class TabularThermo(ThermoInterface):
         grad_rhos = self._interps['rho'].gradient(x_stat)
         p['grad_static'] += time.perf_counter() - t0
 
-        # Static property values
+        # Static property values - get all 7 properties for the return value
         t0 = time.perf_counter()
         hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
+        Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
         gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
+        Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
+        Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
         R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
         p['lookup_total'] += time.perf_counter() - t0
 
@@ -827,6 +838,14 @@ class TabularThermo(ThermoInterface):
 
         p['calls'] += 1
         p['total_time'] += time.perf_counter() - t_start
+
+        # Return static properties converted to input units
+        props_si = StaticProps(
+            Ts=Ts_si, Ps=Ps_si, hs=hs_si, rhos=rhos_si,
+            MN=MN, V=V_si, Vsonic=Vsonic_si, area=area_si,
+            gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=Ss_si, R=R_s
+        )
+        return self._convert_static_props_from_si(props_si)
 
     def _compute_full_jacobian_static_MN(self):
         """Compute and cache the full Jacobian for static_from_MN."""
@@ -995,9 +1014,12 @@ class TabularThermo(ThermoInterface):
 
     def linearize_static_area(self, Tt, Pt, area, W, FAR=None):
         """
-        Compute and cache gradients for static_from_area.
+        Compute static properties and cache gradients for static_from_area.
 
-        This uses implicit differentiation since MN is solved via brentq.
+        This combines the forward pass and linearization into one call,
+        avoiding duplicate lookups when both are needed.
+
+        This uses implicit differentiation since MN is solved via Newton's method.
         The implicit constraint is: area_computed(MN) = area_target
         Using implicit function theorem: dMN/dx = -[d(area)/dMN]^(-1) * d(area)/dx
 
@@ -1013,6 +1035,11 @@ class TabularThermo(ThermoInterface):
             Mass flow rate (in input units)
         FAR : float, optional
             Fuel-to-air ratio. If None, uses the instance's FAR.
+
+        Returns
+        -------
+        StaticProps
+            Named tuple with static properties in input units
         """
         if FAR is None:
             FAR = self.FAR
@@ -1078,6 +1105,8 @@ class TabularThermo(ThermoInterface):
                 jac_mn[3] + jac_mn[2] * dMN_dW,     # d/dW
                 jac_mn[4] + jac_mn[2] * dMN_dFAR,   # d/dFAR
             ])
+
+        return props
 
     def get_jacobian_static_area(self):
         """
