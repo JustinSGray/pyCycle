@@ -159,6 +159,87 @@ class JaxTrilinearInterp:
 
         return c0 * (1 - zd) + c1 * zd
 
+    def interpolate_with_derivs(self, point):
+        """
+        Interpolate all properties and compute analytical derivatives w.r.t. P and T.
+
+        Uses the analytical derivatives of trilinear interpolation to avoid
+        finite difference approximations.
+
+        Parameters
+        ----------
+        point : array-like
+            (FAR, P, T) coordinates
+
+        Returns
+        -------
+        values : dict
+            Property values at the interpolation point
+        dvalues_dP : dict
+            Derivatives of properties w.r.t. P (second coordinate)
+        dvalues_dT : dict
+            Derivatives of properties w.r.t. T (third coordinate)
+        """
+        FAR, P, T = point[0], point[1], point[2]
+
+        # Find cell indices
+        i_FAR = self._find_cell_idx(FAR, self.grid[0])
+        i_P = self._find_cell_idx(P, self.grid[1])
+        i_T = self._find_cell_idx(T, self.grid[2])
+
+        # Get grid points for this cell
+        x0, x1 = self.grid[0][i_FAR], self.grid[0][i_FAR + 1]
+        y0, y1 = self.grid[1][i_P], self.grid[1][i_P + 1]
+        z0, z1 = self.grid[2][i_T], self.grid[2][i_T + 1]
+
+        # Grid spacing for derivatives
+        dy = y1 - y0  # P spacing
+        dz = z1 - z0  # T spacing
+
+        # Compute normalized coordinates [0, 1] within cell
+        xd = (FAR - x0) / (x1 - x0)
+        yd = (P - y0) / dy
+        zd = (T - z0) / dz
+
+        # Get corner values for all properties at once
+        # _stacked_values shape: (n_props, nFAR, nP, nT)
+        c000 = self._stacked_values[:, i_FAR, i_P, i_T]
+        c001 = self._stacked_values[:, i_FAR, i_P, i_T + 1]
+        c010 = self._stacked_values[:, i_FAR, i_P + 1, i_T]
+        c011 = self._stacked_values[:, i_FAR, i_P + 1, i_T + 1]
+        c100 = self._stacked_values[:, i_FAR + 1, i_P, i_T]
+        c101 = self._stacked_values[:, i_FAR + 1, i_P, i_T + 1]
+        c110 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T]
+        c111 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T + 1]
+
+        # Trilinear interpolation (same as interpolate())
+        c00 = c000 * (1 - xd) + c100 * xd
+        c01 = c001 * (1 - xd) + c101 * xd
+        c10 = c010 * (1 - xd) + c110 * xd
+        c11 = c011 * (1 - xd) + c111 * xd
+
+        c0 = c00 * (1 - yd) + c10 * yd
+        c1 = c01 * (1 - yd) + c11 * yd
+
+        values = c0 * (1 - zd) + c1 * zd
+
+        # Analytical derivatives
+        # d(value)/dT = d(value)/d(zd) * d(zd)/dT = (c1 - c0) / dz
+        dvalues_dT = (c1 - c0) / dz
+
+        # d(value)/dP = d(value)/d(yd) * d(yd)/dP
+        # d(value)/d(yd) = d(c0)/d(yd) * (1 - zd) + d(c1)/d(yd) * zd
+        #                = (c10 - c00) * (1 - zd) + (c11 - c01) * zd
+        dc0_dyd = c10 - c00
+        dc1_dyd = c11 - c01
+        dvalues_dP = (dc0_dyd * (1 - zd) + dc1_dyd * zd) / dy
+
+        return (
+            {name: values[i] for i, name in enumerate(self.property_names)},
+            {name: dvalues_dP[i] for i, name in enumerate(self.property_names)},
+            {name: dvalues_dT[i] for i, name in enumerate(self.property_names)},
+        )
+
 
 def jax_newton_solve(residual_fn, x0, max_iter=20, tol=1e-10,
                      lower=160.0, upper=2400.0):
@@ -463,6 +544,21 @@ class JaxTabularThermo:
             props_si = interp.interpolate(point)
             return props_si
 
+        def props_at_TP_si_with_derivs(T_si, P_si, FAR):
+            """Get properties and analytical derivatives at given T, P in SI units.
+
+            Returns
+            -------
+            props : dict
+                Property values
+            dprops_dP : dict
+                Derivatives w.r.t. P (in SI units)
+            dprops_dT : dict
+                Derivatives w.r.t. T (in SI units)
+            """
+            point = jnp.array([FAR, P_si, T_si])
+            return interp.interpolate_with_derivs(point)
+
         def static_from_MN_impl(Tt, Pt, MN, W, FAR):
             """Pure JAX static_from_MN implementation."""
             # Convert to SI
@@ -531,7 +627,8 @@ class JaxTabularThermo:
                     Ts_si, Ps_si = state[0], state[1]
                     i = state[4]
 
-                    props_s = props_at_TP_si(Ts_si, Ps_si, FAR)
+                    # Get properties AND analytical derivatives in one call
+                    props_s, dprops_dP, dprops_dT = props_at_TP_si_with_derivs(Ts_si, Ps_si, FAR)
                     S_s = props_s['S']
                     hs_si = props_s['h']
                     gamma_s = props_s['gamma']
@@ -545,24 +642,18 @@ class JaxTabularThermo:
                     R1 = S_s - S_total
                     R2 = hs_si + 0.5 * V_sq - ht_si
 
-                    # Approximate Jacobian via finite differences
-                    eps_T = 1.0  # 1K step
-                    eps_P = 100.0  # 100Pa step
-
-                    props_T = props_at_TP_si(Ts_si + eps_T, Ps_si, FAR)
-                    props_P = props_at_TP_si(Ts_si, Ps_si + eps_P, FAR)
-
+                    # Analytical Jacobian (no finite differences needed!)
                     # dR1/dTs, dR1/dPs (entropy derivatives)
-                    dR1_dT = (props_T['S'] - S_s) / eps_T
-                    dR1_dP = (props_P['S'] - S_s) / eps_P
+                    dR1_dT = dprops_dT['S']
+                    dR1_dP = dprops_dP['S']
 
                     # dR2/dTs, dR2/dPs (energy derivatives)
-                    dhs_dT = (props_T['h'] - hs_si) / eps_T
-                    dhs_dP = (props_P['h'] - hs_si) / eps_P
-                    dgamma_dT = (props_T['gamma'] - gamma_s) / eps_T
-                    dgamma_dP = (props_P['gamma'] - gamma_s) / eps_P
-                    dR_dT = (props_T['R'] - R_s) / eps_T
-                    dR_dP = (props_P['R'] - R_s) / eps_P
+                    dhs_dT = dprops_dT['h']
+                    dhs_dP = dprops_dP['h']
+                    dgamma_dT = dprops_dT['gamma']
+                    dgamma_dP = dprops_dP['gamma']
+                    dR_dT = dprops_dT['R']
+                    dR_dP = dprops_dP['R']
 
                     dVsq_dT = MN_sq * (dgamma_dT * R_s * Ts_si + gamma_s * dR_dT * Ts_si + gamma_s * R_s)
                     dVsq_dP = MN_sq * (dgamma_dP * R_s * Ts_si + gamma_s * dR_dP * Ts_si)
@@ -664,11 +755,9 @@ class JaxTabularThermo:
             def body_fn_MN(state):
                 MN_val, _, i = state[0], state[1], state[2]
 
-                res = area_residual(MN_val)
-                # Finite difference for derivative
-                eps = 1e-6
-                res_plus = area_residual(MN_val + eps)
-                dres_dMN = (res_plus - res) / eps
+                # Use forward-mode AD (jvp) for derivative - works through while_loop
+                # jax.grad uses reverse-mode which doesn't work with while_loop
+                res, dres_dMN = jax.jvp(area_residual, (MN_val,), (1.0,))
                 dres_dMN = jnp.where(jnp.abs(dres_dMN) < 1e-20, 1e-20, dres_dMN)
                 dMN = -res / dres_dMN
                 MN_new = jnp.clip(MN_val + dMN, 0.01, 0.99)  # Subsonic only
