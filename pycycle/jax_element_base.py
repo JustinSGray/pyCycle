@@ -19,6 +19,10 @@ from pycycle.constants import ALLOWED_THERMOS, AIR_JETA_TAB_SPEC
 import time
 
 _jax_element_timing_stats = {
+    # JaxElement compute() breakdown
+    'compute_calls': 0,
+    'compute_time': 0.0,
+    # JaxElement compute_partials breakdown
     'jacobian_compute_calls': 0,
     'jacobian_compute_time': 0.0,
     'jacobian_assign_calls': 0,
@@ -35,6 +39,11 @@ def reset_timing_stats():
         _jax_element_timing_stats[key] = 0.0 if 'time' in key else 0
 
 
+def get_timing_stats():
+    """Return a copy of the timing statistics dictionary."""
+    return dict(_jax_element_timing_stats)
+
+
 def clear_jit_cache():
     """Clear the class-level JIT function cache.
 
@@ -46,7 +55,16 @@ def clear_jit_cache():
 def print_timing_stats():
     """Print detailed JaxElement timing statistics."""
     stats = _jax_element_timing_stats
-    print("\n=== JaxElement compute_partials Breakdown ===")
+    print("\n=== JaxElement Timing Statistics ===")
+
+    # Forward compute stats
+    print(f"  Forward compute (compute_physics):")
+    print(f"    calls: {stats['compute_calls']}")
+    print(f"    total time: {stats['compute_time']*1000:.3f} ms")
+    if stats['compute_calls'] > 0:
+        print(f"    avg time: {stats['compute_time']*1000/stats['compute_calls']:.3f} ms")
+
+    # Jacobian stats
     print(f"  Jacobian computation (JAX JVP):")
     print(f"    calls: {stats['jacobian_compute_calls']}")
     print(f"    total time: {stats['jacobian_compute_time']*1000:.3f} ms")
@@ -56,6 +74,7 @@ def print_timing_stats():
     print(f"    individual jvp total time: {stats['jvp_time']*1000:.3f} ms")
     if stats['jvp_calls'] > 0:
         print(f"    individual jvp avg time: {stats['jvp_time']*1000/stats['jvp_calls']:.3f} ms")
+
     print(f"  Jacobian assignment to partials:")
     print(f"    calls: {stats['jacobian_assign_calls']}")
     print(f"    total time: {stats['jacobian_assign_time']*1000:.3f} ms")
@@ -71,13 +90,16 @@ def print_timing_stats():
         print(f"    hit rate: {100*stats['jit_cache_hits']/total_lookups:.1f}%")
 
     # Summary
-    total_time = stats['jacobian_compute_time'] + stats['jacobian_assign_time']
+    compute_time = stats['compute_time']
+    partials_time = stats['jacobian_compute_time'] + stats['jacobian_assign_time']
+    total_time = compute_time + partials_time
     print(f"  --- Summary ---")
+    print(f"    Forward compute time: {compute_time*1000:.3f} ms")
+    print(f"    Partials time: {partials_time*1000:.3f} ms")
     print(f"    Total tracked time: {total_time*1000:.3f} ms")
     if total_time > 0:
-        print(f"    jacobian compute: {100*stats['jacobian_compute_time']/total_time:.1f}%")
-        print(f"    jacobian assign: {100*stats['jacobian_assign_time']/total_time:.1f}%")
-    print("=============================================\n")
+        print(f"    forward/partials ratio: {compute_time/partials_time:.2f}x" if partials_time > 0 else "    (no partials computed)")
+    print("=====================================\n")
 
 
 # =============================================================================
@@ -357,8 +379,11 @@ class JaxElement(om.ExplicitComponent):
             else:
                 args.append(float(inputs[om_name][0]))
 
-        # Call pure computation
+        # Call pure computation with timing
+        t_start = time.perf_counter()
         result = self.compute_physics(*args)
+        _jax_element_timing_stats['compute_calls'] += 1
+        _jax_element_timing_stats['compute_time'] += (time.perf_counter() - t_start)
 
         # Validate output count matches registration
         expected = len(self._primal_output_names)

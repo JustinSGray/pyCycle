@@ -5,8 +5,80 @@ This module provides JAX-traceable versions of the tabular thermo operations,
 eliminating the need for pure_callback and enabling efficient JIT compilation.
 """
 
+import time
 import jax
 import jax.numpy as jnp
+
+
+# =============================================================================
+# Thermo Profiling Infrastructure
+# =============================================================================
+
+_thermo_profiling_enabled = False
+
+_thermo_stats = {
+    # Call counts
+    'props_TP_calls': 0,
+    'T_from_hP_calls': 0,
+    'static_from_MN_calls': 0,
+    'static_from_area_calls': 0,
+    # Timing (only when profiling enabled)
+    'props_TP_time': 0.0,
+    'T_from_hP_time': 0.0,
+    'static_from_MN_time': 0.0,
+    'static_from_area_time': 0.0,
+    # Newton iteration tracking (filled by debug runs)
+    'T_from_hP_total_iters': 0,
+    'static_from_MN_total_iters': 0,
+    'static_from_area_total_iters': 0,
+}
+
+
+def enable_thermo_profiling():
+    """Enable detailed thermo profiling (adds timing overhead)."""
+    global _thermo_profiling_enabled
+    _thermo_profiling_enabled = True
+
+
+def disable_thermo_profiling():
+    """Disable thermo profiling."""
+    global _thermo_profiling_enabled
+    _thermo_profiling_enabled = False
+
+
+def reset_thermo_stats():
+    """Reset all thermo profiling statistics."""
+    for key in _thermo_stats:
+        _thermo_stats[key] = 0.0 if 'time' in key else 0
+
+
+def get_thermo_stats():
+    """Return a copy of the thermo statistics dictionary."""
+    return dict(_thermo_stats)
+
+
+def print_thermo_stats():
+    """Print detailed thermo profiling statistics."""
+    stats = _thermo_stats
+    print("\n=== JaxTabularThermo Profiling Statistics ===")
+
+    for method in ['props_TP', 'T_from_hP', 'static_from_MN', 'static_from_area']:
+        calls = stats[f'{method}_calls']
+        time_ms = stats[f'{method}_time'] * 1000
+        if calls > 0:
+            avg_ms = time_ms / calls
+            print(f"  {method}:")
+            print(f"    calls: {calls}")
+            print(f"    total time: {time_ms:.3f} ms")
+            print(f"    avg time: {avg_ms:.3f} ms")
+
+            # Show Newton iterations if available
+            iter_key = f'{method}_total_iters'
+            if iter_key in stats and stats[iter_key] > 0:
+                avg_iters = stats[iter_key] / calls
+                print(f"    avg Newton iters: {avg_iters:.1f}")
+
+    print("=============================================\n")
 
 
 class JaxTrilinearInterp:
@@ -331,11 +403,20 @@ class JaxTabularThermo:
             # Run Newton iteration
             final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
             T_si = final_state[0]
+            n_iters = final_state[2]
 
-            return T_si / T_to_si_scale
+            return T_si / T_to_si_scale, n_iters
 
         self._props_TP_jit = _props_TP_jit
-        self._T_from_hP_jit = _T_from_hP_jit
+        self._T_from_hP_jit_with_iters = jax.jit(_T_from_hP_jit)
+
+        # Wrapper that discards iteration count for normal use
+        @jax.jit
+        def _T_from_hP_jit_simple(h_target, P, FAR):
+            result, _ = _T_from_hP_jit(h_target, P, FAR)
+            return result
+
+        self._T_from_hP_jit = _T_from_hP_jit_simple
 
     def T_from_hP(self, h_target, P, FAR):
         """
@@ -357,6 +438,16 @@ class JaxTabularThermo:
         float
             Temperature (English units: Rankine)
         """
+        # Check if we're being traced by JAX (can't do Python profiling during tracing)
+        is_tracing = isinstance(h_target, jax.core.Tracer)
+        if not is_tracing:
+            _thermo_stats['T_from_hP_calls'] += 1
+            if _thermo_profiling_enabled:
+                t0 = time.perf_counter()
+                result, n_iters = self._T_from_hP_jit_with_iters(h_target, P, FAR)
+                _thermo_stats['T_from_hP_time'] += time.perf_counter() - t0
+                _thermo_stats['T_from_hP_total_iters'] += int(n_iters)
+                return result
         return self._T_from_hP_jit(h_target, P, FAR)
 
     def props_TP(self, T, P, FAR):
@@ -377,6 +468,14 @@ class JaxTabularThermo:
         array
             [h, S, gamma, Cp, Cv, rho, R] in English units
         """
+        is_tracing = isinstance(T, jax.core.Tracer)
+        if not is_tracing:
+            _thermo_stats['props_TP_calls'] += 1
+            if _thermo_profiling_enabled:
+                t0 = time.perf_counter()
+                result = self._props_TP_jit(T, P, FAR)
+                _thermo_stats['props_TP_time'] += time.perf_counter() - t0
+                return result
         return self._props_TP_jit(T, P, FAR)
 
     def static_from_MN(self, Tt, Pt, MN, W, FAR):
@@ -404,6 +503,14 @@ class JaxTabularThermo:
             [Ts, Ps, hs, rhos, MN, V, Vsonic, area, gamma, Cp, Cv, S, R]
             in English units
         """
+        is_tracing = isinstance(Tt, jax.core.Tracer)
+        if not is_tracing:
+            _thermo_stats['static_from_MN_calls'] += 1
+            if _thermo_profiling_enabled:
+                t0 = time.perf_counter()
+                result = self._static_from_MN_jit(Tt, Pt, MN, W, FAR)
+                _thermo_stats['static_from_MN_time'] += time.perf_counter() - t0
+                return result
         return self._static_from_MN_jit(Tt, Pt, MN, W, FAR)
 
     def static_from_area(self, Tt, Pt, area, W, FAR):
@@ -431,6 +538,14 @@ class JaxTabularThermo:
             [Ts, Ps, hs, rhos, MN, V, Vsonic, area, gamma, Cp, Cv, S, R]
             in English units
         """
+        is_tracing = isinstance(Tt, jax.core.Tracer)
+        if not is_tracing:
+            _thermo_stats['static_from_area_calls'] += 1
+            if _thermo_profiling_enabled:
+                t0 = time.perf_counter()
+                result = self._static_from_area_jit(Tt, Pt, area, W, FAR)
+                _thermo_stats['static_from_area_time'] += time.perf_counter() - t0
+                return result
         return self._static_from_area_jit(Tt, Pt, area, W, FAR)
 
     def _setup_static_functions(self):
@@ -691,49 +806,207 @@ class JaxTabularThermo:
                               gamma_out, Cp, Cv, S, R, darea_dMN])
 
         def static_from_area_impl(Tt, Pt, area, W, FAR):
-            """Pure JAX static_from_area implementation using while_loop Newton."""
-            # Initial MN guess - start with subsonic guess
+            """
+            Pure JAX static_from_area using unified 3D Newton on (Ts, Ps, MN).
+
+            Instead of nested Newton loops (outer on MN, inner 2D on Ts/Ps),
+            this solves all three unknowns simultaneously in a single Newton loop.
+
+            Residuals:
+                R1 = S(Ts, Ps) - S_total        (entropy conservation)
+                R2 = hs + 0.5*MN²*γ*R*Ts - ht   (energy conservation)
+                R3 = area_computed - area        (mass continuity)
+
+            Jacobian (3x3):
+                [dS_dT      dS_dP      0           ]
+                [dR2_dT     dR2_dP     MN*γ*R*Ts   ]
+                [dR3_dT     dR3_dP     -area/MN    ]
+            """
+            # Convert to SI
+            Tt_si = Tt * T_to_si_scale
+            Pt_si = Pt * P_to_si
+            W_si = W * W_to_si
+            area_si = area * area_to_si
+
+            # Get total properties
+            tot_props = props_at_TP_si(Tt_si, Pt_si, FAR)
+            ht_si = tot_props['h']
+            S_total = tot_props['S']
+            gamma_t = tot_props['gamma']
+            R_t = tot_props['R']
+
+            # Initial guesses using ideal gas isentropic relations
             MN0 = 0.5
+            MN_sq = MN0 ** 2
+            Ps0_si = Pt_si * (1.0 + (gamma_t - 1.0) / 2.0 * MN_sq) ** (-gamma_t / (gamma_t - 1.0))
+            Ts0_si = Tt_si * (Ps0_si / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
 
-            # Newton iteration on MN to match area using analytical derivative
+            # 3D Newton solver for (Ts, Ps, MN) using while_loop
+            # State indices:
+            #   0: Ts_si, 1: Ps_si, 2: MN
+            #   3: R1, 4: R2, 5: R3 (residuals)
+            #   6: S, 7: hs, 8: gamma, 9: R (properties)
+            #   10: dS_dT, 11: dS_dP, 12: dh_dT, 13: dh_dP
+            #   14: dgamma_dT, 15: dgamma_dP, 16: dR_dT, 17: dR_dP
+            #   18: area_computed, 19: Vsonic_sq
+            #   20: iteration count
 
-            def cond_fn_MN(state):
-                # state = [MN, residual, i]
-                MN_val, residual, i = state[0], state[1], state[2]
-                return (jnp.abs(residual) > 1e-8) & (i < 20)
+            def compute_state_3d(Ts_si, Ps_si, MN, i):
+                """Compute full 3D state including props, derivs, and all three residuals."""
+                # Get properties and derivatives from interpolator
+                props_s, dprops_dP, dprops_dT = props_at_TP_si_with_derivs(Ts_si, Ps_si, FAR)
+                S_s = props_s['S']
+                hs_si = props_s['h']
+                gamma_s = props_s['gamma']
+                R_s = props_s['R']
 
-            def body_fn_MN(state):
-                MN_val, _, i = state[0], state[1], state[2]
+                # Clamp MN for numerical stability
+                MN_clamped = jnp.maximum(MN, 1e-10)
+                MN_sq = MN_clamped ** 2
 
-                # Compute static props at this MN (includes darea_dMN at index 13)
-                static_result = static_from_MN_impl(Tt, Pt, MN_val, W, FAR)
-                area_computed = static_result[7]   # area is at index 7
-                darea_dMN = static_result[13]      # darea_dMN is at index 13
+                # Derived quantities
+                Vsonic_sq = gamma_s * R_s * Ts_si
+                V_sq = MN_sq * Vsonic_sq
+                rho_s = Ps_si / (R_s * Ts_si)
+                V_s = MN_clamped * jnp.sqrt(Vsonic_sq)
+                area_computed = W_si / (rho_s * V_s)
 
-                res = area_computed - area
-                dres_dMN = darea_dMN  # d(residual)/dMN = d(area_computed)/dMN
-                dres_dMN = jnp.where(jnp.abs(dres_dMN) < 1e-20, 1e-20, dres_dMN)
+                # Residuals
+                R1 = S_s - S_total
+                R2 = hs_si + 0.5 * V_sq - ht_si
+                R3 = area_computed - area_si
 
-                dMN = -res / dres_dMN
-                MN_new = jnp.clip(MN_val + dMN, 0.01, 0.99)  # Subsonic only
+                return jnp.array([
+                    Ts_si, Ps_si, MN,
+                    R1, R2, R3,
+                    S_s, hs_si, gamma_s, R_s,
+                    dprops_dT['S'], dprops_dP['S'],
+                    dprops_dT['h'], dprops_dP['h'],
+                    dprops_dT['gamma'], dprops_dP['gamma'],
+                    dprops_dT['R'], dprops_dP['R'],
+                    area_computed, Vsonic_sq,
+                    i
+                ])
 
-                # Compute new residual
-                static_result_new = static_from_MN_impl(Tt, Pt, MN_new, W, FAR)
-                res_new = static_result_new[7] - area
-                return jnp.array([MN_new, res_new, i + 1])
+            def cond_fn_3d(state):
+                R1, R2, R3, i = state[3], state[4], state[5], state[20]
+                residual_norm = jnp.sqrt(R1**2 + R2**2 + R3**2)
+                return (residual_norm > 1e-8) & (i < 30)
 
-            # Initialize state: [MN, residual, iteration]
-            static_result_init = static_from_MN_impl(Tt, Pt, MN0, W, FAR)
-            res_init = static_result_init[7] - area
-            init_state = jnp.array([MN0, res_init, 0.0])
+            def body_fn_3d(state):
+                # Unpack state
+                Ts_si, Ps_si, MN = state[0], state[1], state[2]
+                R1, R2, R3 = state[3], state[4], state[5]
+                gamma_s, R_s = state[8], state[9]
+                dS_dT, dS_dP = state[10], state[11]
+                dh_dT, dh_dP = state[12], state[13]
+                dgamma_dT, dgamma_dP = state[14], state[15]
+                dR_dT, dR_dP = state[16], state[17]
+                area_computed, Vsonic_sq = state[18], state[19]
+                i = state[20]
 
-            # Run Newton iteration
-            final_state = jax.lax.while_loop(cond_fn_MN, body_fn_MN, init_state)
-            MN = final_state[0]
+                MN_clamped = jnp.maximum(MN, 1e-10)
+                MN_sq = MN_clamped ** 2
 
-            # Final computation with solved MN (return first 13 elements, without darea_dMN)
-            result = static_from_MN_impl(Tt, Pt, MN, W, FAR)
-            return result[:13]
+                # === Build 3x3 Jacobian ===
+                # Row 1: dR1/d(Ts, Ps, MN) - entropy residual
+                J11 = dS_dT  # dR1/dTs
+                J12 = dS_dP  # dR1/dPs
+                J13 = 0.0    # dR1/dMN (S doesn't depend on MN directly)
+
+                # Row 2: dR2/d(Ts, Ps, MN) - energy residual
+                # R2 = hs + 0.5*MN²*γ*R*Ts - ht
+                dVsq_dT = MN_sq * (dgamma_dT * R_s * Ts_si + gamma_s * dR_dT * Ts_si + gamma_s * R_s)
+                dVsq_dP = MN_sq * (dgamma_dP * R_s * Ts_si + gamma_s * dR_dP * Ts_si)
+                J21 = dh_dT + 0.5 * dVsq_dT  # dR2/dTs
+                J22 = dh_dP + 0.5 * dVsq_dP  # dR2/dPs
+                J23 = MN_clamped * Vsonic_sq  # dR2/dMN = MN * γ * R * Ts
+
+                # Row 3: dR3/d(Ts, Ps, MN) - area residual
+                # area = W / (ρ * V) = W / (ρ * MN * Vsonic)
+                # Using logarithmic differentiation:
+                # d(ln area)/dTs = 0.5*(dR_dT/R + 1/Ts - dgamma_dT/γ)
+                # d(ln area)/dPs = -1/Ps + 0.5*(dR_dP/R - dgamma_dP/γ)
+                # d(ln area)/dMN = -1/MN
+                J31 = 0.5 * area_computed * (dR_dT / R_s + 1.0 / Ts_si - dgamma_dT / gamma_s)
+                J32 = area_computed * (-1.0 / Ps_si + 0.5 * dR_dP / R_s - 0.5 * dgamma_dP / gamma_s)
+                J33 = -area_computed / MN_clamped  # dR3/dMN
+
+                # === Solve 3x3 system J * dx = -R using block elimination ===
+                # Since J13 = 0, we can reduce to 2x2 + back-substitution
+                #
+                # Row 1: J11*dTs + J12*dPs = -R1
+                # Row 2: J21*dTs + J22*dPs + J23*dMN = -R2
+                # Row 3: J31*dTs + J32*dPs + J33*dMN = -R3
+                #
+                # From Row 1: dTs = (-R1 - J12*dPs) / J11
+                # Substitute into Rows 2 & 3 to get 2x2 system for (dPs, dMN)
+
+                J11_safe = jnp.where(jnp.abs(J11) < 1e-20, 1e-20, J11)
+
+                # Modified coefficients for 2x2 system
+                J22_mod = J22 - J21 * J12 / J11_safe
+                J32_mod = J32 - J31 * J12 / J11_safe
+                R2_mod = -R2 + J21 * R1 / J11_safe
+                R3_mod = -R3 + J31 * R1 / J11_safe
+
+                # Solve 2x2: [J22_mod, J23; J32_mod, J33] * [dPs; dMN] = [R2_mod; R3_mod]
+                det2 = J22_mod * J33 - J23 * J32_mod
+                det2_safe = jnp.where(jnp.abs(det2) < 1e-20, 1e-20, det2)
+
+                dPs = (R2_mod * J33 - J23 * R3_mod) / det2_safe
+                dMN = (J22_mod * R3_mod - R2_mod * J32_mod) / det2_safe
+
+                # Back-substitute to get dTs
+                dTs = (-R1 - J12 * dPs) / J11_safe
+
+                # Apply updates with bounds
+                Ts_new = jnp.clip(Ts_si + dTs, 160.0, 2400.0)
+                Ps_new = jnp.clip(Ps_si + dPs, 100.0, 1e8)
+                MN_new = jnp.clip(MN + dMN, 0.01, 0.99)  # Subsonic only
+
+                return compute_state_3d(Ts_new, Ps_new, MN_new, i + 1)
+
+            # Initialize and run Newton iteration
+            init_state = compute_state_3d(Ts0_si, Ps0_si, MN0, 0.0)
+            final_state = jax.lax.while_loop(cond_fn_3d, body_fn_3d, init_state)
+
+            # Extract converged solution
+            Ts_si = final_state[0]
+            Ps_si = final_state[1]
+            MN_final = final_state[2]
+            hs_si = final_state[7]
+            gamma_s = final_state[8]
+            R_s = final_state[9]
+            S_s = final_state[6]
+
+            # Compute remaining properties
+            rho_s = Ps_si / (R_s * Ts_si)
+            Vsonic = jnp.sqrt(gamma_s * R_s * Ts_si)
+            V_s = MN_final * Vsonic
+            area_final = W_si / (rho_s * V_s)
+
+            # Get Cp and Cv (not in state)
+            props_final = props_at_TP_si(Ts_si, Ps_si, FAR)
+            Cp_s = props_final['Cp']
+            Cv_s = props_final['Cv']
+
+            # Convert to English units
+            Ts = Ts_si / T_to_si_scale
+            Ps = Ps_si / P_to_si
+            hs = hs_si * h_from_si
+            rhos = rho_s * rho_from_si
+            V = V_s * V_from_si
+            Vsonic_eng = Vsonic * V_from_si
+            area_eng = area_final * area_from_si
+            gamma_out = gamma_s
+            Cp = Cp_s * S_from_si
+            Cv = Cv_s * S_from_si
+            S = S_s * S_from_si
+            R_out = R_s * S_from_si
+
+            return jnp.array([Ts, Ps, hs, rhos, MN_final, V, Vsonic_eng, area_eng,
+                              gamma_out, Cp, Cv, S, R_out])
 
         # JIT compile
         self._static_from_MN_jit = jax.jit(static_from_MN_impl)
