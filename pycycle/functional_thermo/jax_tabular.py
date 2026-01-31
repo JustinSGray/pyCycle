@@ -343,6 +343,9 @@ class JaxTabularThermo:
         self._setup_jit_functions()
         self._setup_static_functions()
 
+        # Pre-compile JIT functions by calling with example inputs
+        self._warmup_jit()
+
     def _setup_jit_functions(self):
         """Create JIT-compiled versions of thermo functions."""
         interp = self._interp
@@ -782,6 +785,29 @@ class JaxTabularThermo:
         # JIT compile
         self._static_from_MN_jit = jax.jit(static_from_MN_impl)
         self._static_from_area_jit = jax.jit(static_from_area_impl)
+
+    def _warmup_jit(self):
+        """
+        Pre-compile all JIT functions by calling with example inputs.
+
+        This forces JAX to trace and compile all functions during initialization
+        rather than on first use, moving the compilation cost to import/setup time.
+        """
+        # Use mid-range values within the table bounds
+        T_example = 500.0   # degR (mid-range temperature)
+        P_example = 14.696  # psi (1 atm)
+        FAR_example = 0.0   # fuel-air ratio
+        h_example = -10.0   # Btu/lbm (approximate enthalpy at T=500R)
+        MN_example = 0.5    # Mach number
+        W_example = 100.0   # lbm/s
+        area_example = 500.0  # in^2
+
+        # Warm up each JIT function by calling it once
+        # This triggers JAX tracing and compilation
+        _ = self._props_TP_jit(T_example, P_example, FAR_example)
+        _ = self._T_from_hP_jit(h_example, P_example, FAR_example)
+        _ = self._static_from_MN_jit(T_example, P_example, MN_example, W_example, FAR_example)
+        _ = self._static_from_area_jit(T_example, P_example, area_example, W_example, FAR_example)
 
 
 # Factory function to create JIT-compiled thermo functions
