@@ -742,15 +742,13 @@ class TabularThermo(ThermoInterface):
         # Cache the converged solution
         self._cache_static_MN = (Ts, Ps)
 
-        # Compute all static properties at converged (Ts, Ps)
-        hs = self._lookup_si('h', Ts, Ps, FAR)
-        gam_s = self._lookup_si('gamma', Ts, Ps, FAR)
+        # Reuse hs, gamma_s, R_s from last Newton iteration (already computed above)
+        # Only look up Cp and Cv which weren't needed for the Newton solve
         Cp_s = self._lookup_si('Cp', Ts, Ps, FAR)
         Cv_s = self._lookup_si('Cv', Ts, Ps, FAR)
-        R_s = self._lookup_si('R', Ts, Ps, FAR)
 
-        # Speed of sound and velocity (use static properties)
-        Vsonic = np.sqrt(gam_s * R_s * Ts)
+        # Speed of sound and velocity (use static properties from Newton loop)
+        Vsonic = np.sqrt(gamma_s * R_s * Ts)
         V = MN * Vsonic
 
         # Density from ideal gas law
@@ -761,7 +759,7 @@ class TabularThermo(ThermoInterface):
 
         return StaticProps(Ts=Ts, Ps=Ps, hs=hs, rhos=rhos,
                           MN=MN, V=V, Vsonic=Vsonic, area=area,
-                          gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
+                          gamma=gamma_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
 
     def _T_from_SP_si(self, S_target_si, P_si, FAR, _retry=False):
         """Solve for temperature given entropy and pressure (SI units).
