@@ -7,7 +7,6 @@ eliminating the need for pure_callback and enabling efficient JIT compilation.
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 
 class JaxTrilinearInterp:
@@ -32,7 +31,6 @@ class JaxTrilinearInterp:
 
         # Store property names and stack values for efficient access
         self.property_names = list(values_dict.keys())
-        self._prop_idx = {name: i for i, name in enumerate(self.property_names)}
 
         # Stack all value tables: shape (n_props, nFAR, nP, nT)
         self._stacked_values = jnp.stack(
@@ -46,6 +44,58 @@ class JaxTrilinearInterp:
         idx = jnp.searchsorted(grid, x, side='right') - 1
         # Clamp to valid range [0, len-2] for interpolation
         return jnp.clip(idx, 0, len(grid) - 2)
+
+    def _find_cell_and_coords(self, point):
+        """Find cell indices and compute normalized coordinates.
+
+        Returns
+        -------
+        tuple
+            (i_FAR, i_P, i_T, xd, yd, zd, dy, dz) where:
+            - i_FAR, i_P, i_T: cell indices
+            - xd, yd, zd: normalized coordinates [0, 1] within cell
+            - dy, dz: grid spacing (for derivative computation)
+        """
+        FAR, P, T = point[0], point[1], point[2]
+
+        i_FAR = self._find_cell_idx(FAR, self.grid[0])
+        i_P = self._find_cell_idx(P, self.grid[1])
+        i_T = self._find_cell_idx(T, self.grid[2])
+
+        x0, x1 = self.grid[0][i_FAR], self.grid[0][i_FAR + 1]
+        y0, y1 = self.grid[1][i_P], self.grid[1][i_P + 1]
+        z0, z1 = self.grid[2][i_T], self.grid[2][i_T + 1]
+
+        dx = x1 - x0
+        dy = y1 - y0
+        dz = z1 - z0
+
+        xd = (FAR - x0) / dx
+        yd = (P - y0) / dy
+        zd = (T - z0) / dz
+
+        return i_FAR, i_P, i_T, xd, yd, zd, dy, dz
+
+    def _trilinear_core(self, c000, c001, c010, c011, c100, c101, c110, c111, xd, yd, zd):
+        """Compute trilinear interpolation from 8 corner values.
+
+        Returns
+        -------
+        tuple
+            (values, c0, c1, c00, c01, c10, c11) where values is the interpolated
+            result and the intermediate values are returned for derivative computation.
+        """
+        c00 = c000 * (1 - xd) + c100 * xd
+        c01 = c001 * (1 - xd) + c101 * xd
+        c10 = c010 * (1 - xd) + c110 * xd
+        c11 = c011 * (1 - xd) + c111 * xd
+
+        c0 = c00 * (1 - yd) + c10 * yd
+        c1 = c01 * (1 - yd) + c11 * yd
+
+        values = c0 * (1 - zd) + c1 * zd
+
+        return values, c0, c1, c00, c01, c10, c11
 
     def interpolate(self, point):
         """
@@ -61,22 +111,7 @@ class JaxTrilinearInterp:
         dict
             Property values at the interpolation point
         """
-        FAR, P, T = point[0], point[1], point[2]
-
-        # Find cell indices
-        i_FAR = self._find_cell_idx(FAR, self.grid[0])
-        i_P = self._find_cell_idx(P, self.grid[1])
-        i_T = self._find_cell_idx(T, self.grid[2])
-
-        # Get grid points for this cell
-        x0, x1 = self.grid[0][i_FAR], self.grid[0][i_FAR + 1]
-        y0, y1 = self.grid[1][i_P], self.grid[1][i_P + 1]
-        z0, z1 = self.grid[2][i_T], self.grid[2][i_T + 1]
-
-        # Compute normalized coordinates [0, 1] within cell
-        xd = (FAR - x0) / (x1 - x0)
-        yd = (P - y0) / (y1 - y0)
-        zd = (T - z0) / (z1 - z0)
+        i_FAR, i_P, i_T, xd, yd, zd, _, _ = self._find_cell_and_coords(point)
 
         # Get corner values for all properties at once
         # _stacked_values shape: (n_props, nFAR, nP, nT)
@@ -89,16 +124,7 @@ class JaxTrilinearInterp:
         c110 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T]
         c111 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T + 1]
 
-        # Trilinear interpolation
-        c00 = c000 * (1 - xd) + c100 * xd
-        c01 = c001 * (1 - xd) + c101 * xd
-        c10 = c010 * (1 - xd) + c110 * xd
-        c11 = c011 * (1 - xd) + c111 * xd
-
-        c0 = c00 * (1 - yd) + c10 * yd
-        c1 = c01 * (1 - yd) + c11 * yd
-
-        values = c0 * (1 - zd) + c1 * zd
+        values, *_ = self._trilinear_core(c000, c001, c010, c011, c100, c101, c110, c111, xd, yd, zd)
 
         return {name: values[i] for i, name in enumerate(self.property_names)}
 
@@ -120,22 +146,7 @@ class JaxTrilinearInterp:
         float
             Property value at the interpolation point
         """
-        FAR, P, T = point[0], point[1], point[2]
-
-        # Find cell indices
-        i_FAR = self._find_cell_idx(FAR, self.grid[0])
-        i_P = self._find_cell_idx(P, self.grid[1])
-        i_T = self._find_cell_idx(T, self.grid[2])
-
-        # Get grid points for this cell
-        x0, x1 = self.grid[0][i_FAR], self.grid[0][i_FAR + 1]
-        y0, y1 = self.grid[1][i_P], self.grid[1][i_P + 1]
-        z0, z1 = self.grid[2][i_T], self.grid[2][i_T + 1]
-
-        # Compute normalized coordinates
-        xd = (FAR - x0) / (x1 - x0)
-        yd = (P - y0) / (y1 - y0)
-        zd = (T - z0) / (z1 - z0)
+        i_FAR, i_P, i_T, xd, yd, zd, _, _ = self._find_cell_and_coords(point)
 
         # Get corner values for single property
         vals = self._stacked_values[prop_idx]
@@ -148,16 +159,9 @@ class JaxTrilinearInterp:
         c110 = vals[i_FAR + 1, i_P + 1, i_T]
         c111 = vals[i_FAR + 1, i_P + 1, i_T + 1]
 
-        # Trilinear interpolation
-        c00 = c000 * (1 - xd) + c100 * xd
-        c01 = c001 * (1 - xd) + c101 * xd
-        c10 = c010 * (1 - xd) + c110 * xd
-        c11 = c011 * (1 - xd) + c111 * xd
+        value, *_ = self._trilinear_core(c000, c001, c010, c011, c100, c101, c110, c111, xd, yd, zd)
 
-        c0 = c00 * (1 - yd) + c10 * yd
-        c1 = c01 * (1 - yd) + c11 * yd
-
-        return c0 * (1 - zd) + c1 * zd
+        return value
 
     def interpolate_with_derivs(self, point):
         """
@@ -180,26 +184,7 @@ class JaxTrilinearInterp:
         dvalues_dT : dict
             Derivatives of properties w.r.t. T (third coordinate)
         """
-        FAR, P, T = point[0], point[1], point[2]
-
-        # Find cell indices
-        i_FAR = self._find_cell_idx(FAR, self.grid[0])
-        i_P = self._find_cell_idx(P, self.grid[1])
-        i_T = self._find_cell_idx(T, self.grid[2])
-
-        # Get grid points for this cell
-        x0, x1 = self.grid[0][i_FAR], self.grid[0][i_FAR + 1]
-        y0, y1 = self.grid[1][i_P], self.grid[1][i_P + 1]
-        z0, z1 = self.grid[2][i_T], self.grid[2][i_T + 1]
-
-        # Grid spacing for derivatives
-        dy = y1 - y0  # P spacing
-        dz = z1 - z0  # T spacing
-
-        # Compute normalized coordinates [0, 1] within cell
-        xd = (FAR - x0) / (x1 - x0)
-        yd = (P - y0) / dy
-        zd = (T - z0) / dz
+        i_FAR, i_P, i_T, xd, yd, zd, dy, dz = self._find_cell_and_coords(point)
 
         # Get corner values for all properties at once
         # _stacked_values shape: (n_props, nFAR, nP, nT)
@@ -212,16 +197,9 @@ class JaxTrilinearInterp:
         c110 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T]
         c111 = self._stacked_values[:, i_FAR + 1, i_P + 1, i_T + 1]
 
-        # Trilinear interpolation (same as interpolate())
-        c00 = c000 * (1 - xd) + c100 * xd
-        c01 = c001 * (1 - xd) + c101 * xd
-        c10 = c010 * (1 - xd) + c110 * xd
-        c11 = c011 * (1 - xd) + c111 * xd
-
-        c0 = c00 * (1 - yd) + c10 * yd
-        c1 = c01 * (1 - yd) + c11 * yd
-
-        values = c0 * (1 - zd) + c1 * zd
+        values, c0, c1, c00, c01, c10, c11 = self._trilinear_core(
+            c000, c001, c010, c011, c100, c101, c110, c111, xd, yd, zd
+        )
 
         # Analytical derivatives
         # d(value)/dT = d(value)/d(zd) * d(zd)/dT = (c1 - c0) / dz
@@ -241,52 +219,6 @@ class JaxTrilinearInterp:
         )
 
 
-def jax_newton_solve(residual_fn, x0, max_iter=20, tol=1e-10,
-                     lower=160.0, upper=2400.0):
-    """
-    Pure JAX Newton solver using lax.while_loop.
-
-    Parameters
-    ----------
-    residual_fn : callable
-        Function that returns (residual, jacobian) given x
-    x0 : float
-        Initial guess
-    max_iter : int
-        Maximum iterations
-    tol : float
-        Convergence tolerance
-    lower, upper : float
-        Bounds for the solution
-
-    Returns
-    -------
-    x : float
-        Solution
-    """
-    def cond_fn(state):
-        x, residual, i = state
-        return (jnp.abs(residual) > tol) & (i < max_iter)
-
-    def body_fn(state):
-        x, _, i = state
-        residual, jacobian = residual_fn(x)
-        # Newton step with bounds clamping
-        dx = -residual / jacobian
-        x_new = jnp.clip(x + dx, lower, upper)
-        residual_new, _ = residual_fn(x_new)
-        return (x_new, residual_new, i + 1)
-
-    # Initial state
-    residual0, _ = residual_fn(x0)
-    init_state = (x0, residual0, 0)
-
-    # Run Newton iteration
-    final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
-
-    return final_state[0]
-
-
 class JaxTabularThermo:
     """
     Pure JAX implementation of tabular thermodynamics.
@@ -300,22 +232,8 @@ class JaxTabularThermo:
         Tabular data specification containing grid points and property values
     """
 
-    # Property indices in the stacked values array
-    PROP_H = 0
-    PROP_S = 1
-    PROP_GAMMA = 2
-    PROP_CP = 3
-    PROP_CV = 4
-    PROP_RHO = 5
-    PROP_R = 6
-
     def __init__(self, spec):
         """Initialize with tabular data specification."""
-        # Store grid points
-        self.FAR_grid = jnp.array(spec['FAR'])
-        self.P_grid = jnp.array(spec['P'])
-        self.T_grid = jnp.array(spec['T'])
-
         # Create interpolator for all total properties
         grid = (spec['FAR'], spec['P'], spec['T'])
         values_dict = {
@@ -331,13 +249,13 @@ class JaxTabularThermo:
 
         # Unit conversion factors (SI to English)
         # Assuming input_units='English' for pyCycle compatibility
-        self._h_to_si = 2326.0  # Btu/lbm -> J/kg
-        self._h_from_si = 1.0 / 2326.0
-        self._P_to_si = 6894.76  # psi -> Pa
-        self._T_to_si_offset = 0.0  # Rankine offset
-        self._T_to_si_scale = 5.0 / 9.0  # Rankine -> Kelvin scale
-        self._S_from_si = 1.0 / 4186.8  # J/(kg*K) -> Btu/(lbm*R)
-        self._rho_from_si = 0.062428  # kg/m^3 -> lbm/ft^3
+        h_to_si = 2326.0  # Btu/lbm -> J/kg
+        h_from_si = 1.0 / h_to_si
+        P_to_si = 6894.76  # psi -> Pa
+        T_to_si_scale = 5.0 / 9.0  # Rankine -> Kelvin scale
+        S_from_si = 1.0 / 4186.8  # J/(kg*K) -> Btu/(lbm*R)
+        rho_from_si = 0.062428  # kg/m^3 -> lbm/ft^3
+        self._unit_conversions = (h_to_si, h_from_si, P_to_si, T_to_si_scale, S_from_si, rho_from_si)
 
         # Create JIT-compiled versions of the methods
         self._setup_jit_functions()
@@ -346,12 +264,7 @@ class JaxTabularThermo:
     def _setup_jit_functions(self):
         """Create JIT-compiled versions of thermo functions."""
         interp = self._interp
-        h_to_si = self._h_to_si
-        h_from_si = self._h_from_si
-        P_to_si = self._P_to_si
-        T_to_si_scale = self._T_to_si_scale
-        S_from_si = self._S_from_si
-        rho_from_si = self._rho_from_si
+        h_to_si, h_from_si, P_to_si, T_to_si_scale, S_from_si, rho_from_si = self._unit_conversions
 
         @jax.jit
         def _props_TP_jit(T, P, FAR):
@@ -382,7 +295,7 @@ class JaxTabularThermo:
 
             def h_interp(T_si):
                 point = jnp.array([FAR, P_si, T_si])
-                return interp.interpolate_single(point, 0)  # PROP_H = 0
+                return interp.interpolate_single(point, 0)  # h is at index 0
 
             def cond_fn(state):
                 T_si, residual, i = state
@@ -519,12 +432,7 @@ class JaxTabularThermo:
     def _setup_static_functions(self):
         """Create JIT-compiled versions of static property functions."""
         interp = self._interp
-        h_to_si = self._h_to_si
-        h_from_si = self._h_from_si
-        P_to_si = self._P_to_si
-        T_to_si_scale = self._T_to_si_scale
-        S_from_si = self._S_from_si
-        rho_from_si = self._rho_from_si
+        h_to_si, h_from_si, P_to_si, T_to_si_scale, S_from_si, rho_from_si = self._unit_conversions
 
         # Additional conversion factors for static properties
         # W: lbm/s -> kg/s
@@ -782,33 +690,3 @@ class JaxTabularThermo:
         # JIT compile
         self._static_from_MN_jit = jax.jit(static_from_MN_impl)
         self._static_from_area_jit = jax.jit(static_from_area_impl)
-
-
-# Factory function to create JIT-compiled thermo functions
-def create_jax_thermo_functions(spec):
-    """
-    Create JIT-compiled pure JAX thermo functions from a table specification.
-
-    Parameters
-    ----------
-    spec : dict
-        Tabular data specification
-
-    Returns
-    -------
-    dict
-        Dictionary of JIT-compiled functions:
-        - 'T_from_hP': (h, P, FAR) -> T
-        - 'props_TP': (T, P, FAR) -> [h, S, gamma, Cp, Cv, rho, R]
-    """
-    thermo = JaxTabularThermo(spec)
-
-    # Create JIT-compiled versions
-    T_from_hP_jit = jax.jit(thermo.T_from_hP)
-    props_TP_jit = jax.jit(thermo.props_TP)
-
-    return {
-        'T_from_hP': T_from_hP_jit,
-        'props_TP': props_TP_jit,
-        '_thermo': thermo,  # Keep reference for debugging
-    }

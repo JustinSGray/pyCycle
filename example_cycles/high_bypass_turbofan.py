@@ -9,7 +9,6 @@ import pycycle.api as pyc
 # Import timing stats for profiling
 from pycycle.jax_element_base import print_timing_stats, reset_timing_stats
 from pycycle.elements.duct import print_duct_timing_stats, reset_duct_timing_stats
-from pycycle.functional_thermo.jax_wrappers import print_jax_thermo_timing, reset_jax_thermo_timing
 from pycycle.functional_thermo.tabular import TabularThermo
 
 
@@ -448,7 +447,6 @@ if __name__ == "__main__":
     # Reset timing stats before the run
     reset_timing_stats()
     reset_duct_timing_stats()
-    reset_jax_thermo_timing()
 
     prob.set_solver_print(level=-1)
     prob.set_solver_print(level=2, depth=2)
@@ -509,4 +507,3 @@ if __name__ == "__main__":
     # TabularThermo.print_all_solver_stats()  
 
     print_timing_stats()
-    print_jax_thermo_timing()
