@@ -11,8 +11,7 @@ import jax.numpy as jnp
 
 import openmdao.api as om
 
-from pycycle.constants import (ALLOWED_THERMOS, CEA_AIR_COMPOSITION,
-                               TAB_AIR_FUEL_COMPOSITION, AIR_JETA_TAB_SPEC)
+from pycycle.constants import ALLOWED_THERMOS, AIR_JETA_TAB_SPEC
 
 # =============================================================================
 # Detailed timing stats for compute_partials breakdown
@@ -20,14 +19,10 @@ from pycycle.constants import (ALLOWED_THERMOS, CEA_AIR_COMPOSITION,
 import time
 
 _jax_element_timing_stats = {
-    'pre_linearize_calls': 0,
-    'pre_linearize_time': 0.0,
     'jacobian_compute_calls': 0,
     'jacobian_compute_time': 0.0,
     'jacobian_assign_calls': 0,
     'jacobian_assign_time': 0.0,
-    'post_linearize_calls': 0,
-    'post_linearize_time': 0.0,
     'jvp_calls': 0,
     'jvp_time': 0.0,
     'jit_cache_hits': 0,
@@ -52,11 +47,6 @@ def print_timing_stats():
     """Print detailed JaxElement timing statistics."""
     stats = _jax_element_timing_stats
     print("\n=== JaxElement compute_partials Breakdown ===")
-    print(f"  _pre_linearize():")
-    print(f"    calls: {stats['pre_linearize_calls']}")
-    print(f"    total time: {stats['pre_linearize_time']*1000:.3f} ms")
-    if stats['pre_linearize_calls'] > 0:
-        print(f"    avg time: {stats['pre_linearize_time']*1000/stats['pre_linearize_calls']:.3f} ms")
     print(f"  Jacobian computation (JAX JVP):")
     print(f"    calls: {stats['jacobian_compute_calls']}")
     print(f"    total time: {stats['jacobian_compute_time']*1000:.3f} ms")
@@ -71,11 +61,6 @@ def print_timing_stats():
     print(f"    total time: {stats['jacobian_assign_time']*1000:.3f} ms")
     if stats['jacobian_assign_calls'] > 0:
         print(f"    avg time: {stats['jacobian_assign_time']*1000/stats['jacobian_assign_calls']:.3f} ms")
-    print(f"  _post_linearize():")
-    print(f"    calls: {stats['post_linearize_calls']}")
-    print(f"    total time: {stats['post_linearize_time']*1000:.3f} ms")
-    if stats['post_linearize_calls'] > 0:
-        print(f"    avg time: {stats['post_linearize_time']*1000/stats['post_linearize_calls']:.3f} ms")
 
     # JIT cache stats
     print(f"  JIT function cache:")
@@ -86,15 +71,12 @@ def print_timing_stats():
         print(f"    hit rate: {100*stats['jit_cache_hits']/total_lookups:.1f}%")
 
     # Summary
-    total_time = (stats['pre_linearize_time'] + stats['jacobian_compute_time'] +
-                  stats['jacobian_assign_time'] + stats['post_linearize_time'])
+    total_time = stats['jacobian_compute_time'] + stats['jacobian_assign_time']
     print(f"  --- Summary ---")
     print(f"    Total tracked time: {total_time*1000:.3f} ms")
     if total_time > 0:
-        print(f"    pre_linearize: {100*stats['pre_linearize_time']/total_time:.1f}%")
         print(f"    jacobian compute: {100*stats['jacobian_compute_time']/total_time:.1f}%")
         print(f"    jacobian assign: {100*stats['jacobian_assign_time']/total_time:.1f}%")
-        print(f"    post_linearize: {100*stats['post_linearize_time']/total_time:.1f}%")
     print("=============================================\n")
 
 
@@ -174,7 +156,6 @@ class JaxElement(om.ExplicitComponent):
     def initialize(self):
 
         self._jax_thermo = None
-        self._thermo_cache = {}  # Instance-level cache for linearized derivatives
         self._primal_input_names = []  # Maps primal arg name -> OpenMDAO input name
         self._primal_output_names = []  # Maps primal return index -> OpenMDAO output name
         self._cached_args = None
@@ -214,11 +195,34 @@ class JaxElement(om.ExplicitComponent):
 
         if key not in JaxElement._shared_thermos:
             # Create new JaxThermo and cache at class level
-            thermo = self._create_thermo()
+            spec = self._get_thermo_spec()
             from pycycle.functional_thermo.jax_wrappers import JaxThermo
-            JaxElement._shared_thermos[key] = JaxThermo(thermo)
+            JaxElement._shared_thermos[key] = JaxThermo(spec)
 
         return JaxElement._shared_thermos[key]
+
+    def _get_thermo_spec(self):
+        """
+        Get the tabular thermo spec dict based on options.
+
+        Returns
+        -------
+        dict
+            Tabular thermo specification dictionary.
+
+        Raises
+        ------
+        ValueError
+            If thermo_method is not 'TABULAR'.
+        """
+        method = self.options['thermo_method']
+        if method != 'TABULAR':
+            raise ValueError(f"JaxElement only supports TABULAR thermo_method, got {method}")
+
+        thermo_data = self.options['thermo_data']
+        if thermo_data is None:
+            return AIR_JETA_TAB_SPEC
+        return thermo_data
 
     def pyc_setup_output_ports(self):
         """Override in subclass to set up output port data for Cycle's flow graph."""
@@ -303,107 +307,6 @@ class JaxElement(om.ExplicitComponent):
         """
         raise NotImplementedError("Subclass must implement compute_physics")
 
-    # =========================================================================
-    # Hooks for subclass customization
-    # =========================================================================
-
-    def _pre_linearize(self, inputs, outputs):
-        """
-        Pre-linearize thermo at current operating point for faster JAX JVP.
-
-        Uses flow port configuration from `_flow_in_port` and `_flow_out_port`
-        attributes. Set these in setup() to enable automatic pre-linearization.
-
-        Parameters
-        ----------
-        inputs : dict-like
-            OpenMDAO inputs dict
-        outputs : dict-like
-            OpenMDAO outputs dict (cached from last compute)
-        """
-        # Skip if no jax_thermo or no flow ports configured
-        if self._jax_thermo is None:
-            return
-        if not hasattr(self, '_flow_out_port') or self._flow_out_port is None:
-            return
-
-        fl_out = self._flow_out_port
-        fl_in = getattr(self, '_flow_in_port', 'Fl_I')
-        design = self.options['design']
-        statics = self.options['statics'] if 'statics' in self.options else False
-
-        # Get MN_or_area if statics are enabled
-        if statics:
-            if design:
-                MN_or_area = float(inputs['MN'][0]) if 'MN' in inputs else None
-            else:
-                MN_or_area = float(inputs['area'][0]) if 'area' in inputs else None
-        else:
-            MN_or_area = None
-
-        # Bind instance cache to shared thermo
-        self._jax_thermo.set_cache(self._thermo_cache)
-
-        # Extract props from outputs (computed in forward pass)
-        # to avoid duplicate table lookups in linearize()
-        from pycycle.functional_thermo.base import TotalProps, StaticProps
-        props = TotalProps(
-            h=float(outputs[f'{fl_out}:tot:h'][0]),
-            S=float(outputs[f'{fl_out}:tot:S'][0]),
-            gamma=float(outputs[f'{fl_out}:tot:gamma'][0]),
-            Cp=float(outputs[f'{fl_out}:tot:Cp'][0]),
-            Cv=float(outputs[f'{fl_out}:tot:Cv'][0]),
-            rho=float(outputs[f'{fl_out}:tot:rho'][0]),
-            R=float(outputs[f'{fl_out}:tot:R'][0]),
-        )
-
-        # Extract static props if available
-        static_props = None
-        if statics and f'{fl_out}:stat:T' in outputs:
-            static_props = StaticProps(
-                Ts=float(outputs[f'{fl_out}:stat:T'][0]),
-                Ps=float(outputs[f'{fl_out}:stat:P'][0]),
-                hs=float(outputs[f'{fl_out}:stat:h'][0]),
-                rhos=float(outputs[f'{fl_out}:stat:rho'][0]),
-                MN=float(outputs[f'{fl_out}:stat:MN'][0]),
-                V=float(outputs[f'{fl_out}:stat:V'][0]),
-                Vsonic=float(outputs[f'{fl_out}:stat:Vsonic'][0]),
-                area=float(outputs[f'{fl_out}:stat:area'][0]),
-                gamma=float(outputs[f'{fl_out}:stat:gamma'][0]),
-                Cp=float(outputs[f'{fl_out}:stat:Cp'][0]),
-                Cv=float(outputs[f'{fl_out}:stat:Cv'][0]),
-                S=float(outputs[f'{fl_out}:stat:S'][0]),
-                R=float(outputs[f'{fl_out}:stat:R'][0]),
-            )
-
-        # Pre-linearize at current operating point
-        # Note: outputs dict contains arrays, extract scalar values
-        self._jax_thermo.linearize_at(
-            ht=float(outputs[f'{fl_out}:tot:h'][0]),
-            Pt=float(outputs[f'{fl_out}:tot:P'][0]),
-            W=float(inputs[f'{fl_in}:stat:W'][0]),
-            MN_or_area=MN_or_area,
-            is_design=design,
-            statics=statics,
-            composition=inputs[f'{fl_in}:tot:composition'],
-            T=float(outputs[f'{fl_out}:tot:T'][0]),
-            props=props,
-            static_props=static_props
-        )
-
-    def _post_linearize(self):
-        """
-        Hook called after computing Jacobian. Override for cleanup.
-
-        This is called at the end of compute_partials() to allow subclasses
-        to clear caches or perform other cleanup.
-
-        Default implementation clears thermo caches if jax_thermo is in use.
-        """
-        if self._jax_thermo is not None:
-            self._jax_thermo.clear_cache()
-            self._thermo_cache.clear()
-
     def _get_jit_config_key(self):
         """
         Return a hashable key for JIT function caching.
@@ -471,14 +374,6 @@ class JaxElement(om.ExplicitComponent):
 
     def compute_partials(self, inputs, partials):
         """Compute partial derivatives using JAX autodiff."""
-        # Pre-linearization hook (for thermo caching)
-        # Use OpenMDAO's internal _outputs dict for current output values
-        # JSG: _outputs being used for speed here. But might be risky. Check with OpenMDAO devs.
-        t_start = time.perf_counter()
-        self._pre_linearize(inputs, self._outputs)
-        _jax_element_timing_stats['pre_linearize_calls'] += 1
-        _jax_element_timing_stats['pre_linearize_time'] += (time.perf_counter() - t_start)
-
         args = self._cached_args
 
         # Compute Jacobian (subclass can override compute_jacobian for efficiency)
@@ -513,12 +408,6 @@ class JaxElement(om.ExplicitComponent):
                     partials[dst, src] = np.eye(len(src_val))
         _jax_element_timing_stats['jacobian_assign_calls'] += 1
         _jax_element_timing_stats['jacobian_assign_time'] += (time.perf_counter() - t_start)
-
-        # Post-linearization hook (cleanup)
-        t_start = time.perf_counter()
-        self._post_linearize()
-        _jax_element_timing_stats['post_linearize_calls'] += 1
-        _jax_element_timing_stats['post_linearize_time'] += (time.perf_counter() - t_start)
 
     def _compute_jacobian_fwd(self, args):
         """Compute Jacobian using forward-mode with cached JIT-compiled JVP calls.
@@ -635,44 +524,3 @@ class JaxElement(om.ExplicitComponent):
         self._passthrough_vars.append((f'{fl_src}:tot:composition', f'{fl_name}:tot:composition'))
         self._passthrough_vars.append((f'{fl_src}:FAR', f'{fl_name}:FAR'))
 
-    # =========================================================================
-    # Thermo Creation Helpers
-    # =========================================================================
-
-    def _create_thermo(self, fl_name='Fl_I', composition=None):
-        """Create a functional thermo object based on options."""
-        method = self.options['thermo_method']
-        thermo_data = self.options['thermo_data']
-
-        if method == 'CEA':
-            from pycycle.functional_thermo import CEAThermo
-            from pycycle.thermo.cea import species_data
-
-            if composition is None:
-                composition = self.Fl_I_data.get(fl_name, CEA_AIR_COMPOSITION)
-            if thermo_data is None:
-                thermo_data = species_data.janaf
-
-            return CEAThermo(composition=composition,
-                             thermo_data=thermo_data,
-                             input_units='English')
-
-        elif method == 'TABULAR':
-            from pycycle.functional_thermo import TabularThermo
-
-            if composition is None:
-                composition = self.Fl_I_data.get(fl_name, TAB_AIR_FUEL_COMPOSITION)
-            FAR = composition.get('FAR', 0.0) if isinstance(composition, dict) else 0.0
-            spec = thermo_data if thermo_data else AIR_JETA_TAB_SPEC
-
-            return TabularThermo(FAR=FAR, spec=spec, input_units='English')
-
-        else:
-            raise ValueError(f"Unknown thermo_method: {method}")
-
-    def _create_jax_thermo(self, fl_name='Fl_I', composition=None):
-        """Create a JAX-wrapped functional thermo object."""
-        from pycycle.functional_thermo.jax_wrappers import JaxThermo
-
-        thermo = self._create_thermo(fl_name=fl_name, composition=composition)
-        return JaxThermo(thermo)

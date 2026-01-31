@@ -28,7 +28,6 @@ Internal Units (SI):
 
 from .base import ThermoInterface, TotalProps, StaticProps
 from .units import UnitConverter, SI_UNITS, ENGLISH_UNITS
-from .tabular import TabularThermo
 from .tabular import ThermoAdd as TabularThermoAdd
 from .tabular import ThermoAddOutput as TabularThermoAddOutput
 from .cea import CEAThermo

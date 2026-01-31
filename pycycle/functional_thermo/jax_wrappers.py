@@ -2,7 +2,7 @@
 JAX-compatible wrappers for functional thermodynamic interfaces.
 
 This module provides:
-- JaxThermo: A wrapper class that makes TabularThermo fully JAX-traceable
+- JaxThermo: A wrapper class that provides fully JAX-traceable thermo calculations
 - Named index classes for accessing property arrays
 
 The wrappers use pure JAX functions that JAX can differentiate through directly,
@@ -56,7 +56,7 @@ class StaticPropsIdx:
 
 class JaxThermo:
     """
-    Wrapper that provides fully JAX-traceable interface to TabularThermo.
+    Wrapper that provides fully JAX-traceable interface for tabular thermo calculations.
 
     Uses pure JAX functions that JAX can differentiate through directly. This allows:
     - JIT compilation of the full computation
@@ -66,44 +66,20 @@ class JaxThermo:
     All methods accept composition as an array parameter where composition[0] = FAR.
 
     Note: This class is designed to be shareable across multiple JaxElement instances.
+
+    Parameters
+    ----------
+    spec : dict
+        Tabular thermo specification dictionary containing grid points and property values.
+        Typically AIR_JETA_TAB_SPEC or a custom spec dict.
     """
 
-    def __init__(self, thermo, use_pure_jax=True):
-        self._thermo = thermo
-
-        # Verify this is a TabularThermo (CEAThermo not supported in pure JAX mode)
-        from pycycle.functional_thermo.tabular import TabularThermo
-        if not isinstance(thermo, TabularThermo):
-            raise TypeError(
-                f"JaxThermo only supports TabularThermo, got {type(thermo).__name__}. "
-                "Set thermo_method='TABULAR' in your Cycle options."
-            )
-
+    def __init__(self, spec):
         # Create pure JAX thermo for computation
         from pycycle.functional_thermo.jax_tabular import JaxTabularThermo
-        self._jax_thermo = JaxTabularThermo(thermo.spec)
+        self._jax_thermo = JaxTabularThermo(spec)
 
         self._setup_wrappers()
-
-    def set_cache(self, cache):
-        """
-        No-op for pure JAX mode. Kept for API compatibility.
-        """
-        pass
-
-    def clear_cache(self):
-        """
-        No-op for pure JAX mode. Kept for API compatibility.
-        """
-        pass
-
-    def linearize_at(self, ht, Pt, W, MN_or_area, is_design, statics, composition=None, T=None, props=None, static_props=None):
-        """
-        No-op for pure JAX mode. JAX autodiff handles derivatives directly.
-
-        Kept for API compatibility with jax_element_base.py.
-        """
-        pass
 
     def _setup_wrappers(self):
         """Create pure JAX wrappers for thermo methods."""

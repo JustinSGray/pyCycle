@@ -8,11 +8,7 @@ import pycycle.api as pyc
 
 # Import timing stats for profiling
 from pycycle.jax_element_base import print_timing_stats, reset_timing_stats
-from pycycle.elements.duct import print_duct_timing_stats, reset_duct_timing_stats
-from pycycle.functional_thermo.tabular import TabularThermo
-
-
-from pycycle.jax_element_base import reset_timing_stats, print_timing_stats       
+from pycycle.elements.duct import print_duct_timing_stats, reset_duct_timing_stats       
 
 class HBTF(pyc.Cycle):
 
@@ -500,10 +496,6 @@ if __name__ == "__main__":
     # Print timing stats
     # print_timing_stats()       # JaxElement (NewDuct) timing
     # print_jax_thermo_timing()  # JaxThermo internal timing
-    # TabularThermo.print_profile_static_MN()  # Detailed profiling
     # print_duct_timing_stats()  # Original Duct timing
-
-
-    # TabularThermo.print_all_solver_stats()  
 
     print_timing_stats()

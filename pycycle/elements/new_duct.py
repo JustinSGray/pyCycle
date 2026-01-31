@@ -2,8 +2,8 @@
 NewDuct - A duct element using JaxElement for automatic differentiation.
 
 This is a single ExplicitComponent that replaces the Duct Group.
-It uses functional thermo interfaces (CEAThermo or TabularThermo) and
-provides analytical derivatives via JAX automatic differentiation.
+It uses JaxThermo with tabular thermo data and provides analytical
+derivatives via JAX automatic differentiation.
 """
 
 import time
@@ -82,10 +82,6 @@ class NewDuct(JaxElement):
         design = self.options['design']
         statics = self.options['statics']
         expMN = self.options['expMN']
-
-        # Configure flow ports for base class pre-linearization
-        self._flow_in_port = 'Fl_I'
-        self._flow_out_port = 'Fl_O'
 
         # --- Inputs ---
         # Add all flow inputs for pyCycle flow connections
