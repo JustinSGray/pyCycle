@@ -1262,21 +1262,21 @@ class TabularThermo(ThermoInterface):
         """
         FAR = self._get_FAR(FAR)
 
-        # Convert inputs to SI
+        # Try Newton's method first (much faster when it converges)
+        # Uses analytical derivatives from linearize_static_MN
+        MN, props, converged = self._newton_solve_MN(
+            Tt, Pt, area, W, FAR, MN_guess, subsonic
+        )
+
+        if converged:
+            return props
+
+        # Fall back to brentq for robustness
         Tt_si = self._convert_T_to_si(Tt)
         Pt_si = Pt * self._P_to_si
         area_si = area * self._area_to_si
         W_si = W * self._W_to_si
 
-        # Try Newton's method first (much faster when it converges)
-        MN, props_si, converged = self._newton_solve_MN(
-            Tt_si, Pt_si, area_si, W_si, FAR, MN_guess, subsonic
-        )
-
-        if converged:
-            return self._convert_static_props_from_si(props_si)
-
-        # Fall back to brentq for robustness
         def area_residual(MN):
             props = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si, FAR)
             return float(props.area) - float(area_si)
@@ -1291,22 +1291,47 @@ class TabularThermo(ThermoInterface):
 
         return self._convert_static_props_from_si(props_si)
 
-    def _newton_solve_MN(self, Tt_si, Pt_si, area_si, W_si, FAR, MN_guess, subsonic,
+    def _newton_solve_MN(self, Tt, Pt, area, W, FAR, MN_guess, subsonic,
                          max_iter=10, tol=1e-10):
         """
-        Solve for MN using Newton's method with analytical derivative.
+        Solve for MN using Newton's method with analytical derivatives.
+
+        Uses linearize_static_MN to compute d(area)/d(MN) analytically,
+        avoiding the need for finite differences.
+
+        Parameters
+        ----------
+        Tt : float
+            Total temperature (in input units)
+        Pt : float
+            Total pressure (in input units)
+        area : float
+            Target flow area (in input units)
+        W : float
+            Mass flow rate (in input units)
+        FAR : float
+            Fuel-to-air ratio
+        MN_guess : float
+            Initial guess for Mach number
+        subsonic : bool
+            If True, find subsonic solution; if False, find supersonic
+        max_iter : int, optional
+            Maximum Newton iterations
+        tol : float, optional
+            Convergence tolerance (relative)
 
         Returns
         -------
         MN : float
             Converged Mach number
-        props_si : StaticProps
-            Static properties at converged MN
+        props : StaticProps
+            Static properties at converged MN (in input units)
         converged : bool
             True if Newton converged
         """
         # Use cached solution as initial guess if available
-        cache_key = (round(Tt_si, 2), round(Pt_si, 0), round(W_si, 4), round(FAR, 4), subsonic)
+        # Cache key uses input values (user units)
+        cache_key = (round(Tt, 2), round(Pt, 0), round(W, 4), round(FAR, 4), subsonic)
         if cache_key in self._last_MN_solution:
             MN = self._last_MN_solution[cache_key]
         else:
@@ -1316,23 +1341,27 @@ class TabularThermo(ThermoInterface):
         MN_min = 0.01 if subsonic else 1.001
         MN_max = 0.999 if subsonic else 5.0
 
-        props_si = None
+        props = None
         for _ in range(max_iter):
-            # Compute area and its derivative w.r.t. MN
-            area_computed, darea_dMN, props_si = self._area_and_derivative_si(
-                Tt_si, Pt_si, MN, W_si, FAR
-            )
+            # Compute static properties at current MN
+            props = self.static_from_MN(Tt, Pt, MN, W, FAR)
+            area_computed = props.area
 
-            residual = area_computed - area_si
+            # Get analytical derivative d(area)/d(MN) via linearize_static_MN
+            # Pass sprops to avoid recomputing static properties
+            self.linearize_static_MN(Tt, Pt, MN, W, FAR, sprops=props)
+            darea_dMN = self._jacobian_static_MN['area'][2]
+
+            residual = area_computed - area
 
             # Check convergence
-            if abs(residual) < tol * area_si:
+            if abs(residual) < tol * area:
                 self._last_MN_solution[cache_key] = MN
-                return MN, props_si, True
+                return MN, props, True
 
             # Newton update
             if abs(darea_dMN) < 1e-20:
-                return MN, props_si, False  # Derivative too small
+                return MN, props, False  # Derivative too small
 
             MN_new = MN - residual / darea_dMN
 
@@ -1342,32 +1371,11 @@ class TabularThermo(ThermoInterface):
             # Check for stagnation
             if abs(MN_new - MN) < 1e-14:
                 self._last_MN_solution[cache_key] = MN_new
-                return MN_new, props_si, True
+                return MN_new, props, True
 
             MN = MN_new
 
-        return MN, props_si, False  # Did not converge
-
-    def _area_and_derivative_si(self, Tt_si, Pt_si, MN, W_si, FAR):
-        """
-        Compute area and d(area)/d(MN) at given conditions.
-
-        Uses the new physics (_static_from_MN_si with energy/entropy constraints)
-        and computes d(area)/d(MN) numerically via finite difference.
-
-        Returns area, darea_dMN, and full static props (to avoid recomputation).
-        """
-        # Compute static properties at current MN
-        props_si = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si, FAR)
-        area = props_si.area
-
-        # Compute d(area)/d(MN) via finite difference
-        eps = 1e-6
-        MN_pert = MN + eps
-        props_pert = self._static_from_MN_si(Tt_si, Pt_si, MN_pert, W_si, FAR)
-        darea_dMN = (props_pert.area - area) / eps
-
-        return area, darea_dMN, props_si
+        return MN, props, False  # Did not converge
 
     # =========================================================================
     # Analytical derivatives for static properties
