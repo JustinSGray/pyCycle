@@ -776,72 +776,64 @@ class TabularThermo(ThermoInterface):
         # Get gamma at total conditions
         with _profile_section(p, 'lookup_total'):
             gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
-            R_tot = self._lookup_si('R', Tt_si, Pt_si, FAR)
 
         # Linearize at total conditions for dgamma/dTt, dgamma/dPt, dgamma/dFAR
         with _profile_section(p, 'grad_total'):
             x_tot = np.array([FAR, float(Pt_si), float(Tt_si)])
             grad_gam_tot = self._interps['gamma'].gradient(x_tot)  # (dg/dFAR, dg/dP, dg/dT)
-            grad_R_tot = self._interps['R'].gradient(x_tot)
 
-        dgam_dTt = grad_gam_tot[2] * self._T_to_si  # Convert to input units
-        dgam_dPt = grad_gam_tot[1] * self._P_to_si
-        dgam_dFAR = grad_gam_tot[0]  # FAR is dimensionless
+        # Gamma derivatives in input units
+        dgam_d = np.array([
+            grad_gam_tot[2] * self._T_to_si,  # dgam/dTt
+            grad_gam_tot[1] * self._P_to_si,  # dgam/dPt
+            0.0,                               # dgam/dMN
+            0.0,                               # dgam/dW
+            grad_gam_tot[0]                    # dgam/dFAR (dimensionless)
+        ])
 
-        # Isentropic relations
+        # Isentropic relations and their derivatives
         with _profile_section(p, 'isentropic'):
             MN2 = MN ** 2
             gm1 = gam - 1.0
-            gm1_half = gm1 / 2.0
-            denom = 1.0 + gm1_half * MN2
+            denom = 1.0 + gm1 / 2.0 * MN2
             temp_ratio = 1.0 / denom
+            exp = gam / gm1
 
             Ts_si = Tt_si * temp_ratio
-            exp = gam / gm1
             Ps_si = Pt_si * temp_ratio ** exp
 
-            # Derivatives of temp_ratio w.r.t. inputs
-            # temp_ratio = 1 / (1 + (gam-1)/2 * MN^2)
-            # d(temp_ratio)/dMN = -(gam-1) * MN / denom^2
-            # d(temp_ratio)/dgam = -MN^2 / (2 * denom^2)
+            # Derivatives of temp_ratio: dtr/dMN and dtr/dgam
             dtr_dMN = -gm1 * MN / (denom ** 2)
             dtr_dgam = -MN2 / (2.0 * denom ** 2)
 
-            # Derivatives of Ts w.r.t. inputs (Ts = Tt * temp_ratio)
-            # All derivatives should be in input units (e.g., degR/degR, degR/psi, degR/MN)
-            dTs_dTt = temp_ratio + Tt_si * dtr_dgam * dgam_dTt / self._T_to_si
-            dTs_dPt = Tt_si * dtr_dgam * dgam_dPt / self._P_to_si
-            dTs_dMN = Tt_si * dtr_dMN * self._T_from_si  # Convert T_si to T_input
-            dTs_dFAR = Tt_si * dtr_dgam * dgam_dFAR * self._T_from_si  # Through gamma dependency
+            # Build dTs_d array directly: [dTs/dTt, dTs/dPt, dTs/dMN, dTs/dW, dTs/dFAR]
+            # Ts = Tt * temp_ratio, temp_ratio depends on gam which depends on Tt, Pt, FAR
+            dTs_d = np.array([
+                temp_ratio + Tt_si * dtr_dgam * dgam_d[0] / self._T_to_si,  # dTs/dTt
+                Tt_si * dtr_dgam * dgam_d[1] / self._P_to_si,               # dTs/dPt
+                Tt_si * dtr_dMN * self._T_from_si,                          # dTs/dMN
+                0.0,                                                         # dTs/dW
+                Tt_si * dtr_dgam * dgam_d[4] * self._T_from_si              # dTs/dFAR
+            ]) * self._T_to_si  # Convert to SI for chain rule
 
-            # Derivatives of Ps w.r.t. inputs
-            # Ps = Pt * temp_ratio^exp, exp = gam/(gam-1)
-            # d(exp)/dgam = -1/(gam-1)^2
+            # Build dPs_d array: Ps = Pt * temp_ratio^exp
             dexp_dgam = -1.0 / (gm1 ** 2)
             ln_tr = np.log(temp_ratio) if temp_ratio > 0 else 0.0
+            tr_exp = temp_ratio ** exp
+            tr_exp_m1 = temp_ratio ** (exp - 1)
 
-            # d(Ps)/dPt = temp_ratio^exp + Pt * exp * temp_ratio^(exp-1) * dtr/dgam * dgam/dPt
-            #           + Pt * temp_ratio^exp * ln(temp_ratio) * dexp/dgam * dgam/dPt
-            dPs_dPt_base = temp_ratio ** exp
-            dPs_dPt = dPs_dPt_base + Pt_si * (
-                exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dPt +
-                temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dPt
-            ) / self._P_to_si
+            dPs_d = np.array([
+                Pt_si * (exp * tr_exp_m1 * dtr_dgam * dgam_d[0] +
+                         tr_exp * ln_tr * dexp_dgam * dgam_d[0]) * self._P_from_si,  # dPs/dTt
+                tr_exp + Pt_si * (exp * tr_exp_m1 * dtr_dgam * dgam_d[1] +
+                                  tr_exp * ln_tr * dexp_dgam * dgam_d[1]) / self._P_to_si,  # dPs/dPt
+                Pt_si * exp * tr_exp_m1 * dtr_dMN * self._P_from_si,  # dPs/dMN
+                0.0,  # dPs/dW
+                Pt_si * (exp * tr_exp_m1 * dtr_dgam * dgam_d[4] +
+                         tr_exp * ln_tr * dexp_dgam * dgam_d[4]) * self._P_from_si  # dPs/dFAR
+            ]) * self._P_to_si  # Convert to SI for chain rule
 
-            dPs_dTt = Pt_si * (
-                exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dTt +
-                temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dTt
-            ) * self._P_from_si  # Convert P_si to P_input (was incorrectly / _T_to_si)
-
-            dPs_dMN = Pt_si * exp * temp_ratio ** (exp - 1) * dtr_dMN * self._P_from_si  # Convert P_si to P_input
-
-            # d(Ps)/dFAR through gamma dependency
-            dPs_dFAR = Pt_si * (
-                exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dFAR +
-                temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dFAR
-            ) * self._P_from_si
-
-        # Get static properties and their gradients at (Ts, Ps, FAR)
+        # Get static property gradients at (Ts, Ps, FAR)
         with _profile_section(p, 'grad_static'):
             x_stat = np.array([FAR, float(Ps_si), float(Ts_si)])
             grad_hs = self._interps['h'].gradient(x_stat)
@@ -850,20 +842,17 @@ class TabularThermo(ThermoInterface):
             grad_Cps = self._interps['Cp'].gradient(x_stat)
             grad_Cvs = self._interps['Cv'].gradient(x_stat)
             grad_Rs = self._interps['R'].gradient(x_stat)
-            grad_rhos = self._interps['rho'].gradient(x_stat)
 
         # Static property values - use sprops if provided, else look up
         with _profile_section(p, 'lookup_total'):
             if sprops is not None:
-                # Use pre-computed values from forward pass (convert to SI)
                 hs_si = sprops.hs * self._h_to_si
                 Ss_si = sprops.S * self._S_to_si
-                gam_s = sprops.gamma  # dimensionless
+                gam_s = sprops.gamma
                 Cp_s = sprops.Cp * self._S_to_si
                 Cv_s = sprops.Cv * self._S_to_si
                 R_s = sprops.R * self._S_to_si
             else:
-                # Look up from tables
                 hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
                 Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
                 gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
@@ -877,26 +866,68 @@ class TabularThermo(ThermoInterface):
         rhos_si = Ps_si / (R_s * Ts_si)
         area_si = W_si / (rhos_si * V_si) if V_si > 0 else np.inf
 
-        # Store cached values needed for Jacobian computation
-        # Only store values actually used by _compute_full_jacobian_static_MN
-        self._static_MN_cache = {
-            # Intermediate values used for flow derivatives
-            'MN': MN, 'W_si': W_si,
-            'Ts_si': Ts_si, 'Ps_si': Ps_si,
-            'gam_s': gam_s, 'R_s': R_s,
-            'Vsonic_si': Vsonic_si, 'V_si': V_si, 'rhos_si': rhos_si,
-            # Gradients of Ts, Ps w.r.t. inputs (in input units)
-            'dTs_dTt': dTs_dTt, 'dTs_dPt': dTs_dPt, 'dTs_dMN': dTs_dMN, 'dTs_dFAR': dTs_dFAR,
-            'dPs_dTt': dPs_dTt, 'dPs_dPt': dPs_dPt, 'dPs_dMN': dPs_dMN, 'dPs_dFAR': dPs_dFAR,
-            # Gradients of static properties w.r.t. (FAR, Ps, Ts) in SI
-            'grad_hs': grad_hs, 'grad_Ss': grad_Ss, 'grad_gams': grad_gams,
-            'grad_Cps': grad_Cps, 'grad_Cvs': grad_Cvs, 'grad_Rs': grad_Rs,
-        }
-
-        # Compute full Jacobian matrix directly (13 outputs x 5 inputs)
-        # This avoids calling jvp_static_MN 5 times with basis vectors
+        # Compute full Jacobian inline (no cache needed)
         with _profile_section(p, 'jacobian'):
-            self._compute_full_jacobian_static_MN()
+            # Chain rule helper: dProp/dX = grad[2]*dTs/dX + grad[1]*dPs/dX + grad[0]*dFAR/dX
+            FAR_derivs = np.array([0.0, 0.0, 0.0, 0.0, 1.0])
+
+            def chain_rule(grad):
+                return grad[2] * dTs_d + grad[1] * dPs_d + grad[0] * FAR_derivs
+
+            # Tabular property derivatives
+            dhs_d = chain_rule(grad_hs) * self._h_from_si
+            dSs_d = chain_rule(grad_Ss) * self._S_from_si
+            dgams_d = chain_rule(grad_gams)
+            dCps_d = chain_rule(grad_Cps) * self._S_from_si
+            dCvs_d = chain_rule(grad_Cvs) * self._S_from_si
+            dRs_d_si = chain_rule(grad_Rs)
+            dRs_d = dRs_d_si * self._S_from_si
+
+            # Vsonic = sqrt(gam_s * R_s * Ts)
+            if Vsonic_si > 0:
+                dVsonic_d_si = (R_s * Ts_si * dgams_d + gam_s * Ts_si * dRs_d_si +
+                                gam_s * R_s * dTs_d) / (2 * Vsonic_si)
+            else:
+                dVsonic_d_si = np.zeros(5)
+            dVsonic_d = dVsonic_d_si * self._V_from_si
+
+            # V = MN * Vsonic
+            dMN_d = np.array([0.0, 0.0, 1.0, 0.0, 0.0])
+            dV_d_si = dMN_d * Vsonic_si + MN * dVsonic_d_si
+            dV_d = dV_d_si * self._V_from_si
+
+            # rhos = Ps / (R_s * Ts)
+            drhos_d_si = (dPs_d / (R_s * Ts_si) -
+                          Ps_si * dRs_d_si / (R_s ** 2 * Ts_si) -
+                          Ps_si * dTs_d / (R_s * Ts_si ** 2))
+            drhos_d = drhos_d_si * self._rho_from_si
+
+            # area = W / (rhos * V)
+            dW_d_si = np.array([0.0, 0.0, 0.0, self._W_to_si, 0.0])
+            if V_si > 0 and rhos_si > 0:
+                darea_d_si = (dW_d_si / (rhos_si * V_si) -
+                              W_si * drhos_d_si / (rhos_si ** 2 * V_si) -
+                              W_si * dV_d_si / (rhos_si * V_si ** 2))
+            else:
+                darea_d_si = np.zeros(5)
+            darea_d = darea_d_si * self._area_from_si
+
+            # Store Jacobian
+            self._jacobian_static_MN = {
+                'Ts': dTs_d * self._T_from_si,
+                'Ps': dPs_d * self._P_from_si,
+                'hs': dhs_d,
+                'rhos': drhos_d,
+                'MN': dMN_d,
+                'V': dV_d,
+                'Vsonic': dVsonic_d,
+                'area': darea_d,
+                'gamma': dgams_d,
+                'Cp': dCps_d,
+                'Cv': dCvs_d,
+                'S': dSs_d,
+                'R': dRs_d,
+            }
 
         p['calls'] += 1
         p['total_time'] += time.perf_counter() - t_start
@@ -908,94 +939,6 @@ class TabularThermo(ThermoInterface):
             gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=Ss_si, R=R_s
         )
         return self._convert_static_props_from_si(props_si)
-
-    def _compute_full_jacobian_static_MN(self):
-        """Compute and cache the full Jacobian for static_from_MN."""
-        c = self._static_MN_cache
-
-        # Build intermediate Jacobian: d[Ts_si, Ps_si]/d[Tt, Pt, MN, W, FAR]
-        # Shape: (2, 5) - but we compute in input units then convert
-        dTs_d = np.array([c['dTs_dTt'], c['dTs_dPt'], c['dTs_dMN'], 0.0, c['dTs_dFAR']]) * self._T_to_si
-        dPs_d = np.array([c['dPs_dTt'], c['dPs_dPt'], c['dPs_dMN'], 0.0, c['dPs_dFAR']]) * self._P_to_si
-
-        # Property gradients: grad[i] = (dProp/dFAR, dProp/dPs, dProp/dTs) in SI
-        # Chain rule: dProp/dX = grad[2]*dTs/dX + grad[1]*dPs/dX + grad[0]*dFAR/dX
-        def chain_rule_vec(grad):
-            # Returns array of 5 derivatives w.r.t. [Tt, Pt, MN, W, FAR]
-            FAR_derivs = np.array([0.0, 0.0, 0.0, 0.0, 1.0])  # d(FAR)/d[Tt,Pt,MN,W,FAR]
-            return grad[2] * dTs_d + grad[1] * dPs_d + grad[0] * FAR_derivs
-
-        # Compute derivatives for tabular properties
-        dhs_d = chain_rule_vec(c['grad_hs']) * self._h_from_si
-        dSs_d = chain_rule_vec(c['grad_Ss']) * self._S_from_si
-        dgams_d = chain_rule_vec(c['grad_gams'])
-        dCps_d = chain_rule_vec(c['grad_Cps']) * self._S_from_si
-        dCvs_d = chain_rule_vec(c['grad_Cvs']) * self._S_from_si
-        dRs_d = chain_rule_vec(c['grad_Rs']) * self._S_from_si
-
-        # Flow variable derivatives (more complex chain rules)
-        gam_s, R_s, Ts_si = c['gam_s'], c['R_s'], c['Ts_si']
-        Vsonic = c['Vsonic_si']
-        Ps_si, rhos_si = c['Ps_si'], c['rhos_si']
-        W_si, V_si = c['W_si'], c['V_si']
-        MN = c['MN']
-
-        # Vsonic = sqrt(gam_s * R_s * Ts)
-        # dVsonic = (R_s*Ts*dgam_s + gam_s*Ts*dR_s + gam_s*R_s*dTs) / (2*Vsonic)
-        if Vsonic > 0:
-            dgams_d_si = chain_rule_vec(c['grad_gams'])  # dimensionless
-            dRs_d_si = chain_rule_vec(c['grad_Rs'])  # SI
-            dVsonic_d_si = (R_s * Ts_si * dgams_d_si + gam_s * Ts_si * dRs_d_si +
-                           gam_s * R_s * dTs_d) / (2 * Vsonic)
-        else:
-            dVsonic_d_si = np.zeros(5)
-        dVsonic_d = dVsonic_d_si * self._V_from_si
-
-        # V = MN * Vsonic
-        # dV/d[Tt,Pt,MN,W,FAR] = dMN/d* * Vsonic + MN * dVsonic/d*
-        dMN_d = np.array([0.0, 0.0, 1.0, 0.0, 0.0])  # MN is direct input
-        dV_d_si = dMN_d * Vsonic + MN * dVsonic_d_si
-        dV_d = dV_d_si * self._V_from_si
-
-        # rhos = Ps / (R_s * Ts)
-        # drhos = dPs/(R*T) - Ps*dR/(R^2*T) - Ps*dT/(R*T^2)
-        dRs_d_si = chain_rule_vec(c['grad_Rs'])
-        drhos_d_si = (dPs_d / (R_s * Ts_si) -
-                      Ps_si * dRs_d_si / (R_s ** 2 * Ts_si) -
-                      Ps_si * dTs_d / (R_s * Ts_si ** 2))
-        drhos_d = drhos_d_si * self._rho_from_si
-
-        # area = W / (rhos * V)
-        # darea = dW/(rhos*V) - W*drhos/(rhos^2*V) - W*dV/(rhos*V^2)
-        dW_d_si = np.array([0.0, 0.0, 0.0, self._W_to_si, 0.0])  # W is direct input
-        if V_si > 0 and rhos_si > 0:
-            darea_d_si = (dW_d_si / (rhos_si * V_si) -
-                          W_si * drhos_d_si / (rhos_si ** 2 * V_si) -
-                          W_si * dV_d_si / (rhos_si * V_si ** 2))
-        else:
-            darea_d_si = np.zeros(5)
-        darea_d = darea_d_si * self._area_from_si
-
-        # Ts, Ps derivatives in output units
-        dTs_d_out = dTs_d * self._T_from_si
-        dPs_d_out = dPs_d * self._P_from_si
-
-        # Store full Jacobian as dict of arrays (each array is 5 derivatives)
-        self._jacobian_static_MN = {
-            'Ts': dTs_d_out,
-            'Ps': dPs_d_out,
-            'hs': dhs_d,
-            'rhos': drhos_d,
-            'MN': dMN_d,
-            'V': dV_d,
-            'Vsonic': dVsonic_d,
-            'area': darea_d,
-            'gamma': dgams_d,
-            'Cp': dCps_d,
-            'Cv': dCvs_d,
-            'S': dSs_d,
-            'R': dRs_d,
-        }
 
     def get_jacobian_static_MN(self):
         """
