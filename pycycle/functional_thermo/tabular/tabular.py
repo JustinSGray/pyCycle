@@ -331,6 +331,8 @@ class TabularThermo(ThermoInterface):
     def T_from_hP(self, h_target, P, FAR=None):
         """Solve for temperature given enthalpy and pressure.
 
+        Uses Newton's method with analytical derivatives for fast convergence.
+
         Parameters
         ----------
         h_target : float
@@ -351,17 +353,76 @@ class TabularThermo(ThermoInterface):
         h_si = h_target * self._h_to_si
         P_si = P * self._P_to_si
 
-        def residual(T_si):
-            return float(self._lookup_si('h', T_si, P_si, FAR)) - float(h_si)
-
-        T_min, T_max = 150.0, 2500.0
-        T_si = brentq(residual, T_min, T_max, xtol=1e-10)
+        T_si = self._T_from_hP_si(h_si, P_si, FAR)
 
         # Convert output from SI
         return self._convert_T_from_si(T_si)
 
+    def _T_from_hP_si(self, h_target_si, P_si, FAR):
+        """Solve for temperature given enthalpy and pressure (SI units).
+
+        Uses Newton's method with analytical derivatives.
+
+        Parameters
+        ----------
+        h_target_si : float
+            Target enthalpy in SI (J/kg)
+        P_si : float
+            Pressure in SI (Pa)
+        FAR : float
+            Fuel-to-air ratio
+
+        Returns
+        -------
+        float
+            Temperature in SI (K)
+        """
+        # Initial guess: use Cp to estimate T from enthalpy
+        # h ≈ Cp * T, so T ≈ h / Cp
+        # Use a mid-range Cp estimate (~1000 J/kg/K for air)
+        T = max(300.0, min(2000.0, abs(h_target_si) / 1000.0 + 300.0))
+
+        max_iter = 20
+        tol = 1e-10
+
+        for _ in range(max_iter):
+            x = np.array([FAR, float(P_si), float(T)])
+
+            # Get h and dh/dT
+            h = self._interps['h'].interpolate(x)[0]
+            grad_h = self._interps['h'].gradient(x)  # (dh/dFAR, dh/dP, dh/dT)
+            dh_dT = grad_h[2]
+
+            # Residual and derivative
+            residual = h - h_target_si
+
+            # Check convergence (relative tolerance)
+            if abs(residual) < tol * abs(h_target_si) or abs(residual) < 1e-6:
+                break
+
+            # Newton update
+            if abs(dh_dT) < 1e-30:
+                break  # Derivative too small
+
+            dT = -residual / dh_dT
+
+            # Update with bounds enforcement
+            T_new = T + dT
+            T_new = max(160.0, min(2400.0, T_new))
+
+            # Check for stagnation
+            if abs(T_new - T) < 1e-12:
+                T = T_new
+                break
+
+            T = T_new
+
+        return T
+
     def T_from_SP(self, S_target, P, FAR=None):
         """Solve for temperature given entropy and pressure.
+
+        Uses Newton's method with analytical derivatives for fast convergence.
 
         Parameters
         ----------
@@ -383,11 +444,7 @@ class TabularThermo(ThermoInterface):
         S_si = S_target * self._S_to_si
         P_si = P * self._P_to_si
 
-        def residual(T_si):
-            return float(self._lookup_si('S', T_si, P_si, FAR)) - float(S_si)
-
-        T_min, T_max = 150.0, 2500.0
-        T_si = brentq(residual, T_min, T_max, xtol=1e-10)
+        T_si = self._T_from_SP_si(S_si, P_si, FAR)
 
         return self._convert_T_from_si(T_si)
 
@@ -395,9 +452,9 @@ class TabularThermo(ThermoInterface):
     # Static property calculations
     # =========================================================================
 
-    def _isentropic_relations(self, Tt, Pt, MN, gamma):
+    def _ideal_gas_Ps_guess(self, Tt, Pt, MN, gamma):
         """
-        Compute static T and P from isentropic flow relations.
+        Compute initial guess for static pressure using ideal gas isentropic relations.
 
         Parameters
         ----------
@@ -408,25 +465,26 @@ class TabularThermo(ThermoInterface):
         MN : float
             Mach number
         gamma : float
-            Ratio of specific heats
+            Ratio of specific heats (at total conditions)
 
         Returns
         -------
-        Ts : float
-            Static temperature
         Ps : float
-            Static pressure
-        temp_ratio : float
-            Ts/Tt ratio (useful for derivatives)
+            Initial guess for static pressure
         """
         gm1 = gamma - 1.0
         temp_ratio = 1.0 / (1.0 + gm1 / 2.0 * MN**2)
-        Ts = Tt * temp_ratio
-        Ps = Pt * temp_ratio ** (gamma / gm1)
-        return Ts, Ps, temp_ratio
+        return Pt * temp_ratio ** (gamma / gm1)
 
     def _static_from_MN_si(self, Tt_si, Pt_si, MN, W_si, FAR=None):
         """Compute static properties in SI units.
+
+        Uses the same physics as the original pyCycle:
+        1. Energy conservation: ht = hs + V²/2 where V = MN * Vsonic
+        2. Entropy conservation: S(Ts, Ps) = S_total (isentropic process)
+
+        Uses a 2D Newton solver on (Ts, Ps) with analytical Jacobians for
+        fast quadratic convergence.
 
         Parameters
         ----------
@@ -443,15 +501,118 @@ class TabularThermo(ThermoInterface):
         """
         FAR = self._get_FAR(FAR)
 
-        # Get gamma at total conditions (in SI)
-        gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
+        # Get total properties
+        ht = self._lookup_si('h', Tt_si, Pt_si, FAR)
+        S_total = self._lookup_si('S', Tt_si, Pt_si, FAR)
+        gamma_t = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
 
-        # Isentropic relations
-        Ts, Ps, _ = self._isentropic_relations(Tt_si, Pt_si, MN, gam)
+        # Handle zero Mach number case (no flow, static = total)
+        if MN < 1e-10:
+            hs = ht
+            Ts = Tt_si
+            Ps = Pt_si
+            gam_s = gamma_t
+            R_s = self._lookup_si('R', Ts, Ps, FAR)
+            Cp_s = self._lookup_si('Cp', Ts, Ps, FAR)
+            Cv_s = self._lookup_si('Cv', Ts, Ps, FAR)
+            rhos = Ps / (R_s * Ts)
+            return StaticProps(Ts=Ts, Ps=Ps, hs=hs, rhos=rhos,
+                              MN=MN, V=0.0, Vsonic=np.sqrt(gam_s * R_s * Ts), area=np.inf,
+                              gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
 
-        # Full static properties at static T and P
+        # Initial guesses using ideal gas isentropic relations
+        Ps_guess = self._ideal_gas_Ps_guess(Tt_si, Pt_si, MN, gamma_t)
+        # Ts from isentropic relation: Ts/Tt = (Ps/Pt)^((gamma-1)/gamma)
+        Ts_guess = Tt_si * (Ps_guess / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+
+        MN_sq = MN ** 2
+
+        # 2D Newton solver for coupled (Ts, Ps) system
+        # Residuals:
+        #   R1 = S(Ts, Ps) - S_total = 0  (entropy conservation)
+        #   R2 = hs + MN²·γ·R·Ts/2 - ht = 0  (energy conservation)
+        Ts = Ts_guess
+        Ps = Ps_guess
+
+        max_iter = 20
+        tol = 1e-10
+
+        for _ in range(max_iter):
+            # Evaluate properties and gradients at current (Ts, Ps)
+            x = np.array([FAR, float(Ps), float(Ts)])
+
+            # Get values
+            S_s = self._interps['S'].interpolate(x)[0]
+            hs = self._interps['h'].interpolate(x)[0]
+            gamma_s = self._interps['gamma'].interpolate(x)[0]
+            R_s = self._interps['R'].interpolate(x)[0]
+
+            # Compute residuals
+            # R1: entropy conservation (normalized)
+            R1 = (S_s - S_total) / S_total
+
+            # R2: energy conservation (normalized)
+            # ht = hs + MN² * gamma_s * R_s * Ts / 2
+            kinetic = MN_sq * gamma_s * R_s * Ts / 2.0
+            ht_calc = hs + kinetic
+            R2 = (ht_calc - ht) / ht
+
+            # Check convergence
+            if abs(R1) < tol and abs(R2) < tol:
+                break
+
+            # Get gradients: (d/dFAR, d/dPs, d/dTs)
+            grad_S = self._interps['S'].gradient(x)
+            grad_h = self._interps['h'].gradient(x)
+            grad_gamma = self._interps['gamma'].gradient(x)
+            grad_R = self._interps['R'].gradient(x)
+
+            # Jacobian of residuals w.r.t. (Ts, Ps)
+            # dR1/dTs = (dS/dTs) / S_total
+            # dR1/dPs = (dS/dPs) / S_total
+            dR1_dTs = grad_S[2] / S_total
+            dR1_dPs = grad_S[1] / S_total
+
+            # dR2/dTs = (dhs/dTs + MN²/2 * (dγ/dTs·R·Ts + γ·dR/dTs·Ts + γ·R)) / ht
+            # dR2/dPs = (dhs/dPs + MN²/2 * (dγ/dPs·R·Ts + γ·dR/dPs·Ts)) / ht
+            dkinetic_dTs = MN_sq / 2.0 * (
+                grad_gamma[2] * R_s * Ts + gamma_s * grad_R[2] * Ts + gamma_s * R_s
+            )
+            dkinetic_dPs = MN_sq / 2.0 * (
+                grad_gamma[1] * R_s * Ts + gamma_s * grad_R[1] * Ts
+            )
+
+            dR2_dTs = (grad_h[2] + dkinetic_dTs) / ht
+            dR2_dPs = (grad_h[1] + dkinetic_dPs) / ht
+
+            # Solve 2x2 linear system: J @ [dTs, dPs]^T = -[R1, R2]^T
+            det = dR1_dTs * dR2_dPs - dR1_dPs * dR2_dTs
+            if abs(det) < 1e-30:
+                # Jacobian is singular, fall back to brentq
+                break
+
+            # Cramer's rule
+            dTs = (-R1 * dR2_dPs + R2 * dR1_dPs) / det
+            dPs = (-R2 * dR1_dTs + R1 * dR2_dTs) / det
+
+            # Apply Newton update with damping to stay in valid range
+            alpha = 1.0
+            Ts_new = Ts + alpha * dTs
+            Ps_new = Ps + alpha * dPs
+
+            # Clamp to valid ranges
+            Ts_new = max(160.0, min(2400.0, Ts_new))
+            Ps_new = max(Pt_si * 0.001, min(Pt_si * 0.9999, Ps_new))
+
+            # Check for stagnation
+            if abs(Ts_new - Ts) < 1e-12 and abs(Ps_new - Ps) < 1e-12:
+                Ts, Ps = Ts_new, Ps_new
+                break
+
+            Ts, Ps = Ts_new, Ps_new
+
+        # Compute all static properties at converged (Ts, Ps)
         hs = self._lookup_si('h', Ts, Ps, FAR)
-        S_s = self._lookup_si('S', Ts, Ps, FAR)
         gam_s = self._lookup_si('gamma', Ts, Ps, FAR)
         Cp_s = self._lookup_si('Cp', Ts, Ps, FAR)
         Cv_s = self._lookup_si('Cv', Ts, Ps, FAR)
@@ -469,7 +630,66 @@ class TabularThermo(ThermoInterface):
 
         return StaticProps(Ts=Ts, Ps=Ps, hs=hs, rhos=rhos,
                           MN=MN, V=V, Vsonic=Vsonic, area=area,
-                          gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_s, R=R_s)
+                          gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
+
+    def _T_from_SP_si(self, S_target_si, P_si, FAR):
+        """Solve for temperature given entropy and pressure (SI units).
+
+        Uses Newton's method with analytical derivatives.
+
+        Parameters
+        ----------
+        S_target_si : float
+            Target entropy in SI (J/kg/K)
+        P_si : float
+            Pressure in SI (Pa)
+        FAR : float
+            Fuel-to-air ratio
+
+        Returns
+        -------
+        float
+            Temperature in SI (K)
+        """
+        # Initial guess: mid-range temperature
+        T = 800.0
+
+        max_iter = 20
+        tol = 1e-10
+
+        for _ in range(max_iter):
+            x = np.array([FAR, float(P_si), float(T)])
+
+            # Get S and dS/dT
+            S = self._interps['S'].interpolate(x)[0]
+            grad_S = self._interps['S'].gradient(x)  # (dS/dFAR, dS/dP, dS/dT)
+            dS_dT = grad_S[2]
+
+            # Residual
+            residual = S - S_target_si
+
+            # Check convergence (relative tolerance)
+            if abs(residual) < tol * abs(S_target_si) or abs(residual) < 1e-6:
+                break
+
+            # Newton update
+            if abs(dS_dT) < 1e-30:
+                break  # Derivative too small
+
+            dT = -residual / dS_dT
+
+            # Update with bounds enforcement
+            T_new = T + dT
+            T_new = max(160.0, min(2400.0, T_new))
+
+            # Check for stagnation
+            if abs(T_new - T) < 1e-12:
+                T = T_new
+                break
+
+            T = T_new
+
+        return T
 
     def static_from_MN(self, Tt, Pt, MN, W, FAR=None):
         """Compute static properties from total conditions and Mach number.
@@ -627,70 +847,20 @@ class TabularThermo(ThermoInterface):
         """
         Compute area and d(area)/d(MN) at given conditions.
 
+        Uses the new physics (_static_from_MN_si with energy/entropy constraints)
+        and computes d(area)/d(MN) numerically via finite difference.
+
         Returns area, darea_dMN, and full static props (to avoid recomputation).
         """
-        # Get gamma at total conditions
-        gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
+        # Compute static properties at current MN
+        props_si = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si, FAR)
+        area = props_si.area
 
-        # Isentropic relations
-        Ts, Ps, temp_ratio = self._isentropic_relations(Tt_si, Pt_si, MN, gam)
-        MN2 = MN ** 2
-        gm1 = gam - 1.0
-        denom = 1.0 + gm1 / 2.0 * MN2
-        exp = gam / gm1
-
-        # Static properties
-        gam_s = self._lookup_si('gamma', Ts, Ps, FAR)
-        R_s = self._lookup_si('R', Ts, Ps, FAR)
-
-        # Flow properties
-        Vsonic = np.sqrt(gam_s * R_s * Ts)
-        V = MN * Vsonic
-        rhos = Ps / (R_s * Ts)
-        area = W_si / (rhos * V) if V > 0 else np.inf
-
-        # Compute d(area)/d(MN) analytically
-        # area = W / (rhos * V) = W * R_s * Ts / (Ps * V)
-        # V = MN * Vsonic
-        # Need: d(area)/d(MN) = d(area)/d(Ts)*d(Ts)/d(MN) + d(area)/d(Ps)*d(Ps)/d(MN) + d(area)/d(V)*d(V)/d(MN)
-
-        # Derivatives of temp_ratio w.r.t. MN
-        dtr_dMN = -gm1 * MN / (denom ** 2)
-
-        # d(Ts)/d(MN) = Tt * d(temp_ratio)/d(MN)
-        dTs_dMN = Tt_si * dtr_dMN
-
-        # d(Ps)/d(MN) = Pt * exp * temp_ratio^(exp-1) * d(temp_ratio)/d(MN)
-        dPs_dMN = Pt_si * exp * temp_ratio ** (exp - 1) * dtr_dMN
-
-        # d(Vsonic)/d(MN) ≈ 0.5 * Vsonic / Ts * dTs_dMN (ignoring gamma_s, R_s dependence on Ts, Ps)
-        # More accurate: Vsonic = sqrt(gam_s * R_s * Ts)
-        # d(Vsonic)/d(MN) = 0.5/Vsonic * (gam_s * R_s * dTs_dMN) = 0.5 * Vsonic / Ts * dTs_dMN
-        dVsonic_dMN = 0.5 * Vsonic / Ts * dTs_dMN if Ts > 0 else 0.0
-
-        # d(V)/d(MN) = Vsonic + MN * d(Vsonic)/d(MN)
-        dV_dMN = Vsonic + MN * dVsonic_dMN
-
-        # d(rhos)/d(MN) = d(Ps/R_s/Ts)/d(MN) ≈ (dPs_dMN - Ps/Ts*dTs_dMN) / (R_s * Ts)
-        # Ignoring R_s dependence on static conditions
-        drhos_dMN = (dPs_dMN / (R_s * Ts) - Ps * dTs_dMN / (R_s * Ts ** 2))
-
-        # d(area)/d(MN) = -W / (rhos * V)^2 * (drhos_dMN * V + rhos * dV_dMN)
-        #               = -area / (rhos * V) * (drhos_dMN * V + rhos * dV_dMN)
-        if V > 0 and rhos > 0:
-            darea_dMN = -W_si / (rhos ** 2 * V ** 2) * (drhos_dMN * V + rhos * dV_dMN)
-        else:
-            darea_dMN = 0.0
-
-        # Build full props for return (avoid recomputing later)
-        hs = self._lookup_si('h', Ts, Ps, FAR)
-        S_s = self._lookup_si('S', Ts, Ps, FAR)
-        Cp_s = self._lookup_si('Cp', Ts, Ps, FAR)
-        Cv_s = self._lookup_si('Cv', Ts, Ps, FAR)
-
-        props_si = StaticProps(Ts=Ts, Ps=Ps, hs=hs, rhos=rhos,
-                               MN=MN, V=V, Vsonic=Vsonic, area=area,
-                               gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_s, R=R_s)
+        # Compute d(area)/d(MN) via finite difference
+        eps = 1e-6
+        MN_pert = MN + eps
+        props_pert = self._static_from_MN_si(Tt_si, Pt_si, MN_pert, W_si, FAR)
+        darea_dMN = (props_pert.area - area) / eps
 
         return area, darea_dMN, props_si
 
@@ -732,16 +902,15 @@ class TabularThermo(ThermoInterface):
 
     def linearize_static_MN(self, Tt, Pt, MN, W, FAR=None, sprops=None):
         """
-        Compute static properties and cache gradients for static_from_MN.
+        Compute static properties and cache analytical gradients for static_from_MN.
 
-        This combines the forward pass and linearization into one call,
-        avoiding duplicate lookups when both are needed.
+        Uses the implicit function theorem to compute derivatives through the
+        energy and entropy constraints:
+        - F(Ts, Ps) = S(Ts, Ps) - S_total = 0 (entropy constraint)
+        - G(Ts, Ps) = hs + MN²*gamma*R*Ts/2 - ht = 0 (energy constraint)
 
-        The static_from_MN calculation is explicit (no solver), so we can
-        differentiate directly using the chain rule through:
-        1. Isentropic relations: Ts(Tt, MN, gamma), Ps(Pt, MN, gamma)
-        2. Property lookups at (Ts, Ps, FAR)
-        3. Flow relations: V, Vsonic, rhos, area
+        The Jacobian of (Ts, Ps) w.r.t. inputs is computed analytically using
+        the interpolator's gradient() method.
 
         Parameters
         ----------
@@ -757,7 +926,7 @@ class TabularThermo(ThermoInterface):
             Fuel-to-air ratio. If None, uses the instance's FAR.
         sprops : StaticProps, optional
             Pre-computed static properties from forward pass. If provided,
-            skips the static property value lookups (only computes gradients).
+            uses these for the primal values.
 
         Returns
         -------
@@ -773,172 +942,199 @@ class TabularThermo(ThermoInterface):
         Pt_si = Pt * self._P_to_si
         W_si = W * self._W_to_si
 
-        # Get gamma at total conditions
-        with _profile_section(p, 'lookup_total'):
-            gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
+        # Compute primal static properties if not provided
+        if sprops is not None:
+            props = sprops
+            Ts_si = self._convert_T_to_si(props.Ts)
+            Ps_si = props.Ps * self._P_to_si
+        else:
+            props = self.static_from_MN(Tt, Pt, MN, W, FAR)
+            Ts_si = self._convert_T_to_si(props.Ts)
+            Ps_si = props.Ps * self._P_to_si
 
-        # Linearize at total conditions for dgamma/dTt, dgamma/dPt, dgamma/dFAR
-        with _profile_section(p, 'grad_total'):
-            x_tot = np.array([FAR, float(Pt_si), float(Tt_si)])
-            grad_gam_tot = self._interps['gamma'].gradient(x_tot)  # (dg/dFAR, dg/dP, dg/dT)
+        # Get total properties and their gradients
+        x_tot = np.array([FAR, float(Pt_si), float(Tt_si)])
+        ht_si = self._interps['h'].interpolate(x_tot)[0]
+        S_total = self._interps['S'].interpolate(x_tot)[0]
 
-        # Gamma derivatives in input units
-        dgam_d = np.array([
-            grad_gam_tot[2] * self._T_to_si,  # dgam/dTt
-            grad_gam_tot[1] * self._P_to_si,  # dgam/dPt
-            0.0,                               # dgam/dMN
-            0.0,                               # dgam/dW
-            grad_gam_tot[0]                    # dgam/dFAR (dimensionless)
-        ])
+        grad_ht_tot = self._interps['h'].gradient(x_tot)  # (dh/dFAR, dh/dP, dh/dT)
+        grad_S_tot = self._interps['S'].gradient(x_tot)   # (dS/dFAR, dS/dP, dS/dT)
 
-        # Isentropic relations and their derivatives
-        with _profile_section(p, 'isentropic'):
-            MN2 = MN ** 2
-            gm1 = gam - 1.0
-            denom = 1.0 + gm1 / 2.0 * MN2
-            temp_ratio = 1.0 / denom
-            exp = gam / gm1
+        # Get static properties and their gradients at (Ts, Ps, FAR)
+        x_stat = np.array([FAR, float(Ps_si), float(Ts_si)])
+        hs_si = self._interps['h'].interpolate(x_stat)[0]
+        gamma_s = self._interps['gamma'].interpolate(x_stat)[0]
+        R_s = self._interps['R'].interpolate(x_stat)[0]
 
-            Ts_si = Tt_si * temp_ratio
-            Ps_si = Pt_si * temp_ratio ** exp
+        grad_hs = self._interps['h'].gradient(x_stat)      # (dhs/dFAR, dhs/dPs, dhs/dTs)
+        grad_Ss = self._interps['S'].gradient(x_stat)      # (dSs/dFAR, dSs/dPs, dSs/dTs)
+        grad_gams = self._interps['gamma'].gradient(x_stat)
+        grad_Rs = self._interps['R'].gradient(x_stat)
+        grad_Cps = self._interps['Cp'].gradient(x_stat)
+        grad_Cvs = self._interps['Cv'].gradient(x_stat)
 
-            # Derivatives of temp_ratio: dtr/dMN and dtr/dgam
-            dtr_dMN = -gm1 * MN / (denom ** 2)
-            dtr_dgam = -MN2 / (2.0 * denom ** 2)
+        MN_sq = MN ** 2
 
-            # Build dTs_d array directly: [dTs/dTt, dTs/dPt, dTs/dMN, dTs/dW, dTs/dFAR]
-            # Ts = Tt * temp_ratio, temp_ratio depends on gam which depends on Tt, Pt, FAR
-            dTs_d = np.array([
-                temp_ratio + Tt_si * dtr_dgam * dgam_d[0] / self._T_to_si,  # dTs/dTt
-                Tt_si * dtr_dgam * dgam_d[1] / self._P_to_si,               # dTs/dPt
-                Tt_si * dtr_dMN * self._T_from_si,                          # dTs/dMN
-                0.0,                                                         # dTs/dW
-                Tt_si * dtr_dgam * dgam_d[4] * self._T_from_si              # dTs/dFAR
-            ]) * self._T_to_si  # Convert to SI for chain rule
+        # Implicit constraints:
+        # F = S(Ts, Ps, FAR) - S_total(Tt, Pt, FAR) = 0
+        # G = hs(Ts, Ps, FAR) + MN²*gamma_s*R_s*Ts/2 - ht(Tt, Pt, FAR) = 0
+        #
+        # Jacobian of constraints w.r.t. (Ts, Ps):
+        # dF/dTs = dSs/dTs
+        # dF/dPs = dSs/dPs
+        # dG/dTs = dhs/dTs + MN²/2 * (dgamma/dTs * R_s * Ts + gamma_s * dR/dTs * Ts + gamma_s * R_s)
+        # dG/dPs = dhs/dPs + MN²/2 * (dgamma/dPs * R_s * Ts + gamma_s * dR/dPs * Ts)
 
-            # Build dPs_d array: Ps = Pt * temp_ratio^exp
-            dexp_dgam = -1.0 / (gm1 ** 2)
-            ln_tr = np.log(temp_ratio) if temp_ratio > 0 else 0.0
-            tr_exp = temp_ratio ** exp
-            tr_exp_m1 = temp_ratio ** (exp - 1)
+        dF_dTs = grad_Ss[2]  # dSs/dTs
+        dF_dPs = grad_Ss[1]  # dSs/dPs
 
-            dPs_d = np.array([
-                Pt_si * (exp * tr_exp_m1 * dtr_dgam * dgam_d[0] +
-                         tr_exp * ln_tr * dexp_dgam * dgam_d[0]) * self._P_from_si,  # dPs/dTt
-                tr_exp + Pt_si * (exp * tr_exp_m1 * dtr_dgam * dgam_d[1] +
-                                  tr_exp * ln_tr * dexp_dgam * dgam_d[1]) / self._P_to_si,  # dPs/dPt
-                Pt_si * exp * tr_exp_m1 * dtr_dMN * self._P_from_si,  # dPs/dMN
-                0.0,  # dPs/dW
-                Pt_si * (exp * tr_exp_m1 * dtr_dgam * dgam_d[4] +
-                         tr_exp * ln_tr * dexp_dgam * dgam_d[4]) * self._P_from_si  # dPs/dFAR
-            ]) * self._P_to_si  # Convert to SI for chain rule
+        kinetic_term = MN_sq * gamma_s * R_s * Ts_si / 2.0
+        dG_dTs = grad_hs[2] + MN_sq / 2.0 * (
+            grad_gams[2] * R_s * Ts_si + gamma_s * grad_Rs[2] * Ts_si + gamma_s * R_s
+        )
+        dG_dPs = grad_hs[1] + MN_sq / 2.0 * (
+            grad_gams[1] * R_s * Ts_si + gamma_s * grad_Rs[1] * Ts_si
+        )
 
-        # Get static property gradients at (Ts, Ps, FAR)
-        with _profile_section(p, 'grad_static'):
-            x_stat = np.array([FAR, float(Ps_si), float(Ts_si)])
-            grad_hs = self._interps['h'].gradient(x_stat)
-            grad_Ss = self._interps['S'].gradient(x_stat)
-            grad_gams = self._interps['gamma'].gradient(x_stat)
-            grad_Cps = self._interps['Cp'].gradient(x_stat)
-            grad_Cvs = self._interps['Cv'].gradient(x_stat)
-            grad_Rs = self._interps['R'].gradient(x_stat)
+        # Constraint Jacobian matrix
+        J_constraint = np.array([[dF_dTs, dF_dPs],
+                                  [dG_dTs, dG_dPs]])
 
-        # Static property values - use sprops if provided, else look up
-        with _profile_section(p, 'lookup_total'):
-            if sprops is not None:
-                hs_si = sprops.hs * self._h_to_si
-                Ss_si = sprops.S * self._S_to_si
-                gam_s = sprops.gamma
-                Cp_s = sprops.Cp * self._S_to_si
-                Cv_s = sprops.Cv * self._S_to_si
-                R_s = sprops.R * self._S_to_si
-            else:
-                hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
-                Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
-                gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
-                Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
-                Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
-                R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
+        # Invert the constraint Jacobian
+        det = dF_dTs * dG_dPs - dF_dPs * dG_dTs
+        if abs(det) > 1e-20:
+            J_inv = np.array([[dG_dPs, -dF_dPs],
+                              [-dG_dTs, dF_dTs]]) / det
+        else:
+            J_inv = np.zeros((2, 2))
 
-        # Flow calculations
-        Vsonic_si = np.sqrt(gam_s * R_s * Ts_si)
+        # Compute dTs, dPs w.r.t. each input using implicit function theorem:
+        # [dTs/dx, dPs/dx]^T = -J_inv @ [dF/dx, dG/dx]^T
+
+        # Derivatives w.r.t. Tt (in input units):
+        # dF/dTt = -dS_tot/dTt = -grad_S_tot[2] * T_to_si
+        # dG/dTt = -dht/dTt = -grad_ht_tot[2] * T_to_si
+        dF_dTt = -grad_S_tot[2] * self._T_to_si
+        dG_dTt = -grad_ht_tot[2] * self._T_to_si
+        d_dTt = -J_inv @ np.array([dF_dTt, dG_dTt])
+        dTs_dTt_si, dPs_dTt_si = d_dTt[0], d_dTt[1]
+
+        # Derivatives w.r.t. Pt (in input units):
+        dF_dPt = -grad_S_tot[1] * self._P_to_si
+        dG_dPt = -grad_ht_tot[1] * self._P_to_si
+        d_dPt = -J_inv @ np.array([dF_dPt, dG_dPt])
+        dTs_dPt_si, dPs_dPt_si = d_dPt[0], d_dPt[1]
+
+        # Derivatives w.r.t. MN:
+        # dF/dMN = 0
+        # dG/dMN = MN * gamma_s * R_s * Ts
+        dF_dMN = 0.0
+        dG_dMN = MN * gamma_s * R_s * Ts_si
+        d_dMN = -J_inv @ np.array([dF_dMN, dG_dMN])
+        dTs_dMN_si, dPs_dMN_si = d_dMN[0], d_dMN[1]
+
+        # Derivatives w.r.t. W:
+        # Neither F nor G depends on W directly
+        dTs_dW_si, dPs_dW_si = 0.0, 0.0
+
+        # Derivatives w.r.t. FAR:
+        # dF/dFAR = dSs/dFAR - dS_tot/dFAR = grad_Ss[0] - grad_S_tot[0]
+        # dG/dFAR = dhs/dFAR + MN²/2*(dgamma/dFAR*R*Ts + gamma*dR/dFAR*Ts) - dht/dFAR
+        dF_dFAR = grad_Ss[0] - grad_S_tot[0]
+        dG_dFAR = (grad_hs[0] +
+                   MN_sq / 2.0 * (grad_gams[0] * R_s * Ts_si + gamma_s * grad_Rs[0] * Ts_si) -
+                   grad_ht_tot[0])
+        d_dFAR = -J_inv @ np.array([dF_dFAR, dG_dFAR])
+        dTs_dFAR_si, dPs_dFAR_si = d_dFAR[0], d_dFAR[1]
+
+        # Build derivative arrays for Ts and Ps in input units
+        # [d/dTt, d/dPt, d/dMN, d/dW, d/dFAR]
+        dTs_d = np.array([dTs_dTt_si * self._T_from_si,
+                          dTs_dPt_si * self._T_from_si,
+                          dTs_dMN_si * self._T_from_si,
+                          dTs_dW_si * self._T_from_si,
+                          dTs_dFAR_si * self._T_from_si])
+        dPs_d = np.array([dPs_dTt_si * self._P_from_si,
+                          dPs_dPt_si * self._P_from_si,
+                          dPs_dMN_si * self._P_from_si,
+                          dPs_dW_si * self._P_from_si,
+                          dPs_dFAR_si * self._P_from_si])
+
+        # Now compute derivatives of all other properties using chain rule
+        # Property(Ts, Ps, FAR) -> dProp/dx = dProp/dTs * dTs/dx + dProp/dPs * dPs/dx + dProp/dFAR * dFAR/dx
+        FAR_derivs = np.array([0.0, 0.0, 0.0, 0.0, 1.0])
+
+        # Convert dTs_d and dPs_d to SI for chain rule with SI gradients
+        dTs_d_si = np.array([dTs_dTt_si, dTs_dPt_si, dTs_dMN_si, dTs_dW_si, dTs_dFAR_si])
+        dPs_d_si = np.array([dPs_dTt_si, dPs_dPt_si, dPs_dMN_si, dPs_dW_si, dPs_dFAR_si])
+
+        def chain_rule(grad):
+            """grad is (dProp/dFAR, dProp/dPs, dProp/dTs) in SI"""
+            return grad[2] * dTs_d_si + grad[1] * dPs_d_si + grad[0] * FAR_derivs
+
+        # Tabular property derivatives (in SI, then convert)
+        dhs_d = chain_rule(grad_hs) * self._h_from_si
+        dSs_d = chain_rule(grad_Ss) * self._S_from_si
+        dgams_d = chain_rule(grad_gams)
+        dCps_d = chain_rule(grad_Cps) * self._S_from_si
+        dCvs_d = chain_rule(grad_Cvs) * self._S_from_si
+        dRs_d_si = chain_rule(grad_Rs)
+        dRs_d = dRs_d_si * self._S_from_si
+
+        # Vsonic = sqrt(gamma_s * R_s * Ts)
+        Vsonic_si = np.sqrt(gamma_s * R_s * Ts_si)
+        if Vsonic_si > 0:
+            dVsonic_d_si = (R_s * Ts_si * dgams_d + gamma_s * Ts_si * dRs_d_si +
+                            gamma_s * R_s * dTs_d_si) / (2 * Vsonic_si)
+        else:
+            dVsonic_d_si = np.zeros(5)
+        dVsonic_d = dVsonic_d_si * self._V_from_si
+
+        # V = MN * Vsonic
+        dMN_d = np.array([0.0, 0.0, 1.0, 0.0, 0.0])
         V_si = MN * Vsonic_si
+        dV_d_si = dMN_d * Vsonic_si + MN * dVsonic_d_si
+        dV_d = dV_d_si * self._V_from_si
+
+        # rhos = Ps / (R_s * Ts)
         rhos_si = Ps_si / (R_s * Ts_si)
+        drhos_d_si = (dPs_d_si / (R_s * Ts_si) -
+                      Ps_si * dRs_d_si / (R_s ** 2 * Ts_si) -
+                      Ps_si * dTs_d_si / (R_s * Ts_si ** 2))
+        drhos_d = drhos_d_si * self._rho_from_si
+
+        # area = W / (rhos * V)
         area_si = W_si / (rhos_si * V_si) if V_si > 0 else np.inf
+        dW_d_si = np.array([0.0, 0.0, 0.0, self._W_to_si, 0.0])
+        if V_si > 0 and rhos_si > 0:
+            darea_d_si = (dW_d_si / (rhos_si * V_si) -
+                          W_si * drhos_d_si / (rhos_si ** 2 * V_si) -
+                          W_si * dV_d_si / (rhos_si * V_si ** 2))
+        else:
+            darea_d_si = np.zeros(5)
+        darea_d = darea_d_si * self._area_from_si
 
-        # Compute full Jacobian inline (no cache needed)
-        with _profile_section(p, 'jacobian'):
-            # Chain rule helper: dProp/dX = grad[2]*dTs/dX + grad[1]*dPs/dX + grad[0]*dFAR/dX
-            FAR_derivs = np.array([0.0, 0.0, 0.0, 0.0, 1.0])
-
-            def chain_rule(grad):
-                return grad[2] * dTs_d + grad[1] * dPs_d + grad[0] * FAR_derivs
-
-            # Tabular property derivatives
-            dhs_d = chain_rule(grad_hs) * self._h_from_si
-            dSs_d = chain_rule(grad_Ss) * self._S_from_si
-            dgams_d = chain_rule(grad_gams)
-            dCps_d = chain_rule(grad_Cps) * self._S_from_si
-            dCvs_d = chain_rule(grad_Cvs) * self._S_from_si
-            dRs_d_si = chain_rule(grad_Rs)
-            dRs_d = dRs_d_si * self._S_from_si
-
-            # Vsonic = sqrt(gam_s * R_s * Ts)
-            if Vsonic_si > 0:
-                dVsonic_d_si = (R_s * Ts_si * dgams_d + gam_s * Ts_si * dRs_d_si +
-                                gam_s * R_s * dTs_d) / (2 * Vsonic_si)
-            else:
-                dVsonic_d_si = np.zeros(5)
-            dVsonic_d = dVsonic_d_si * self._V_from_si
-
-            # V = MN * Vsonic
-            dMN_d = np.array([0.0, 0.0, 1.0, 0.0, 0.0])
-            dV_d_si = dMN_d * Vsonic_si + MN * dVsonic_d_si
-            dV_d = dV_d_si * self._V_from_si
-
-            # rhos = Ps / (R_s * Ts)
-            drhos_d_si = (dPs_d / (R_s * Ts_si) -
-                          Ps_si * dRs_d_si / (R_s ** 2 * Ts_si) -
-                          Ps_si * dTs_d / (R_s * Ts_si ** 2))
-            drhos_d = drhos_d_si * self._rho_from_si
-
-            # area = W / (rhos * V)
-            dW_d_si = np.array([0.0, 0.0, 0.0, self._W_to_si, 0.0])
-            if V_si > 0 and rhos_si > 0:
-                darea_d_si = (dW_d_si / (rhos_si * V_si) -
-                              W_si * drhos_d_si / (rhos_si ** 2 * V_si) -
-                              W_si * dV_d_si / (rhos_si * V_si ** 2))
-            else:
-                darea_d_si = np.zeros(5)
-            darea_d = darea_d_si * self._area_from_si
-
-            # Store Jacobian
-            self._jacobian_static_MN = {
-                'Ts': dTs_d * self._T_from_si,
-                'Ps': dPs_d * self._P_from_si,
-                'hs': dhs_d,
-                'rhos': drhos_d,
-                'MN': dMN_d,
-                'V': dV_d,
-                'Vsonic': dVsonic_d,
-                'area': darea_d,
-                'gamma': dgams_d,
-                'Cp': dCps_d,
-                'Cv': dCvs_d,
-                'S': dSs_d,
-                'R': dRs_d,
-            }
+        # Store Jacobian
+        self._jacobian_static_MN = {
+            'Ts': dTs_d,
+            'Ps': dPs_d,
+            'hs': dhs_d,
+            'rhos': drhos_d,
+            'MN': dMN_d,
+            'V': dV_d,
+            'Vsonic': dVsonic_d,
+            'area': darea_d,
+            'gamma': dgams_d,
+            'Cp': dCps_d,
+            'Cv': dCvs_d,
+            'S': dSs_d,
+            'R': dRs_d,
+        }
 
         p['calls'] += 1
         p['total_time'] += time.perf_counter() - t_start
 
-        # Return static properties converted to input units
-        props_si = StaticProps(
-            Ts=Ts_si, Ps=Ps_si, hs=hs_si, rhos=rhos_si,
-            MN=MN, V=V_si, Vsonic=Vsonic_si, area=area_si,
-            gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=Ss_si, R=R_s
-        )
-        return self._convert_static_props_from_si(props_si)
+        return props
 
     def get_jacobian_static_MN(self):
         """
@@ -1136,6 +1332,11 @@ class TabularThermo(ThermoInterface):
     def static_from_Ps(self, Tt, Pt, Ps, W, FAR=None):
         """Compute static properties from total conditions and static pressure.
 
+        Uses the same physics as the original pyCycle (PsCalc):
+        1. Entropy conservation: S(Ts, Ps) = S_total (find Ts)
+        2. Energy conservation: V = sqrt(2 * (ht - hs)) [in SI units: J/kg -> m/s]
+        3. MN = V / Vsonic
+
         Parameters
         ----------
         Tt : float
@@ -1162,38 +1363,42 @@ class TabularThermo(ThermoInterface):
         Ps_si = Ps * self._P_to_si
         W_si = W * self._W_to_si
 
-        # Get gamma at total conditions for isentropic relation
-        gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
+        # Get total properties in SI (J/kg for enthalpy)
+        ht_si = self._lookup_si('h', Tt_si, Pt_si, FAR)
+        S_total = self._lookup_si('S', Tt_si, Pt_si, FAR)
 
-        # From isentropic relation
-        pressure_ratio = Ps_si / Pt_si
-        Ts = Tt_si * pressure_ratio**((gam - 1.0) / gam)
+        # Find Ts from entropy constraint: S(Ts, Ps) = S_total
+        Ts_si = self._T_from_SP_si(S_total, Ps_si, FAR)
 
-        # Full static properties at static T and P
-        hs = self._lookup_si('h', Ts, Ps_si, FAR)
-        S_s = self._lookup_si('S', Ts, Ps_si, FAR)
-        gam_s = self._lookup_si('gamma', Ts, Ps_si, FAR)
-        Cp_s = self._lookup_si('Cp', Ts, Ps_si, FAR)
-        Cv_s = self._lookup_si('Cv', Ts, Ps_si, FAR)
-        R_s = self._lookup_si('R', Ts, Ps_si, FAR)
+        # Full static properties at (Ts, Ps) in SI
+        hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
+        gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
+        Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
+        Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
+        R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
 
-        # Compute Mach number from temperature ratio
-        temp_ratio = Ts / Tt_si
-        MN_sq = 2.0 / (gam - 1.0) * (1.0 / temp_ratio - 1.0)
-        MN = np.sqrt(max(0.0, MN_sq))
+        # Speed of sound in SI (m/s)
+        Vsonic_si = np.sqrt(gam_s * R_s * Ts_si)
 
-        # Speed of sound and velocity (use static properties)
-        Vsonic = np.sqrt(gam_s * R_s * Ts)
-        V = MN * Vsonic
+        # Velocity from energy conservation: ht = hs + V²/2
+        # V = sqrt(2 * (ht - hs)) in SI units (J/kg -> m/s)
+        # Handle case where ht < hs (inverted, as in original PsCalc)
+        if ht_si >= hs_si:
+            V_si = np.sqrt(2.0 * (ht_si - hs_si))
+        else:
+            V_si = np.sqrt(2.0 * (hs_si - ht_si))
 
-        # Density from ideal gas law
-        rhos = Ps_si / (R_s * Ts)
+        # Mach number
+        MN = V_si / Vsonic_si
 
-        # Area from continuity
-        area = W_si / (rhos * V) if V > 0 else np.inf
+        # Density from ideal gas law (SI)
+        rhos_si = Ps_si / (R_s * Ts_si)
 
-        props_si = StaticProps(Ts=Ts, Ps=Ps_si, hs=hs, rhos=rhos,
-                              MN=MN, V=V, Vsonic=Vsonic, area=area,
-                              gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_s, R=R_s)
+        # Area from continuity (SI)
+        area_si = W_si / (rhos_si * V_si) if V_si > 0 else np.inf
+
+        props_si = StaticProps(Ts=Ts_si, Ps=Ps_si, hs=hs_si, rhos=rhos_si,
+                              MN=MN, V=V_si, Vsonic=Vsonic_si, area=area_si,
+                              gamma=gam_s, Cp=Cp_s, Cv=Cv_s, S=S_total, R=R_s)
 
         return self._convert_static_props_from_si(props_si)

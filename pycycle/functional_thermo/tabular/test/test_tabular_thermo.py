@@ -291,7 +291,9 @@ class TabularThermoStaticDerivativesTestCase(unittest.TestCase):
 
         for prop in ['Ts', 'Ps', 'hs', 'V', 'Vsonic', 'area', 'gamma']:
             fd = (getattr(props_p, prop) - getattr(props_m, prop)) / (2 * self.h)
-            if abs(fd) > 1e-10:
+            # Use 1e-6 threshold since smaller FD values are numerical noise
+            # (e.g., dTs/dPt is essentially 0 because h doesn't depend on P)
+            if abs(fd) > 1e-6:
                 rel_err = abs(jvp[prop] - fd) / abs(fd)
                 self.assertLess(rel_err, 1e-4, f"d{prop}/dPt: ana={jvp[prop]:.8g}, fd={fd:.8g}")
 
