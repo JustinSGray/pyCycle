@@ -17,10 +17,11 @@ from ..base import ThermoInterface, TotalProps, StaticProps
 
 class NewtonSolver:
     """
-    Generic Newton solver for 1D and N-D root-finding problems.
+    Generic Newton solver for N-D root-finding problems.
 
-    Supports analytical Jacobians, bounds clamping, and multiple convergence
-    criteria. Optimized for small systems (1D, 2D) with minimal overhead.
+    Supports analytical Jacobians, bounds clamping, Armijo-Goldstein line search,
+    and multiple convergence criteria. Works for any dimension (1D, 2D, N-D) with
+    a unified implementation.
 
     Parameters
     ----------
@@ -30,17 +31,25 @@ class NewtonSolver:
         Convergence tolerance. Default is 1e-10.
     convergence_mode : str, optional
         How to check convergence:
-        - 'relative': |R| < tol * |target| (default)
+        - 'relative': |R| < tol * |ref| or |R| < abs_tol (default)
         - 'absolute': |R| < tol
-        - 'component': max(|R_i|) < tol (for N-D)
+        - 'component': max(|R_i|) < tol
     abs_tol : float, optional
         Absolute tolerance floor for 'relative' mode. Default is 1e-6.
     stagnation_tol : float, optional
         Minimum step size before declaring stagnation. Default is 1e-12.
     bounds : tuple, optional
         (lower, upper) bounds for the solution. Can be scalars or arrays.
-    jac_singular_tol : float, optional
-        Threshold below which Jacobian is considered singular. Default is 1e-30.
+    linesearch : bool, optional
+        Enable Armijo-Goldstein line search. Default is False.
+    ls_c : float, optional
+        Slope parameter for sufficient decrease condition. Controls how much
+        decrease is required. Larger values require more decrease. Default is 0.1.
+    ls_rho : float, optional
+        Contraction factor for backtracking. Each failed iteration multiplies
+        the step size by this factor. Default is 0.5.
+    ls_maxiter : int, optional
+        Maximum line search iterations before accepting the step. Default is 5.
 
     Examples
     --------
@@ -61,18 +70,27 @@ class NewtonSolver:
     ...     J = np.array([[dR1_dTs, dR1_dPs], [dR2_dTs, dR2_dPs]])
     ...     return R, J
     >>> x, converged, n_iter = solver.solve(residual_and_jac, [Ts_guess, Ps_guess])
+
+    With line search for improved robustness:
+
+    >>> solver = NewtonSolver(linesearch=True, ls_c=0.1, ls_rho=0.5, ls_maxiter=5)
+    >>> x, converged, n_iter = solver.solve(residual_and_jac, x0)
     """
 
     def __init__(self, max_iter=20, tol=1e-10, convergence_mode='relative',
                  abs_tol=1e-6, stagnation_tol=1e-12, bounds=None,
-                 jac_singular_tol=1e-30):
+                 linesearch=False, ls_c=0.1, ls_rho=0.5, ls_maxiter=5):
         self.max_iter = max_iter
         self.tol = tol
         self.convergence_mode = convergence_mode
         self.abs_tol = abs_tol
         self.stagnation_tol = stagnation_tol
         self.bounds = bounds
-        self.jac_singular_tol = jac_singular_tol
+        # Line search parameters
+        self.linesearch = linesearch
+        self.ls_c = ls_c
+        self.ls_rho = ls_rho
+        self.ls_maxiter = ls_maxiter
 
     def solve(self, residual_and_jac_fn, x0, ref_value=None):
         """
@@ -82,160 +100,164 @@ class NewtonSolver:
         ----------
         residual_and_jac_fn : callable
             Function that takes x and returns (residual, jacobian).
-            For 1D: residual and jacobian are scalars.
-            For N-D: residual is (N,) array, jacobian is (N, N) array.
+            - For 1D: x is scalar, residual is scalar, jacobian is scalar
+            - For N-D: x is (N,) array, residual is (N,) array, jacobian is (N,N) array
         x0 : float or array-like
-            Initial guess.
+            Initial guess. Determines the problem dimension.
         ref_value : float or array-like, optional
             Reference value for relative convergence checking.
-            If None, uses the first residual magnitude.
+            If None, uses abs_tol as the floor.
 
         Returns
         -------
         x : float or ndarray
-            Solution (same type as x0).
+            Solution (same type/shape as x0).
         converged : bool
             True if the solver converged within tolerance.
         n_iter : int
             Number of iterations performed.
         """
-        # Determine if 1D or N-D based on x0
+        # Normalize to arrays for unified handling
         is_scalar = np.isscalar(x0)
-        if is_scalar:
-            return self._solve_1d(residual_and_jac_fn, float(x0), ref_value)
+        x = np.atleast_1d(np.asarray(x0, dtype=float))
+        n = x.size
+
+        # Set up bounds
+        if self.bounds is not None:
+            lower = np.atleast_1d(np.asarray(self.bounds[0], dtype=float))
+            upper = np.atleast_1d(np.asarray(self.bounds[1], dtype=float))
+            # Broadcast scalar bounds to array size
+            if lower.size == 1:
+                lower = np.full(n, lower[0])
+            if upper.size == 1:
+                upper = np.full(n, upper[0])
         else:
-            x0_arr = np.asarray(x0, dtype=float)
-            if x0_arr.size == 2:
-                return self._solve_2d(residual_and_jac_fn, x0_arr, ref_value)
+            lower = np.full(n, -np.inf)
+            upper = np.full(n, np.inf)
+
+        # Normalize ref_value
+        if ref_value is not None:
+            ref_value = np.atleast_1d(np.asarray(ref_value, dtype=float))
+
+        # Newton iteration
+        for n_iter in range(1, self.max_iter + 1):
+            # Get residual and Jacobian
+            if is_scalar:
+                residual, jacobian = residual_and_jac_fn(x[0])
+                residual = np.atleast_1d(residual)
+                jacobian = np.atleast_2d(jacobian)
             else:
-                return self._solve_nd(residual_and_jac_fn, x0_arr, ref_value)
-
-    def _solve_1d(self, residual_and_jac_fn, x, ref_value):
-        """Optimized 1D Newton solver."""
-        bounds = self.bounds
-        lower = bounds[0] if bounds else -np.inf
-        upper = bounds[1] if bounds else np.inf
-
-        for n_iter in range(1, self.max_iter + 1):
-            residual, jacobian = residual_and_jac_fn(x)
+                residual, jacobian = residual_and_jac_fn(x)
 
             # Check convergence
-            if self._check_convergence_1d(residual, ref_value):
-                return x, True, n_iter
+            if self._check_convergence(residual, ref_value):
+                return (x[0] if is_scalar else x), True, n_iter
 
-            # Check for singular Jacobian
-            if abs(jacobian) < self.jac_singular_tol:
-                return x, False, n_iter
+            # Current residual norm (for line search)
+            phi0 = np.linalg.norm(residual)
 
-            # Newton step
-            dx = -residual / jacobian
-            x_new = x + dx
-
-            # Apply bounds
-            x_new = max(lower, min(upper, x_new))
-
-            # Check for stagnation
-            if abs(x_new - x) < self.stagnation_tol:
-                return x_new, True, n_iter
-
-            x = x_new
-
-        return x, False, self.max_iter
-
-    def _solve_2d(self, residual_and_jac_fn, x, ref_value):
-        """Optimized 2D Newton solver using Cramer's rule."""
-        bounds = self.bounds
-        if bounds:
-            lower = np.asarray(bounds[0])
-            upper = np.asarray(bounds[1])
-        else:
-            lower = np.array([-np.inf, -np.inf])
-            upper = np.array([np.inf, np.inf])
-
-        for n_iter in range(1, self.max_iter + 1):
-            residual, jacobian = residual_and_jac_fn(x)
-
-            # Check convergence
-            if self._check_convergence_nd(residual, ref_value):
-                return x, True, n_iter
-
-            # Cramer's rule for 2x2 system: J @ dx = -R
-            J = jacobian
-            det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
-
-            if abs(det) < self.jac_singular_tol:
-                return x, False, n_iter
-
-            # dx = J^{-1} @ (-R)
-            dx0 = (-residual[0] * J[1, 1] + residual[1] * J[0, 1]) / det
-            dx1 = (-residual[1] * J[0, 0] + residual[0] * J[1, 0]) / det
-
-            x_new = np.array([x[0] + dx0, x[1] + dx1])
-
-            # Apply bounds
-            x_new = np.maximum(lower, np.minimum(upper, x_new))
-
-            # Check for stagnation
-            if np.max(np.abs(x_new - x)) < self.stagnation_tol:
-                return x_new, True, n_iter
-
-            x = x_new
-
-        return x, False, self.max_iter
-
-    def _solve_nd(self, residual_and_jac_fn, x, ref_value):
-        """General N-D Newton solver using numpy.linalg.solve."""
-        bounds = self.bounds
-        if bounds:
-            lower = np.asarray(bounds[0])
-            upper = np.asarray(bounds[1])
-        else:
-            lower = np.full_like(x, -np.inf)
-            upper = np.full_like(x, np.inf)
-
-        for n_iter in range(1, self.max_iter + 1):
-            residual, jacobian = residual_and_jac_fn(x)
-
-            # Check convergence
-            if self._check_convergence_nd(residual, ref_value):
-                return x, True, n_iter
-
-            # Solve linear system
+            # Solve linear system: J @ dx = -R
             try:
                 dx = np.linalg.solve(jacobian, -residual)
             except np.linalg.LinAlgError:
-                return x, False, n_iter
+                return (x[0] if is_scalar else x), False, n_iter
 
-            x_new = x + dx
+            # Line search (if enabled)
+            if self.linesearch and phi0 > 0:
+                alpha = self._armijo_linesearch(residual_and_jac_fn, x, dx, phi0,
+                                                is_scalar, lower, upper)
+            else:
+                alpha = 1.0
+
+            # Newton update with step size
+            x_new = x + alpha * dx
 
             # Apply bounds
             x_new = np.maximum(lower, np.minimum(upper, x_new))
 
             # Check for stagnation
             if np.max(np.abs(x_new - x)) < self.stagnation_tol:
-                return x_new, True, n_iter
+                return (x_new[0] if is_scalar else x_new), True, n_iter
 
             x = x_new
 
-        return x, False, self.max_iter
+        return (x[0] if is_scalar else x), False, self.max_iter
 
-    def _check_convergence_1d(self, residual, ref_value):
-        """Check convergence for 1D problem."""
-        abs_res = abs(residual)
-        if self.convergence_mode == 'absolute':
-            return abs_res < self.tol
-        elif self.convergence_mode == 'relative':
-            ref = abs(ref_value) if ref_value is not None else abs_res
-            return abs_res < self.tol * ref or abs_res < self.abs_tol
-        else:  # component (same as absolute for 1D)
-            return abs_res < self.tol
+    def _armijo_linesearch(self, residual_and_jac_fn, x, dx, phi0, is_scalar, lower, upper):
+        """
+        Armijo-Goldstein backtracking line search.
 
-    def _check_convergence_nd(self, residual, ref_value):
-        """Check convergence for N-D problem."""
+        Finds a step size alpha such that the sufficient decrease condition is satisfied:
+            phi(alpha) <= phi(0) + c * alpha * dphi/dalpha
+
+        For Newton's method, the directional derivative dphi/dalpha at alpha=0 equals -phi(0),
+        since a full Newton step would drive the linearized residuals to zero.
+        This simplifies the condition to:
+            phi(alpha) <= phi(0) * (1 - c * alpha)
+
+        Parameters
+        ----------
+        residual_and_jac_fn : callable
+            Function that returns (residual, jacobian).
+        x : ndarray
+            Current solution estimate.
+        dx : ndarray
+            Newton step direction.
+        phi0 : float
+            Current residual norm ||R(x)||.
+        is_scalar : bool
+            Whether the original problem was scalar.
+        lower : ndarray
+            Lower bounds.
+        upper : ndarray
+            Upper bounds.
+
+        Returns
+        -------
+        alpha : float
+            Accepted step size (between 0 and 1).
+        """
+        c = self.ls_c
+        rho = self.ls_rho
+        alpha = 1.0
+
+        # Directional derivative for Newton's method: dphi/dalpha = -phi0
+        # Armijo condition: phi(alpha) <= phi0 + c * alpha * (-phi0)
+        #                   phi(alpha) <= phi0 * (1 - c * alpha)
+
+        for _ in range(self.ls_maxiter):
+            # Trial point
+            x_trial = x + alpha * dx
+            x_trial = np.maximum(lower, np.minimum(upper, x_trial))
+
+            # Evaluate residual at trial point
+            if is_scalar:
+                residual_trial, _ = residual_and_jac_fn(x_trial[0])
+                residual_trial = np.atleast_1d(residual_trial)
+            else:
+                residual_trial, _ = residual_and_jac_fn(x_trial)
+
+            phi = np.linalg.norm(residual_trial)
+
+            # Check Armijo condition
+            if phi <= phi0 * (1.0 - c * alpha):
+                return alpha
+
+            # Backtrack
+            alpha *= rho
+
+        # Return whatever alpha we ended up with
+        return alpha
+
+    def _check_convergence(self, residual, ref_value):
+        """Check convergence based on configured mode."""
         if self.convergence_mode == 'absolute':
             return np.linalg.norm(residual) < self.tol
         elif self.convergence_mode == 'relative':
-            ref = np.linalg.norm(ref_value) if ref_value is not None else np.linalg.norm(residual)
+            if ref_value is not None:
+                ref = np.linalg.norm(ref_value)
+            else:
+                ref = 1.0  # Fall back to abs_tol check
             return np.linalg.norm(residual) < self.tol * ref or np.linalg.norm(residual) < self.abs_tol
         else:  # component
             return np.max(np.abs(residual)) < self.tol
