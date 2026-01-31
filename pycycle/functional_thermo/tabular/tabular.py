@@ -2,9 +2,34 @@
 Tabular thermodynamic property calculations using interpolation.
 """
 
+import time
+from contextlib import contextmanager
+
 import numpy as np
+from scipy.optimize import brentq
 
 from ..base import ThermoInterface, TotalProps, StaticProps
+
+
+# Property name constants to avoid repetition
+TOTAL_PROPS = ('h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R')
+STATIC_PROPS = ('Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R')
+
+# Unit conversion factor mapping for jvp/vjp
+_PROP_UNIT_FACTORS = {
+    'gamma': 'dimensionless',
+    'h': 'h',
+    'S': 'S', 'Cp': 'S', 'Cv': 'S', 'R': 'S',
+    'rho': 'rho',
+}
+
+
+@contextmanager
+def _profile_section(profile_dict, key):
+    """Context manager for timing code sections."""
+    t0 = time.perf_counter()
+    yield
+    profile_dict[key] += time.perf_counter() - t0
 
 
 class TabularThermo(ThermoInterface):
@@ -46,7 +71,7 @@ class TabularThermo(ThermoInterface):
 
         # Use 3D-slinear for 3D grids - it's ~2.3x faster than generic slinear
         self._interps = {}
-        for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
+        for prop in TOTAL_PROPS:
             self._interps[prop] = InterpND(
                 method='3D-slinear',
                 points=points,
@@ -54,10 +79,13 @@ class TabularThermo(ThermoInterface):
                 extrapolate=True
             )
 
+    def _get_FAR(self, FAR):
+        """Return FAR if provided, else instance default."""
+        return FAR if FAR is not None else self.FAR
+
     def _lookup_si(self, prop, T_si, P_si, FAR=None):
         """Internal lookup function in SI units."""
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
         x = np.array([FAR, float(P_si), float(T_si)])
         return self._interps[prop].interpolate(x)[0]
 
@@ -89,8 +117,7 @@ class TabularThermo(ThermoInterface):
         TotalProps
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in input units
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI for lookup
         T_si = self._convert_T_to_si(T)
@@ -108,7 +135,7 @@ class TabularThermo(ThermoInterface):
         # Compute gradients for each property (in SI units)
         # gradients are (dProp/dFAR, dProp/dP, dProp/dT)
         self._gradients_si = {}
-        for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
+        for prop in TOTAL_PROPS:
             self._gradients_si[prop] = self._interps[prop].gradient(x)
 
         # If props provided from forward pass, use those; otherwise lookup
@@ -116,12 +143,25 @@ class TabularThermo(ThermoInterface):
             return props
         else:
             props_si = {}
-            for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
+            for prop in TOTAL_PROPS:
                 props_si[prop] = self._interps[prop].interpolate(x)[0]
             return self._convert_total_props_from_si(TotalProps(
                 h=props_si['h'], S=props_si['S'], gamma=props_si['gamma'],
                 Cp=props_si['Cp'], Cv=props_si['Cv'], rho=props_si['rho'], R=props_si['R']
             ))
+
+    def _get_output_unit_factor(self, prop):
+        """Get unit conversion factor for a property."""
+        unit_type = _PROP_UNIT_FACTORS.get(prop, 'dimensionless')
+        if unit_type == 'dimensionless':
+            return 1.0
+        elif unit_type == 'h':
+            return self._h_from_si
+        elif unit_type == 'S':
+            return self._S_from_si
+        elif unit_type == 'rho':
+            return self._rho_from_si
+        return 1.0
 
     def jvp(self, T_dot, P_dot, FAR_dot=0.0):
         """
@@ -145,18 +185,10 @@ class TabularThermo(ThermoInterface):
             raise RuntimeError("Must call linearize() before jvp()")
 
         result = {}
-        for prop in ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']:
+        for prop in TOTAL_PROPS:
             # gradients are (dProp/dFAR, dProp/dP, dProp/dT) in SI
             grad = self._gradients_si[prop]
-
-            if prop == 'gamma':
-                out_factor = 1.0
-            elif prop in ('S', 'Cp', 'Cv', 'R'):
-                out_factor = self._S_from_si
-            elif prop == 'h':
-                out_factor = self._h_from_si
-            elif prop == 'rho':
-                out_factor = self._rho_from_si
+            out_factor = self._get_output_unit_factor(prop)
 
             # Convert gradient to input units
             # grad is (dProp/dFAR, dProp/dP, dProp/dT) in SI
@@ -210,15 +242,7 @@ class TabularThermo(ThermoInterface):
         for prop, cotan in cotangents.items():
             if cotan != 0.0:
                 grad = self._gradients_si[prop]
-
-                if prop == 'gamma':
-                    out_factor = 1.0
-                elif prop in ('S', 'Cp', 'Cv', 'R'):
-                    out_factor = self._S_from_si
-                elif prop == 'h':
-                    out_factor = self._h_from_si
-                elif prop == 'rho':
-                    out_factor = self._rho_from_si
+                out_factor = self._get_output_unit_factor(prop)
 
                 # grad is (dProp/dFAR, dProp/dP, dProp/dT) in SI
                 dprop_dFAR = grad[0] * out_factor  # FAR is dimensionless
@@ -252,8 +276,7 @@ class TabularThermo(ThermoInterface):
         TotalProps
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in input units
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         T_si = self._convert_T_to_si(T)
@@ -322,10 +345,7 @@ class TabularThermo(ThermoInterface):
         float
             Temperature (in input units) such that h(T, P, FAR) = h_target
         """
-        from scipy.optimize import brentq
-
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         h_si = h_target * self._h_to_si
@@ -357,10 +377,7 @@ class TabularThermo(ThermoInterface):
         float
             Temperature (in input units) such that S(T, P, FAR) = S_target
         """
-        from scipy.optimize import brentq
-
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         S_si = S_target * self._S_to_si
@@ -378,6 +395,36 @@ class TabularThermo(ThermoInterface):
     # Static property calculations
     # =========================================================================
 
+    def _isentropic_relations(self, Tt, Pt, MN, gamma):
+        """
+        Compute static T and P from isentropic flow relations.
+
+        Parameters
+        ----------
+        Tt : float
+            Total temperature
+        Pt : float
+            Total pressure
+        MN : float
+            Mach number
+        gamma : float
+            Ratio of specific heats
+
+        Returns
+        -------
+        Ts : float
+            Static temperature
+        Ps : float
+            Static pressure
+        temp_ratio : float
+            Ts/Tt ratio (useful for derivatives)
+        """
+        gm1 = gamma - 1.0
+        temp_ratio = 1.0 / (1.0 + gm1 / 2.0 * MN**2)
+        Ts = Tt * temp_ratio
+        Ps = Pt * temp_ratio ** (gamma / gm1)
+        return Ts, Ps, temp_ratio
+
     def _static_from_MN_si(self, Tt_si, Pt_si, MN, W_si, FAR=None):
         """Compute static properties in SI units.
 
@@ -394,17 +441,13 @@ class TabularThermo(ThermoInterface):
         FAR : float, optional
             Fuel-to-air ratio. If None, uses the instance's FAR.
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
-        # Get gamma and R at total conditions (in SI)
+        # Get gamma at total conditions (in SI)
         gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
-        R_gas = self._lookup_si('R', Tt_si, Pt_si, FAR)
 
         # Isentropic relations
-        temp_ratio = 1.0 / (1.0 + (gam - 1.0) / 2.0 * MN**2)
-        Ts = Tt_si * temp_ratio
-        Ps = Pt_si * temp_ratio**(gam / (gam - 1.0))
+        Ts, Ps, _ = self._isentropic_relations(Tt_si, Pt_si, MN, gam)
 
         # Full static properties at static T and P
         hs = self._lookup_si('h', Ts, Ps, FAR)
@@ -449,8 +492,7 @@ class TabularThermo(ThermoInterface):
         StaticProps
             Named tuple with static properties in input units
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         Tt_si = self._convert_T_to_si(Tt)
@@ -493,8 +535,7 @@ class TabularThermo(ThermoInterface):
         StaticProps
             Named tuple with static properties in input units
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         Tt_si = self._convert_T_to_si(Tt)
@@ -511,8 +552,6 @@ class TabularThermo(ThermoInterface):
             return self._convert_static_props_from_si(props_si)
 
         # Fall back to brentq for robustness
-        from scipy.optimize import brentq
-
         def area_residual(MN):
             props = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si, FAR)
             return float(props.area) - float(area_si)
@@ -594,14 +633,11 @@ class TabularThermo(ThermoInterface):
         gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
 
         # Isentropic relations
+        Ts, Ps, temp_ratio = self._isentropic_relations(Tt_si, Pt_si, MN, gam)
         MN2 = MN ** 2
         gm1 = gam - 1.0
         denom = 1.0 + gm1 / 2.0 * MN2
-        temp_ratio = 1.0 / denom
         exp = gam / gm1
-
-        Ts = Tt_si * temp_ratio
-        Ps = Pt_si * temp_ratio ** exp
 
         # Static properties
         gam_s = self._lookup_si('gamma', Ts, Ps, FAR)
@@ -728,12 +764,9 @@ class TabularThermo(ThermoInterface):
         StaticProps
             Named tuple with static properties in input units
         """
-        import time
         t_start = time.perf_counter()
         p = self._profile_static_MN
-
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         Tt_si = self._convert_T_to_si(Tt)
@@ -741,107 +774,102 @@ class TabularThermo(ThermoInterface):
         W_si = W * self._W_to_si
 
         # Get gamma at total conditions
-        t0 = time.perf_counter()
-        gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
-        R_tot = self._lookup_si('R', Tt_si, Pt_si, FAR)
-        p['lookup_total'] += time.perf_counter() - t0
+        with _profile_section(p, 'lookup_total'):
+            gam = self._lookup_si('gamma', Tt_si, Pt_si, FAR)
+            R_tot = self._lookup_si('R', Tt_si, Pt_si, FAR)
 
         # Linearize at total conditions for dgamma/dTt, dgamma/dPt, dgamma/dFAR
-        t0 = time.perf_counter()
-        x_tot = np.array([FAR, float(Pt_si), float(Tt_si)])
-        grad_gam_tot = self._interps['gamma'].gradient(x_tot)  # (dg/dFAR, dg/dP, dg/dT)
-        grad_R_tot = self._interps['R'].gradient(x_tot)
-        p['grad_total'] += time.perf_counter() - t0
+        with _profile_section(p, 'grad_total'):
+            x_tot = np.array([FAR, float(Pt_si), float(Tt_si)])
+            grad_gam_tot = self._interps['gamma'].gradient(x_tot)  # (dg/dFAR, dg/dP, dg/dT)
+            grad_R_tot = self._interps['R'].gradient(x_tot)
 
         dgam_dTt = grad_gam_tot[2] * self._T_to_si  # Convert to input units
         dgam_dPt = grad_gam_tot[1] * self._P_to_si
         dgam_dFAR = grad_gam_tot[0]  # FAR is dimensionless
 
         # Isentropic relations
-        t0 = time.perf_counter()
-        MN2 = MN ** 2
-        gm1 = gam - 1.0
-        gm1_half = gm1 / 2.0
-        denom = 1.0 + gm1_half * MN2
-        temp_ratio = 1.0 / denom
+        with _profile_section(p, 'isentropic'):
+            MN2 = MN ** 2
+            gm1 = gam - 1.0
+            gm1_half = gm1 / 2.0
+            denom = 1.0 + gm1_half * MN2
+            temp_ratio = 1.0 / denom
 
-        Ts_si = Tt_si * temp_ratio
-        exp = gam / gm1
-        Ps_si = Pt_si * temp_ratio ** exp
+            Ts_si = Tt_si * temp_ratio
+            exp = gam / gm1
+            Ps_si = Pt_si * temp_ratio ** exp
 
-        # Derivatives of temp_ratio w.r.t. inputs
-        # temp_ratio = 1 / (1 + (gam-1)/2 * MN^2)
-        # d(temp_ratio)/dMN = -(gam-1) * MN / denom^2
-        # d(temp_ratio)/dgam = -MN^2 / (2 * denom^2)
-        dtr_dMN = -gm1 * MN / (denom ** 2)
-        dtr_dgam = -MN2 / (2.0 * denom ** 2)
+            # Derivatives of temp_ratio w.r.t. inputs
+            # temp_ratio = 1 / (1 + (gam-1)/2 * MN^2)
+            # d(temp_ratio)/dMN = -(gam-1) * MN / denom^2
+            # d(temp_ratio)/dgam = -MN^2 / (2 * denom^2)
+            dtr_dMN = -gm1 * MN / (denom ** 2)
+            dtr_dgam = -MN2 / (2.0 * denom ** 2)
 
-        # Derivatives of Ts w.r.t. inputs (Ts = Tt * temp_ratio)
-        # All derivatives should be in input units (e.g., degR/degR, degR/psi, degR/MN)
-        dTs_dTt = temp_ratio + Tt_si * dtr_dgam * dgam_dTt / self._T_to_si
-        dTs_dPt = Tt_si * dtr_dgam * dgam_dPt / self._P_to_si
-        dTs_dMN = Tt_si * dtr_dMN * self._T_from_si  # Convert T_si to T_input
-        dTs_dFAR = Tt_si * dtr_dgam * dgam_dFAR * self._T_from_si  # Through gamma dependency
+            # Derivatives of Ts w.r.t. inputs (Ts = Tt * temp_ratio)
+            # All derivatives should be in input units (e.g., degR/degR, degR/psi, degR/MN)
+            dTs_dTt = temp_ratio + Tt_si * dtr_dgam * dgam_dTt / self._T_to_si
+            dTs_dPt = Tt_si * dtr_dgam * dgam_dPt / self._P_to_si
+            dTs_dMN = Tt_si * dtr_dMN * self._T_from_si  # Convert T_si to T_input
+            dTs_dFAR = Tt_si * dtr_dgam * dgam_dFAR * self._T_from_si  # Through gamma dependency
 
-        # Derivatives of Ps w.r.t. inputs
-        # Ps = Pt * temp_ratio^exp, exp = gam/(gam-1)
-        # d(exp)/dgam = -1/(gam-1)^2
-        dexp_dgam = -1.0 / (gm1 ** 2)
-        ln_tr = np.log(temp_ratio) if temp_ratio > 0 else 0.0
+            # Derivatives of Ps w.r.t. inputs
+            # Ps = Pt * temp_ratio^exp, exp = gam/(gam-1)
+            # d(exp)/dgam = -1/(gam-1)^2
+            dexp_dgam = -1.0 / (gm1 ** 2)
+            ln_tr = np.log(temp_ratio) if temp_ratio > 0 else 0.0
 
-        # d(Ps)/dPt = temp_ratio^exp + Pt * exp * temp_ratio^(exp-1) * dtr/dgam * dgam/dPt
-        #           + Pt * temp_ratio^exp * ln(temp_ratio) * dexp/dgam * dgam/dPt
-        dPs_dPt_base = temp_ratio ** exp
-        dPs_dPt = dPs_dPt_base + Pt_si * (
-            exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dPt +
-            temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dPt
-        ) / self._P_to_si
+            # d(Ps)/dPt = temp_ratio^exp + Pt * exp * temp_ratio^(exp-1) * dtr/dgam * dgam/dPt
+            #           + Pt * temp_ratio^exp * ln(temp_ratio) * dexp/dgam * dgam/dPt
+            dPs_dPt_base = temp_ratio ** exp
+            dPs_dPt = dPs_dPt_base + Pt_si * (
+                exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dPt +
+                temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dPt
+            ) / self._P_to_si
 
-        dPs_dTt = Pt_si * (
-            exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dTt +
-            temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dTt
-        ) * self._P_from_si  # Convert P_si to P_input (was incorrectly / _T_to_si)
+            dPs_dTt = Pt_si * (
+                exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dTt +
+                temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dTt
+            ) * self._P_from_si  # Convert P_si to P_input (was incorrectly / _T_to_si)
 
-        dPs_dMN = Pt_si * exp * temp_ratio ** (exp - 1) * dtr_dMN * self._P_from_si  # Convert P_si to P_input
+            dPs_dMN = Pt_si * exp * temp_ratio ** (exp - 1) * dtr_dMN * self._P_from_si  # Convert P_si to P_input
 
-        # d(Ps)/dFAR through gamma dependency
-        dPs_dFAR = Pt_si * (
-            exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dFAR +
-            temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dFAR
-        ) * self._P_from_si
-        p['isentropic'] += time.perf_counter() - t0
+            # d(Ps)/dFAR through gamma dependency
+            dPs_dFAR = Pt_si * (
+                exp * temp_ratio ** (exp - 1) * dtr_dgam * dgam_dFAR +
+                temp_ratio ** exp * ln_tr * dexp_dgam * dgam_dFAR
+            ) * self._P_from_si
 
         # Get static properties and their gradients at (Ts, Ps, FAR)
-        t0 = time.perf_counter()
-        x_stat = np.array([FAR, float(Ps_si), float(Ts_si)])
-        grad_hs = self._interps['h'].gradient(x_stat)
-        grad_Ss = self._interps['S'].gradient(x_stat)
-        grad_gams = self._interps['gamma'].gradient(x_stat)
-        grad_Cps = self._interps['Cp'].gradient(x_stat)
-        grad_Cvs = self._interps['Cv'].gradient(x_stat)
-        grad_Rs = self._interps['R'].gradient(x_stat)
-        grad_rhos = self._interps['rho'].gradient(x_stat)
-        p['grad_static'] += time.perf_counter() - t0
+        with _profile_section(p, 'grad_static'):
+            x_stat = np.array([FAR, float(Ps_si), float(Ts_si)])
+            grad_hs = self._interps['h'].gradient(x_stat)
+            grad_Ss = self._interps['S'].gradient(x_stat)
+            grad_gams = self._interps['gamma'].gradient(x_stat)
+            grad_Cps = self._interps['Cp'].gradient(x_stat)
+            grad_Cvs = self._interps['Cv'].gradient(x_stat)
+            grad_Rs = self._interps['R'].gradient(x_stat)
+            grad_rhos = self._interps['rho'].gradient(x_stat)
 
         # Static property values - use sprops if provided, else look up
-        t0 = time.perf_counter()
-        if sprops is not None:
-            # Use pre-computed values from forward pass (convert to SI)
-            hs_si = sprops.hs * self._h_to_si
-            Ss_si = sprops.S * self._S_to_si
-            gam_s = sprops.gamma  # dimensionless
-            Cp_s = sprops.Cp * self._S_to_si
-            Cv_s = sprops.Cv * self._S_to_si
-            R_s = sprops.R * self._S_to_si
-        else:
-            # Look up from tables
-            hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
-            Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
-            gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
-            Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
-            Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
-            R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
-        p['lookup_total'] += time.perf_counter() - t0
+        with _profile_section(p, 'lookup_total'):
+            if sprops is not None:
+                # Use pre-computed values from forward pass (convert to SI)
+                hs_si = sprops.hs * self._h_to_si
+                Ss_si = sprops.S * self._S_to_si
+                gam_s = sprops.gamma  # dimensionless
+                Cp_s = sprops.Cp * self._S_to_si
+                Cv_s = sprops.Cv * self._S_to_si
+                R_s = sprops.R * self._S_to_si
+            else:
+                # Look up from tables
+                hs_si = self._lookup_si('h', Ts_si, Ps_si, FAR)
+                Ss_si = self._lookup_si('S', Ts_si, Ps_si, FAR)
+                gam_s = self._lookup_si('gamma', Ts_si, Ps_si, FAR)
+                Cp_s = self._lookup_si('Cp', Ts_si, Ps_si, FAR)
+                Cv_s = self._lookup_si('Cv', Ts_si, Ps_si, FAR)
+                R_s = self._lookup_si('R', Ts_si, Ps_si, FAR)
 
         # Flow calculations
         Vsonic_si = np.sqrt(gam_s * R_s * Ts_si)
@@ -849,29 +877,26 @@ class TabularThermo(ThermoInterface):
         rhos_si = Ps_si / (R_s * Ts_si)
         area_si = W_si / (rhos_si * V_si) if V_si > 0 else np.inf
 
-        # Store cached values needed for JVP (kept for backward compatibility)
+        # Store cached values needed for Jacobian computation
+        # Only store values actually used by _compute_full_jacobian_static_MN
         self._static_MN_cache = {
-            # Input values (SI)
-            'Tt_si': Tt_si, 'Pt_si': Pt_si, 'MN': MN, 'W_si': W_si, 'FAR': FAR,
-            # Intermediate values
-            'gam': gam, 'temp_ratio': temp_ratio, 'exp': exp,
+            # Intermediate values used for flow derivatives
+            'MN': MN, 'W_si': W_si,
             'Ts_si': Ts_si, 'Ps_si': Ps_si,
             'gam_s': gam_s, 'R_s': R_s,
-            'Vsonic_si': Vsonic_si, 'V_si': V_si, 'rhos_si': rhos_si, 'area_si': area_si,
+            'Vsonic_si': Vsonic_si, 'V_si': V_si, 'rhos_si': rhos_si,
             # Gradients of Ts, Ps w.r.t. inputs (in input units)
             'dTs_dTt': dTs_dTt, 'dTs_dPt': dTs_dPt, 'dTs_dMN': dTs_dMN, 'dTs_dFAR': dTs_dFAR,
             'dPs_dTt': dPs_dTt, 'dPs_dPt': dPs_dPt, 'dPs_dMN': dPs_dMN, 'dPs_dFAR': dPs_dFAR,
             # Gradients of static properties w.r.t. (FAR, Ps, Ts) in SI
             'grad_hs': grad_hs, 'grad_Ss': grad_Ss, 'grad_gams': grad_gams,
             'grad_Cps': grad_Cps, 'grad_Cvs': grad_Cvs, 'grad_Rs': grad_Rs,
-            'grad_rhos': grad_rhos,
         }
 
         # Compute full Jacobian matrix directly (13 outputs x 5 inputs)
         # This avoids calling jvp_static_MN 5 times with basis vectors
-        t0 = time.perf_counter()
-        self._compute_full_jacobian_static_MN()
-        p['jacobian'] += time.perf_counter() - t0
+        with _profile_section(p, 'jacobian'):
+            self._compute_full_jacobian_static_MN()
 
         p['calls'] += 1
         p['total_time'] += time.perf_counter() - t_start
@@ -912,7 +937,7 @@ class TabularThermo(ThermoInterface):
         gam_s, R_s, Ts_si = c['gam_s'], c['R_s'], c['Ts_si']
         Vsonic = c['Vsonic_si']
         Ps_si, rhos_si = c['Ps_si'], c['rhos_si']
-        W_si, V_si, area_si = c['W_si'], c['V_si'], c['area_si']
+        W_si, V_si = c['W_si'], c['V_si']
         MN = c['MN']
 
         # Vsonic = sqrt(gam_s * R_s * Ts)
@@ -986,34 +1011,6 @@ class TabularThermo(ThermoInterface):
             raise RuntimeError("Must call linearize_static_MN() before get_jacobian_static_MN()")
         return self._jacobian_static_MN
 
-    def jacobian_static_MN(self):
-        """
-        Return the full Jacobian matrix for static_from_MN.
-
-        Returns
-        -------
-        dict
-            Dictionary mapping property names to arrays of 5 partial derivatives
-            [d/dTt, d/dPt, d/dMN, d/dW, d/dFAR]
-        """
-        if not hasattr(self, '_static_MN_cache'):
-            raise RuntimeError("Must call linearize_static_MN() before jacobian_static_MN()")
-
-        # Compute all five JVPs efficiently
-        jvp_Tt = self.jvp_static_MN(1.0, 0.0, 0.0, 0.0, 0.0)
-        jvp_Pt = self.jvp_static_MN(0.0, 1.0, 0.0, 0.0, 0.0)
-        jvp_MN = self.jvp_static_MN(0.0, 0.0, 1.0, 0.0, 0.0)
-        jvp_W = self.jvp_static_MN(0.0, 0.0, 0.0, 1.0, 0.0)
-        jvp_FAR = self.jvp_static_MN(0.0, 0.0, 0.0, 0.0, 1.0)
-
-        result = {}
-        for prop in ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
-                     'gamma', 'Cp', 'Cv', 'S', 'R']:
-            result[prop] = np.array([jvp_Tt[prop], jvp_Pt[prop], jvp_MN[prop],
-                                     jvp_W[prop], jvp_FAR[prop]])
-
-        return result
-
     def jvp_static_MN(self, Tt_dot, Pt_dot, MN_dot, W_dot, FAR_dot=0.0):
         """
         Compute JVP for static_from_MN using cached Jacobian.
@@ -1044,7 +1041,7 @@ class TabularThermo(ThermoInterface):
 
         # Simple matrix-vector product using pre-computed Jacobian
         result = {}
-        for prop in ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R']:
+        for prop in STATIC_PROPS:
             result[prop] = float(np.dot(jac[prop], tangent))
 
         return result
@@ -1078,8 +1075,7 @@ class TabularThermo(ThermoInterface):
         StaticProps
             Named tuple with static properties in input units
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # First compute the solution to get MN
         props = self.static_from_area(Tt, Pt, area, W, FAR=FAR)
@@ -1128,7 +1124,7 @@ class TabularThermo(ThermoInterface):
         dMN_d = np.array([dMN_dTt, dMN_dPt, dMN_darea, dMN_dW, dMN_dFAR])
 
         self._jacobian_static_area = {}
-        for prop in ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R']:
+        for prop in STATIC_PROPS:
             # jac_MN[prop] = [d/dTt, d/dPt, d/dMN, d/dW, d/dFAR] from static_from_MN
             # For static_from_area inputs are [Tt, Pt, area, W, FAR]
             # Total deriv = direct (through Tt, Pt, W, FAR) + indirect (through MN)
@@ -1189,7 +1185,7 @@ class TabularThermo(ThermoInterface):
 
         # Simple matrix-vector product using pre-computed Jacobian
         result = {}
-        for prop in ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area', 'gamma', 'Cp', 'Cv', 'S', 'R']:
+        for prop in STATIC_PROPS:
             result[prop] = float(np.dot(jac[prop], tangent))
 
         return result
@@ -1215,8 +1211,7 @@ class TabularThermo(ThermoInterface):
         StaticProps
             Named tuple with static properties in input units
         """
-        if FAR is None:
-            FAR = self.FAR
+        FAR = self._get_FAR(FAR)
 
         # Convert inputs to SI
         Tt_si = self._convert_T_to_si(Tt)
