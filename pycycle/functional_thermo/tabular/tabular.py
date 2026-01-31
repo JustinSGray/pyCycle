@@ -52,7 +52,12 @@ class TabularThermo(ThermoInterface):
         - 'English': Use pyCycle English units
     """
 
+    # Class-level registry of all instances for stats collection
+    _instances = []
+
     def __init__(self, FAR=0.0, spec=None, input_units='SI'):
+        # Register this instance
+        TabularThermo._instances.append(self)
         from openmdao.components.interp_util.interp import InterpND
         from pycycle.constants import AIR_JETA_TAB_SPEC
 
@@ -90,9 +95,72 @@ class TabularThermo(ThermoInterface):
         self._needs_guess_T_from_SP = True
         self._needs_guess_static_MN = True
 
+        # Solver statistics for logging
+        self._solver_stats = {
+            'T_from_hP': {'calls': 0, 'guesses': 0, 'retries': 0},
+            'T_from_SP': {'calls': 0, 'guesses': 0, 'retries': 0},
+            'static_MN': {'calls': 0, 'guesses': 0, 'retries': 0},
+        }
+
     def _get_FAR(self, FAR):
         """Return FAR if provided, else instance default."""
         return FAR if FAR is not None else self.FAR
+
+    def print_solver_stats(self):
+        """Print solver caching statistics."""
+        print("\n=== TabularThermo Solver Statistics ===")
+        for solver, stats in self._solver_stats.items():
+            calls = stats['calls']
+            guesses = stats['guesses']
+            retries = stats['retries']
+            cache_hits = calls - guesses if calls > 0 else 0
+            hit_rate = 100.0 * cache_hits / calls if calls > 0 else 0.0
+            print(f"  {solver}:")
+            print(f"    calls: {calls}, guesses: {guesses}, retries: {retries}")
+            print(f"    cache hit rate: {hit_rate:.1f}%")
+        print("========================================\n")
+
+    def reset_solver_stats(self):
+        """Reset solver statistics counters."""
+        for solver in self._solver_stats:
+            self._solver_stats[solver] = {'calls': 0, 'guesses': 0, 'retries': 0}
+
+    @classmethod
+    def print_all_solver_stats(cls):
+        """Print aggregated solver statistics across all TabularThermo instances."""
+        totals = {
+            'T_from_hP': {'calls': 0, 'guesses': 0, 'retries': 0},
+            'T_from_SP': {'calls': 0, 'guesses': 0, 'retries': 0},
+            'static_MN': {'calls': 0, 'guesses': 0, 'retries': 0},
+        }
+        for instance in cls._instances:
+            for solver in totals:
+                for key in ('calls', 'guesses', 'retries'):
+                    totals[solver][key] += instance._solver_stats[solver][key]
+
+        print("\n=== TabularThermo Solver Statistics (All Instances) ===")
+        print(f"  Number of TabularThermo instances: {len(cls._instances)}")
+        for solver, stats in totals.items():
+            calls = stats['calls']
+            guesses = stats['guesses']
+            retries = stats['retries']
+            cache_hits = calls - guesses if calls > 0 else 0
+            hit_rate = 100.0 * cache_hits / calls if calls > 0 else 0.0
+            print(f"  {solver}:")
+            print(f"    calls: {calls}, guesses: {guesses}, retries: {retries}")
+            print(f"    cache hit rate: {hit_rate:.1f}%")
+        print("========================================================\n")
+
+    @classmethod
+    def reset_all_solver_stats(cls):
+        """Reset solver statistics for all TabularThermo instances."""
+        for instance in cls._instances:
+            instance.reset_solver_stats()
+
+    @classmethod
+    def clear_instances(cls):
+        """Clear the instance registry (call between test runs if needed)."""
+        cls._instances = []
 
     def _lookup_si(self, prop, T_si, P_si, FAR=None):
         """Internal lookup function in SI units."""
@@ -394,11 +462,16 @@ class TabularThermo(ThermoInterface):
         max_iter = 20
         tol = 1e-10
 
+        # Track solver stats
+        if not _retry:
+            self._solver_stats['T_from_hP']['calls'] += 1
+
         # Apply initial guess if needed, otherwise use cached value
         if self._needs_guess_T_from_hP:
             # Empirical initial guess: h ≈ Cp * T, so T ≈ h / Cp
             T = max(300.0, min(2000.0, abs(h_target_si) / 1000.0 + 300.0))
             self._needs_guess_T_from_hP = False
+            self._solver_stats['T_from_hP']['guesses'] += 1
         else:
             T = self._cache_T_from_hP
 
@@ -439,6 +512,7 @@ class TabularThermo(ThermoInterface):
         # If not converged and haven't retried, reset guess flag and retry once
         if not converged and not _retry:
             self._needs_guess_T_from_hP = True
+            self._solver_stats['T_from_hP']['retries'] += 1
             return self._T_from_hP_si(h_target_si, P_si, FAR, _retry=True)
 
         # Cache the converged solution
@@ -554,12 +628,17 @@ class TabularThermo(ThermoInterface):
         max_iter = 20
         tol = 1e-10
 
+        # Track solver stats
+        if not _retry:
+            self._solver_stats['static_MN']['calls'] += 1
+
         # Apply initial guess if needed, otherwise use cached values
         if self._needs_guess_static_MN:
             # Initial guesses using ideal gas isentropic relations
             Ps = self._ideal_gas_Ps_guess(Tt_si, Pt_si, MN, gamma_t)
             # Ts from isentropic relation: Ts/Tt = (Ps/Pt)^((gamma-1)/gamma)
             Ts = Tt_si * (Ps / Pt_si) ** ((gamma_t - 1.0) / gamma_t)
+            self._solver_stats['static_MN']['guesses'] += 1
             self._needs_guess_static_MN = False
         else:
             Ts, Ps = self._cache_static_MN
@@ -647,6 +726,7 @@ class TabularThermo(ThermoInterface):
         # If not converged and haven't retried, reset guess flag and retry once
         if not converged and not _retry:
             self._needs_guess_static_MN = True
+            self._solver_stats['static_MN']['retries'] += 1
             return self._static_from_MN_si(Tt_si, Pt_si, MN, W_si, FAR, _retry=True)
 
         # Cache the converged solution
@@ -698,11 +778,16 @@ class TabularThermo(ThermoInterface):
         max_iter = 20
         tol = 1e-10
 
+        # Track solver stats
+        if not _retry:
+            self._solver_stats['T_from_SP']['calls'] += 1
+
         # Apply initial guess if needed, otherwise use cached value
         if self._needs_guess_T_from_SP:
             # Empirical initial guess: mid-range temperature
             T = 800.0
             self._needs_guess_T_from_SP = False
+            self._solver_stats['T_from_SP']['guesses'] += 1
         else:
             T = self._cache_T_from_SP
 
@@ -743,6 +828,7 @@ class TabularThermo(ThermoInterface):
         # If not converged and haven't retried, reset guess flag and retry once
         if not converged and not _retry:
             self._needs_guess_T_from_SP = True
+            self._solver_stats['T_from_SP']['retries'] += 1
             return self._T_from_SP_si(S_target_si, P_si, FAR, _retry=True)
 
         # Cache the converged solution

@@ -498,7 +498,10 @@ if __name__ == "__main__":
     print("Run time", time.time() - st)
 
     # Print timing stats
-    print_timing_stats()       # JaxElement (NewDuct) timing
-    print_jax_thermo_timing()  # JaxThermo internal timing
-    TabularThermo.print_profile_static_MN()  # Detailed profiling
-    print_duct_timing_stats()  # Original Duct timing
+    # print_timing_stats()       # JaxElement (NewDuct) timing
+    # print_jax_thermo_timing()  # JaxThermo internal timing
+    # TabularThermo.print_profile_static_MN()  # Detailed profiling
+    # print_duct_timing_stats()  # Original Duct timing
+
+
+    TabularThermo.print_all_solver_stats()  
