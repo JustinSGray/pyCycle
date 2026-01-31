@@ -473,7 +473,7 @@ class JaxElement(om.ExplicitComponent):
         _jax_element_timing_stats['post_linearize_time'] += (time.perf_counter() - t_start)
 
     def _compute_jacobian_fwd(self, args):
-        """Compute Jacobian using forward-mode with sequential JVP calls."""
+        """Compute Jacobian using forward-mode with sequential JIT-compiled JVP calls."""
         n_inputs = len(args)
         n_outputs = len(self._primal_output_names)
         jacs = [np.zeros(n_outputs) for _ in range(n_inputs)]
@@ -481,7 +481,6 @@ class JaxElement(om.ExplicitComponent):
 
         # Create JIT-compiled single-direction JVP function on first call
         if self._jit_jvp_fn is None:
-            # Wrap compute_physics to return a JAX array
             compute_physics = self.compute_physics
             def jvp_wrapper(args_tuple, tangents_tuple):
                 _, jvp_out = jax.jvp(compute_physics, args_tuple, tangents_tuple)
