@@ -5,15 +5,7 @@ import numpy as np
 import openmdao.api as om
 
 import pycycle.api as pyc
-
-# Import timing stats for profiling
-   
-from pycycle.jax_element_base import reset_timing_stats, print_timing_stats, get_timing_stats
-
-from pycycle.functional_thermo.jax_tabular import (                                                                                                                               
-      enable_thermo_profiling, reset_thermo_stats, print_thermo_stats                                                                                                               
-  )                                                                                                                                                                                 
-                                                                                                                                                                                    
+                                                                                                                                                                          
 
 class HBTF(pyc.Cycle):
 
@@ -445,13 +437,6 @@ if __name__ == "__main__":
 
     st = time.time()
 
-    # Reset timing stats before the run
-    reset_timing_stats()
-
-    enable_thermo_profiling()                                                                                                                                                         
-    reset_thermo_stats() 
-
-
     prob.set_solver_print(level=-1)
     prob.set_solver_print(level=2, depth=2)
 
@@ -499,11 +484,3 @@ if __name__ == "__main__":
 
     print()
     print("Run time", time.time() - st)
-
-    # Print timing stats
-    # print_timing_stats()       # JaxElement (NewDuct) timing
-    # print_jax_thermo_timing()  # JaxThermo internal timing
-    # print_duct_timing_stats()  # Original Duct timing
-
-    # print_timing_stats()
-    # print_thermo_stats() 

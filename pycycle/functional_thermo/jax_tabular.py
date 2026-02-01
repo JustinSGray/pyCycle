@@ -5,11 +5,12 @@ This module provides JAX-traceable versions of the tabular thermo operations,
 eliminating the need for pure_callback and enabling efficient JIT compilation.
 """
 
-import time
 from collections import namedtuple
 
 import jax
 import jax.numpy as jnp
+
+from pycycle.functional_thermo.base import TotalProps, StaticProps
 
 
 # =============================================================================
@@ -31,85 +32,11 @@ _R_IDX = 6
 # Named Tuples for Property Returns
 # =============================================================================
 
-# Import from base to ensure consistency
-from pycycle.functional_thermo.base import TotalProps, StaticProps
-
 StaticPropsWithDeriv = namedtuple('StaticPropsWithDeriv', [
     'Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
     'gamma', 'Cp', 'Cv', 'S', 'R', 'darea_dMN'
 ])
 """Static properties plus darea/dMN derivative (for static_from_MN)."""
-
-
-# =============================================================================
-# Thermo Profiling Infrastructure
-# =============================================================================
-
-_thermo_profiling_enabled = False
-
-_thermo_stats = {
-    # Call counts
-    'props_TP_calls': 0,
-    'T_from_hP_calls': 0,
-    'static_from_MN_calls': 0,
-    'static_from_area_calls': 0,
-    # Timing (only when profiling enabled)
-    'props_TP_time': 0.0,
-    'T_from_hP_time': 0.0,
-    'static_from_MN_time': 0.0,
-    'static_from_area_time': 0.0,
-    # Newton iteration tracking (filled by debug runs)
-    'T_from_hP_total_iters': 0,
-    'static_from_MN_total_iters': 0,
-    'static_from_area_total_iters': 0,
-}
-
-
-def enable_thermo_profiling():
-    """Enable detailed thermo profiling (adds timing overhead)."""
-    global _thermo_profiling_enabled
-    _thermo_profiling_enabled = True
-
-
-def disable_thermo_profiling():
-    """Disable thermo profiling."""
-    global _thermo_profiling_enabled
-    _thermo_profiling_enabled = False
-
-
-def reset_thermo_stats():
-    """Reset all thermo profiling statistics."""
-    for key in _thermo_stats:
-        _thermo_stats[key] = 0.0 if 'time' in key else 0
-
-
-def get_thermo_stats():
-    """Return a copy of the thermo statistics dictionary."""
-    return dict(_thermo_stats)
-
-
-def print_thermo_stats():
-    """Print detailed thermo profiling statistics."""
-    stats = _thermo_stats
-    print("\n=== JaxTabularThermo Profiling Statistics ===")
-
-    for method in ['props_TP', 'T_from_hP', 'static_from_MN', 'static_from_area']:
-        calls = stats[f'{method}_calls']
-        time_ms = stats[f'{method}_time'] * 1000
-        if calls > 0:
-            avg_ms = time_ms / calls
-            print(f"  {method}:")
-            print(f"    calls: {calls}")
-            print(f"    total time: {time_ms:.3f} ms")
-            print(f"    avg time: {avg_ms:.3f} ms")
-
-            # Show Newton iterations if available
-            iter_key = f'{method}_total_iters'
-            if iter_key in stats and stats[iter_key] > 0:
-                avg_iters = stats[iter_key] / calls
-                print(f"    avg Newton iters: {avg_iters:.1f}")
-
-    print("=============================================\n")
 
 
 class JaxTrilinearInterp:
@@ -387,34 +314,20 @@ class JaxTabularThermo:
                 return (T_si_new, residual, i + 1)
 
             # Initialize state: (T_si, residual, iteration)
-            # Use h_and_deriv for initial residual (consistent with body_fn)
             h_init, _ = h_and_deriv(T_si_init)
             residual_init = h_init - h_target_si
             init_state = (T_si_init, residual_init, 0)
 
             # Run Newton iteration
             final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
-            T_si = final_state[0]
-            n_iters = final_state[2]
-
-            return T_si / T_to_si_scale, n_iters
+            return final_state[0] / T_to_si_scale
 
         self._props_TP_jit = _props_TP_jit
-        self._T_from_hP_jit_with_iters = jax.jit(_T_from_hP_jit)
-
-        # Wrapper that discards iteration count for normal use
-        @jax.jit
-        def _T_from_hP_jit_simple(h_target, P, FAR):
-            result, _ = _T_from_hP_jit(h_target, P, FAR)
-            return result
-
-        self._T_from_hP_jit = _T_from_hP_jit_simple
+        self._T_from_hP_jit = _T_from_hP_jit
 
     def T_from_hP(self, h_target, P, FAR):
         """
         Solve for temperature given enthalpy and pressure.
-
-        Pure JAX implementation using Newton's method with JAX interpolation.
 
         Parameters
         ----------
@@ -430,16 +343,6 @@ class JaxTabularThermo:
         float
             Temperature (English units: Rankine)
         """
-        # Check if we're being traced by JAX (can't do Python profiling during tracing)
-        is_tracing = isinstance(h_target, jax.core.Tracer)
-        if not is_tracing:
-            _thermo_stats['T_from_hP_calls'] += 1
-            if _thermo_profiling_enabled:
-                t0 = time.perf_counter()
-                result, n_iters = self._T_from_hP_jit_with_iters(h_target, P, FAR)
-                _thermo_stats['T_from_hP_time'] += time.perf_counter() - t0
-                _thermo_stats['T_from_hP_total_iters'] += int(n_iters)
-                return result
         return self._T_from_hP_jit(h_target, P, FAR)
 
     def props_TP(self, T, P, FAR):
@@ -457,24 +360,14 @@ class JaxTabularThermo:
 
         Returns
         -------
-        array
-            [h, S, gamma, Cp, Cv, rho, R] in English units
+        TotalProps
+            Named tuple with (h, S, gamma, Cp, Cv, rho, R) in English units
         """
-        is_tracing = isinstance(T, jax.core.Tracer)
-        if not is_tracing:
-            _thermo_stats['props_TP_calls'] += 1
-            if _thermo_profiling_enabled:
-                t0 = time.perf_counter()
-                result = self._props_TP_jit(T, P, FAR)
-                _thermo_stats['props_TP_time'] += time.perf_counter() - t0
-                return result
         return self._props_TP_jit(T, P, FAR)
 
     def static_from_MN(self, Tt, Pt, MN, W, FAR):
         """
         Compute static properties from total conditions and Mach number.
-
-        Pure JAX implementation using 2D Newton solver.
 
         Parameters
         ----------
@@ -491,25 +384,14 @@ class JaxTabularThermo:
 
         Returns
         -------
-        array
-            [Ts, Ps, hs, rhos, MN, V, Vsonic, area, gamma, Cp, Cv, S, R]
-            in English units
+        StaticPropsWithDeriv
+            Named tuple with static properties plus darea/dMN derivative
         """
-        is_tracing = isinstance(Tt, jax.core.Tracer)
-        if not is_tracing:
-            _thermo_stats['static_from_MN_calls'] += 1
-            if _thermo_profiling_enabled:
-                t0 = time.perf_counter()
-                result = self._static_from_MN_jit(Tt, Pt, MN, W, FAR)
-                _thermo_stats['static_from_MN_time'] += time.perf_counter() - t0
-                return result
         return self._static_from_MN_jit(Tt, Pt, MN, W, FAR)
 
     def static_from_area(self, Tt, Pt, area, W, FAR):
         """
         Compute static properties from total conditions and flow area.
-
-        Pure JAX implementation using nested Newton solvers.
 
         Parameters
         ----------
@@ -526,18 +408,9 @@ class JaxTabularThermo:
 
         Returns
         -------
-        array
-            [Ts, Ps, hs, rhos, MN, V, Vsonic, area, gamma, Cp, Cv, S, R]
-            in English units
+        StaticProps
+            Named tuple with static properties
         """
-        is_tracing = isinstance(Tt, jax.core.Tracer)
-        if not is_tracing:
-            _thermo_stats['static_from_area_calls'] += 1
-            if _thermo_profiling_enabled:
-                t0 = time.perf_counter()
-                result = self._static_from_area_jit(Tt, Pt, area, W, FAR)
-                _thermo_stats['static_from_area_time'] += time.perf_counter() - t0
-                return result
         return self._static_from_area_jit(Tt, Pt, area, W, FAR)
 
     def _setup_static_functions(self):
