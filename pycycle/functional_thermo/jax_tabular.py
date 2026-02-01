@@ -13,6 +13,21 @@ import jax.numpy as jnp
 
 
 # =============================================================================
+# Property Index Constants (for array-based interpolation returns)
+# =============================================================================
+
+# Indices into the stacked property array returned by interpolation
+# Order must match JaxTrilinearInterp initialization in JaxTabularThermo.__init__
+_H_IDX = 0
+_S_IDX = 1
+_GAMMA_IDX = 2
+_CP_IDX = 3
+_CV_IDX = 4
+_RHO_IDX = 5
+_R_IDX = 6
+
+
+# =============================================================================
 # Named Tuples for Property Returns
 # =============================================================================
 
@@ -117,14 +132,17 @@ class JaxTrilinearInterp:
         self.grid = tuple(jnp.array(g) for g in grid)
         self.grid_sizes = tuple(len(g) for g in grid)
 
-        # Store property names and stack values for efficient access
-        self.property_names = list(values_dict.keys())
-
-        # Stack all value tables: shape (n_props, nFAR, nP, nT)
-        self._stacked_values = jnp.stack(
-            [jnp.array(values_dict[name]) for name in self.property_names],
-            axis=0
-        )
+        # Stack all value tables in fixed order matching index constants
+        # Order: h, S, gamma, Cp, Cv, rho, R (indices 0-6)
+        self._stacked_values = jnp.stack([
+            jnp.array(values_dict['h']),
+            jnp.array(values_dict['S']),
+            jnp.array(values_dict['gamma']),
+            jnp.array(values_dict['Cp']),
+            jnp.array(values_dict['Cv']),
+            jnp.array(values_dict['rho']),
+            jnp.array(values_dict['R']),
+        ], axis=0)
 
     def _find_cell_idx(self, x, grid):
         """Find cell index using searchsorted equivalent in JAX."""
@@ -196,8 +214,8 @@ class JaxTrilinearInterp:
 
         Returns
         -------
-        dict
-            Property values at the interpolation point
+        array
+            Property values at the interpolation point, indexed by _H_IDX, _S_IDX, etc.
         """
         i_FAR, i_P, i_T, xd, yd, zd, _, _ = self._find_cell_and_coords(point)
 
@@ -214,42 +232,7 @@ class JaxTrilinearInterp:
 
         values, *_ = self._trilinear_core(c000, c001, c010, c011, c100, c101, c110, c111, xd, yd, zd)
 
-        return {name: values[i] for i, name in enumerate(self.property_names)}
-
-    def interpolate_single(self, point, prop_idx):
-        """
-        Interpolate a single property at the given point.
-
-        More efficient than interpolate() when only one property is needed.
-
-        Parameters
-        ----------
-        point : array-like
-            (FAR, P, T) coordinates
-        prop_idx : int
-            Index of the property to interpolate
-
-        Returns
-        -------
-        float
-            Property value at the interpolation point
-        """
-        i_FAR, i_P, i_T, xd, yd, zd, _, _ = self._find_cell_and_coords(point)
-
-        # Get corner values for single property
-        vals = self._stacked_values[prop_idx]
-        c000 = vals[i_FAR, i_P, i_T]
-        c001 = vals[i_FAR, i_P, i_T + 1]
-        c010 = vals[i_FAR, i_P + 1, i_T]
-        c011 = vals[i_FAR, i_P + 1, i_T + 1]
-        c100 = vals[i_FAR + 1, i_P, i_T]
-        c101 = vals[i_FAR + 1, i_P, i_T + 1]
-        c110 = vals[i_FAR + 1, i_P + 1, i_T]
-        c111 = vals[i_FAR + 1, i_P + 1, i_T + 1]
-
-        value, *_ = self._trilinear_core(c000, c001, c010, c011, c100, c101, c110, c111, xd, yd, zd)
-
-        return value
+        return values
 
     def interpolate_with_derivs(self, point):
         """
@@ -265,11 +248,11 @@ class JaxTrilinearInterp:
 
         Returns
         -------
-        values : dict
-            Property values at the interpolation point
-        dvalues_dP : dict
+        values : array
+            Property values at the interpolation point, indexed by _H_IDX, _S_IDX, etc.
+        dvalues_dP : array
             Derivatives of properties w.r.t. P (second coordinate)
-        dvalues_dT : dict
+        dvalues_dT : array
             Derivatives of properties w.r.t. T (third coordinate)
         """
         i_FAR, i_P, i_T, xd, yd, zd, dy, dz = self._find_cell_and_coords(point)
@@ -300,11 +283,7 @@ class JaxTrilinearInterp:
         dc1_dyd = c11 - c01
         dvalues_dP = (dc0_dyd * (1 - zd) + dc1_dyd * zd) / dy
 
-        return (
-            {name: values[i] for i, name in enumerate(self.property_names)},
-            {name: dvalues_dP[i] for i, name in enumerate(self.property_names)},
-            {name: dvalues_dT[i] for i, name in enumerate(self.property_names)},
-        )
+        return values, dvalues_dP, dvalues_dT
 
 
 class JaxTabularThermo:
@@ -363,13 +342,13 @@ class JaxTabularThermo:
             props_si = interp.interpolate(point)
 
             return TotalProps(
-                h=props_si['h'] * h_from_si,
-                S=props_si['S'] * S_from_si,
-                gamma=props_si['gamma'],
-                Cp=props_si['Cp'] * S_from_si,
-                Cv=props_si['Cv'] * S_from_si,
-                rho=props_si['rho'] * rho_from_si,
-                R=props_si['R'] * S_from_si,
+                h=props_si[_H_IDX] * h_from_si,
+                S=props_si[_S_IDX] * S_from_si,
+                gamma=props_si[_GAMMA_IDX],
+                Cp=props_si[_CP_IDX] * S_from_si,
+                Cv=props_si[_CV_IDX] * S_from_si,
+                rho=props_si[_RHO_IDX] * rho_from_si,
+                R=props_si[_R_IDX] * S_from_si,
             )
 
         @jax.jit
@@ -385,35 +364,32 @@ class JaxTabularThermo:
                 """Get h and dh/dT using analytical derivatives from interpolator."""
                 point = jnp.array([FAR, P_si, T_si])
                 props, _, dprops_dT = interp.interpolate_with_derivs(point)
-                return props['h'], dprops_dT['h']
-
-            def h_only(T_si):
-                """Get h value only (more efficient for residual check)."""
-                point = jnp.array([FAR, P_si, T_si])
-                return interp.interpolate_single(point, 0)  # h is at index 0
+                return props[_H_IDX], dprops_dT[_H_IDX]
 
             def cond_fn(state):
                 T_si, residual, i = state
                 return (jnp.abs(residual) > 1e-8) & (i < 20)
 
             def body_fn(state):
-                T_si, _, i = state
+                T_si, residual, i = state
 
-                # Get h and analytical dh/dT from interpolator
+                # Get h and analytical dh/dT from interpolator (single interpolation)
                 h_si, dh_dT = h_and_deriv(T_si)
                 residual = h_si - h_target_si
-                dh_dT = jnp.where(jnp.abs(dh_dT) < 1e-20, 1e-20, dh_dT)
+                dh_dT_safe = jnp.where(jnp.abs(dh_dT) < 1e-20, 1e-20, dh_dT)
 
                 # Newton step with bounds
-                dx = -residual / dh_dT
+                dx = -residual / dh_dT_safe
                 T_si_new = jnp.clip(T_si + dx, 160.0, 2400.0)
 
-                # Compute new residual for convergence check
-                residual_new = h_only(T_si_new) - h_target_si
-                return (T_si_new, residual_new, i + 1)
+                # Return current residual for convergence check
+                # (when residual is small, Newton step is small, so we're converged)
+                return (T_si_new, residual, i + 1)
 
             # Initialize state: (T_si, residual, iteration)
-            residual_init = h_only(T_si_init) - h_target_si
+            # Use h_and_deriv for initial residual (consistent with body_fn)
+            h_init, _ = h_and_deriv(T_si_init)
+            residual_init = h_init - h_target_si
             init_state = (T_si_init, residual_init, 0)
 
             # Run Newton iteration
@@ -658,12 +634,12 @@ class JaxTabularThermo:
 
             # Get total properties
             tot_props = props_at_TP_si(Tt_si, Pt_si, FAR)
-            ht_si = tot_props['h']
-            S_total = tot_props['S']
-            gamma_t = tot_props['gamma']
-            R_t = tot_props['R']
-            Cp_t = tot_props['Cp']
-            Cv_t = tot_props['Cv']
+            ht_si = tot_props[_H_IDX]
+            S_total = tot_props[_S_IDX]
+            gamma_t = tot_props[_GAMMA_IDX]
+            R_t = tot_props[_R_IDX]
+            Cp_t = tot_props[_CP_IDX]
+            Cv_t = tot_props[_CV_IDX]
 
             # Clamp MN
             MN_clamped = jnp.maximum(MN, 1e-10)
@@ -672,11 +648,18 @@ class JaxTabularThermo:
             # Initial guess
             Ts0_si, Ps0_si = compute_isentropic_initial_guess(Tt_si, Pt_si, gamma_t, MN_clamped)
 
-            # 2D Newton state: [Ts, Ps, R1, R2, S, hs, gamma, R,
+            # 2D Newton state: [Ts, Ps, R1, R2, S, hs, gamma, R, Cp, Cv,
             #                   dS_dT, dS_dP, dh_dT, dh_dP, dgamma_dT, dgamma_dP, dR_dT, dR_dP, iter]
+            # Indices:          0   1   2   3   4   5    6     7   8   9
+            #                   10    11     12     13     14        15        16     17     18
             def compute_state_2d(Ts_si, Ps_si, i):
                 props_s, dprops_dP, dprops_dT = props_at_TP_si_with_derivs(Ts_si, Ps_si, FAR)
-                S_s, hs_si, gamma_s, R_s = props_s['S'], props_s['h'], props_s['gamma'], props_s['R']
+                S_s = props_s[_S_IDX]
+                hs_si = props_s[_H_IDX]
+                gamma_s = props_s[_GAMMA_IDX]
+                R_s = props_s[_R_IDX]
+                Cp_s = props_s[_CP_IDX]
+                Cv_s = props_s[_CV_IDX]
 
                 Vsonic_sq = gamma_s * R_s * Ts_si
                 R1 = S_s - S_total
@@ -684,26 +667,26 @@ class JaxTabularThermo:
 
                 return jnp.array([
                     Ts_si, Ps_si, R1, R2,
-                    S_s, hs_si, gamma_s, R_s,
-                    dprops_dT['S'], dprops_dP['S'], dprops_dT['h'], dprops_dP['h'],
-                    dprops_dT['gamma'], dprops_dP['gamma'], dprops_dT['R'], dprops_dP['R'],
+                    S_s, hs_si, gamma_s, R_s, Cp_s, Cv_s,
+                    dprops_dT[_S_IDX], dprops_dP[_S_IDX], dprops_dT[_H_IDX], dprops_dP[_H_IDX],
+                    dprops_dT[_GAMMA_IDX], dprops_dP[_GAMMA_IDX], dprops_dT[_R_IDX], dprops_dP[_R_IDX],
                     i
                 ])
 
             def cond_fn_2d(state):
-                R1, R2, i = state[2], state[3], state[16]
+                R1, R2, i = state[2], state[3], state[18]
                 return (jnp.sqrt(R1**2 + R2**2) > 1e-8) & (i < 20)
 
             def body_fn_2d(state):
                 Ts_si, Ps_si = state[0], state[1]
                 R1, R2 = state[2], state[3]
                 gamma_s, R_s = state[6], state[7]
-                i = state[16]
+                i = state[18]
 
                 dR1_dT, dR1_dP, dR2_dT, dR2_dP = compute_R1_R2_jacobian(
                     Ts_si, MN_sq, gamma_s, R_s,
-                    state[8], state[9], state[10], state[11],
-                    state[12], state[13], state[14], state[15]
+                    state[10], state[11], state[12], state[13],
+                    state[14], state[15], state[16], state[17]
                 )
 
                 dTs, dPs = solve_2x2(dR1_dT, dR1_dP, dR2_dT, dR2_dP, R1, R2)
@@ -716,14 +699,11 @@ class JaxTabularThermo:
             init_state = compute_state_2d(Ts0_si, Ps0_si, 0.0)
             final_state = jax.lax.while_loop(cond_fn_2d, body_fn_2d, init_state)
 
-            # Extract solution
+            # Extract solution (Cp, Cv now in state at indices 8, 9)
             Ts_newton, Ps_newton = final_state[0], final_state[1]
             S_newton, hs_newton = final_state[4], final_state[5]
             gamma_newton, R_newton = final_state[6], final_state[7]
-
-            # Get Cp, Cv (not in state)
-            props_final = props_at_TP_si(Ts_newton, Ps_newton, FAR)
-            Cp_newton, Cv_newton = props_final['Cp'], props_final['Cv']
+            Cp_newton, Cv_newton = final_state[8], final_state[9]
 
             # Compute derived quantities
             rhos_newton = Ps_newton / (R_newton * Ts_newton)
@@ -735,8 +715,8 @@ class JaxTabularThermo:
             Vsonic_sq_newton = gamma_newton * R_newton * Ts_newton
             dR1_dT, dR1_dP, dR2_dT, dR2_dP = compute_R1_R2_jacobian(
                 Ts_newton, MN_sq, gamma_newton, R_newton,
-                final_state[8], final_state[9], final_state[10], final_state[11],
-                final_state[12], final_state[13], final_state[14], final_state[15]
+                final_state[10], final_state[11], final_state[12], final_state[13],
+                final_state[14], final_state[15], final_state[16], final_state[17]
             )
 
             # Solve for dTs/dMN, dPs/dMN: J * [dTs/dMN; dPs/dMN] = [0; -MN*Vsonic²]
@@ -747,8 +727,8 @@ class JaxTabularThermo:
             dPs_dMN = (dR1_dT * rhs_MN) / det
 
             # Chain rule for derived quantities
-            dgamma_dT, dgamma_dP = final_state[12], final_state[13]
-            dR_dT, dR_dP = final_state[14], final_state[15]
+            dgamma_dT, dgamma_dP = final_state[14], final_state[15]
+            dR_dT, dR_dP = final_state[16], final_state[17]
             dgamma_dMN = dgamma_dT * dTs_dMN + dgamma_dP * dPs_dMN
             dR_dMN = dR_dT * dTs_dMN + dR_dP * dPs_dMN
 
@@ -803,20 +783,28 @@ class JaxTabularThermo:
 
             # Get total properties
             tot_props = props_at_TP_si(Tt_si, Pt_si, FAR)
-            ht_si = tot_props['h']
-            S_total = tot_props['S']
-            gamma_t = tot_props['gamma']
+            ht_si = tot_props[_H_IDX]
+            S_total = tot_props[_S_IDX]
+            gamma_t = tot_props[_GAMMA_IDX]
 
             # Initial guess
             MN0 = 0.5
             Ts0_si, Ps0_si = compute_isentropic_initial_guess(Tt_si, Pt_si, gamma_t, MN0)
 
-            # 3D Newton state: [Ts, Ps, MN, R1, R2, R3, S, hs, gamma, R,
+            # 3D Newton state: [Ts, Ps, MN, R1, R2, R3, S, hs, gamma, R, Cp, Cv,
             #                   dS_dT, dS_dP, dh_dT, dh_dP, dgamma_dT, dgamma_dP, dR_dT, dR_dP,
             #                   area_computed, Vsonic_sq, iter]
+            # Indices:          0   1   2   3   4   5   6   7    8     9  10  11
+            #                   12    13     14     15     16        17        18     19
+            #                   20            21         22
             def compute_state_3d(Ts_si, Ps_si, MN, i):
                 props_s, dprops_dP, dprops_dT = props_at_TP_si_with_derivs(Ts_si, Ps_si, FAR)
-                S_s, hs_si, gamma_s, R_s = props_s['S'], props_s['h'], props_s['gamma'], props_s['R']
+                S_s = props_s[_S_IDX]
+                hs_si = props_s[_H_IDX]
+                gamma_s = props_s[_GAMMA_IDX]
+                R_s = props_s[_R_IDX]
+                Cp_s = props_s[_CP_IDX]
+                Cv_s = props_s[_CV_IDX]
 
                 MN_clamped = jnp.maximum(MN, 1e-10)
                 MN_sq = MN_clamped ** 2
@@ -831,22 +819,22 @@ class JaxTabularThermo:
 
                 return jnp.array([
                     Ts_si, Ps_si, MN, R1, R2, R3,
-                    S_s, hs_si, gamma_s, R_s,
-                    dprops_dT['S'], dprops_dP['S'], dprops_dT['h'], dprops_dP['h'],
-                    dprops_dT['gamma'], dprops_dP['gamma'], dprops_dT['R'], dprops_dP['R'],
+                    S_s, hs_si, gamma_s, R_s, Cp_s, Cv_s,
+                    dprops_dT[_S_IDX], dprops_dP[_S_IDX], dprops_dT[_H_IDX], dprops_dP[_H_IDX],
+                    dprops_dT[_GAMMA_IDX], dprops_dP[_GAMMA_IDX], dprops_dT[_R_IDX], dprops_dP[_R_IDX],
                     area_computed, Vsonic_sq, i
                 ])
 
             def cond_fn_3d(state):
-                R1, R2, R3, i = state[3], state[4], state[5], state[20]
+                R1, R2, R3, i = state[3], state[4], state[5], state[22]
                 return (jnp.sqrt(R1**2 + R2**2 + R3**2) > 1e-8) & (i < 30)
 
             def body_fn_3d(state):
                 Ts_si, Ps_si, MN = state[0], state[1], state[2]
                 R1, R2, R3 = state[3], state[4], state[5]
                 gamma_s, R_s = state[8], state[9]
-                area_computed, Vsonic_sq = state[18], state[19]
-                i = state[20]
+                area_computed, Vsonic_sq = state[20], state[21]
+                i = state[22]
 
                 MN_clamped = jnp.maximum(MN, 1e-10)
                 MN_sq = MN_clamped ** 2
@@ -854,14 +842,14 @@ class JaxTabularThermo:
                 # Jacobian rows 1 & 2 (shared with 2D solver)
                 dR1_dT, dR1_dP, dR2_dT, dR2_dP = compute_R1_R2_jacobian(
                     Ts_si, MN_sq, gamma_s, R_s,
-                    state[10], state[11], state[12], state[13],
-                    state[14], state[15], state[16], state[17]
+                    state[12], state[13], state[14], state[15],
+                    state[16], state[17], state[18], state[19]
                 )
                 dR2_dMN = MN_clamped * Vsonic_sq  # dR2/dMN = MN * γ * R * Ts
 
                 # Jacobian row 3 (area residual)
-                dgamma_dT, dgamma_dP = state[14], state[15]
-                dR_dT, dR_dP = state[16], state[17]
+                dgamma_dT, dgamma_dP = state[16], state[17]
+                dR_dT, dR_dP = state[18], state[19]
                 dR3_dT = 0.5 * area_computed * (dR_dT / R_s + 1.0 / Ts_si - dgamma_dT / gamma_s)
                 dR3_dP = area_computed * (-1.0 / Ps_si + 0.5 * dR_dP / R_s - 0.5 * dgamma_dP / gamma_s)
                 dR3_dMN = -area_computed / MN_clamped
@@ -888,19 +876,16 @@ class JaxTabularThermo:
             init_state = compute_state_3d(Ts0_si, Ps0_si, MN0, 0.0)
             final_state = jax.lax.while_loop(cond_fn_3d, body_fn_3d, init_state)
 
-            # Extract solution
+            # Extract solution (Cp, Cv now in state at indices 10, 11)
             Ts_si, Ps_si, MN_final = final_state[0], final_state[1], final_state[2]
             S_s, hs_si, gamma_s, R_s = final_state[6], final_state[7], final_state[8], final_state[9]
+            Cp_s, Cv_s = final_state[10], final_state[11]
 
             # Compute derived quantities
             rho_s = Ps_si / (R_s * Ts_si)
             Vsonic = jnp.sqrt(gamma_s * R_s * Ts_si)
             V_s = MN_final * Vsonic
             area_final = W_si / (rho_s * V_s)
-
-            # Get Cp, Cv
-            props_final = props_at_TP_si(Ts_si, Ps_si, FAR)
-            Cp_s, Cv_s = props_final['Cp'], props_final['Cv']
 
             # Convert to English and return
             return convert_static_to_english(
