@@ -14,7 +14,7 @@ from pycycle import constants
 
 class SetTotalSimpleTestCase(unittest.TestCase):
 
-    def test_set_total_TP(self):
+    def test_set_total_hP(self):
         p = om.Problem()
         p.model.add_subsystem('thermo', Thermo(mode='total_TP', 
                                                method='CEA', 
@@ -223,15 +223,15 @@ class TestStaticJanaf(unittest.TestCase):
                            method='CEA', 
                            thermo_kwargs={'composition': constants.CEA_AIR_COMPOSITION, 
                                            'spec': species_data.janaf }) 
-        p.model.add_subsystem('set_total_TP', total_TP)
+        p.model.add_subsystem('set_total_hP', total_TP)
 
         static_Ps =  Thermo(mode='static_Ps', 
                             method='CEA', 
                             thermo_kwargs={'composition': constants.CEA_AIR_COMPOSITION, 
                                            'spec': species_data.janaf }) 
         p.model.add_subsystem('set_static_Ps', static_Ps)
-        p.model.connect('set_total_TP.flow:S', 'set_static_Ps.S')
-        p.model.connect('set_total_TP.flow:h', 'set_static_Ps.ht')
+        p.model.connect('set_total_hP.flow:S', 'set_static_Ps.S')
+        p.model.connect('set_total_hP.flow:h', 'set_static_Ps.ht')
        
 
         p.setup()
@@ -246,8 +246,8 @@ class TestStaticJanaf(unittest.TestCase):
                 continue 
             # print(i, data[h_map['Tt']], data[h_map['Pt']], data[h_map['Ps']], data[h_map['W']], ';', data[h_map['MN']])
 
-            p.set_val('set_total_TP.T', data[h_map['Tt']], units='degR')
-            p.set_val('set_total_TP.P', data[h_map['Pt']], units='psi')
+            p.set_val('set_total_hP.T', data[h_map['Tt']], units='degR')
+            p.set_val('set_total_hP.P', data[h_map['Pt']], units='psi')
 
             p.set_val('set_static_Ps.Ps', data[h_map['Ps']], units='psi')
             p.set_val('set_static_Ps.W', data[h_map['W']], units='lbm/s')
@@ -264,7 +264,7 @@ class TestStaticJanaf(unittest.TestCase):
                            method='CEA', 
                            thermo_kwargs={'composition': constants.CEA_AIR_COMPOSITION, 
                                            'spec': species_data.janaf })  
-        p.model.add_subsystem('set_total_TP', total_TP)
+        p.model.add_subsystem('set_total_hP', total_TP)
 
         static_A =  Thermo(mode='static_A', 
                            method='CEA', 
@@ -272,10 +272,10 @@ class TestStaticJanaf(unittest.TestCase):
                                           'spec': species_data.janaf }) 
         p.model.add_subsystem('set_static_A', static_A)
         
-        p.model.connect('set_total_TP.flow:S', 'set_static_A.S')
-        p.model.connect('set_total_TP.flow:h', 'set_static_A.ht')
-        p.model.connect('set_total_TP.flow:gamma', 'set_static_A.guess:gamt')
-        p.model.connect('set_total_TP.flow:P', 'set_static_A.guess:Pt')
+        p.model.connect('set_total_hP.flow:S', 'set_static_A.S')
+        p.model.connect('set_total_hP.flow:h', 'set_static_A.ht')
+        p.model.connect('set_total_hP.flow:gamma', 'set_static_A.guess:gamt')
+        p.model.connect('set_total_hP.flow:P', 'set_static_A.guess:Pt')
 
         p.setup()
         # om.n2(p)
@@ -288,8 +288,8 @@ class TestStaticJanaf(unittest.TestCase):
         # 4 cases to check against
         for i, data in enumerate(self.ref_data):
 
-            p.set_val('set_total_TP.T', data[h_map['Tt']], units='degR')
-            p.set_val('set_total_TP.P', data[h_map['Pt']], units='psi')
+            p.set_val('set_total_hP.T', data[h_map['Tt']], units='degR')
+            p.set_val('set_total_hP.P', data[h_map['Pt']], units='psi')
 
             p.set_val('set_static_A.area', data[h_map['A']], units='inch**2')
             p.set_val('set_static_A.W', data[h_map['W']], units='lbm/s')
@@ -313,7 +313,7 @@ class TestStaticJanaf(unittest.TestCase):
                           method='CEA', 
                           thermo_kwargs={'composition': constants.CEA_AIR_COMPOSITION, 
                                            'spec': species_data.janaf }) 
-        p.model.add_subsystem('set_total_TP', total_TP)
+        p.model.add_subsystem('set_total_hP', total_TP)
 
         static_MN = Thermo(mode='static_MN', 
                            method='CEA', 
@@ -321,10 +321,10 @@ class TestStaticJanaf(unittest.TestCase):
                                            'spec': species_data.janaf }) 
         p.model.add_subsystem('set_static_MN', static_MN)
 
-        p.model.connect('set_total_TP.flow:S', 'set_static_MN.S')
-        p.model.connect('set_total_TP.flow:h', 'set_static_MN.ht')
-        p.model.connect('set_total_TP.flow:gamma', 'set_static_MN.guess:gamt')
-        p.model.connect('set_total_TP.flow:P', 'set_static_MN.guess:Pt')
+        p.model.connect('set_total_hP.flow:S', 'set_static_MN.S')
+        p.model.connect('set_total_hP.flow:h', 'set_static_MN.ht')
+        p.model.connect('set_total_hP.flow:gamma', 'set_static_MN.guess:gamt')
+        p.model.connect('set_total_hP.flow:P', 'set_static_MN.guess:Pt')
 
         p.set_solver_print(level=-1)
         p.setup(check=False)
@@ -336,8 +336,8 @@ class TestStaticJanaf(unittest.TestCase):
 
             # print(i, data[h_map['Tt']], data[h_map['Pt']], data[h_map['MN']], data[h_map['W']])
 
-            p.set_val('set_total_TP.T', data[h_map['Tt']], units='degR')
-            p.set_val('set_total_TP.P', data[h_map['Pt']], units='psi')
+            p.set_val('set_total_hP.T', data[h_map['Tt']], units='degR')
+            p.set_val('set_total_hP.P', data[h_map['Pt']], units='psi')
 
             p.set_val('set_static_MN.MN', data[h_map['MN']])
             p.set_val('set_static_MN.W', data[h_map['W']], units='lbm/s')

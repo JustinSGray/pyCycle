@@ -203,7 +203,7 @@ class ThermoInterface:
     # Total property calculations
     # =========================================================================
 
-    def props_TP(self, T, P):
+    def set_total_TP(self, T, P):
         """
         Compute thermodynamic properties from temperature and pressure.
 
@@ -219,7 +219,7 @@ class ThermoInterface:
         TotalProps
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in input units
         """
-        raise NotImplementedError("Subclass must implement props_TP")
+        raise NotImplementedError("Subclass must implement set_total_TP")
 
     def h(self, T, P):
         """Compute enthalpy from T and P (in input units)."""
@@ -253,7 +253,7 @@ class ThermoInterface:
     # Inverse calculations (solve for T)
     # =========================================================================
 
-    def T_from_hP(self, h, P):
+    def set_total_hP(self, h, P):
         """
         Solve for temperature given enthalpy and pressure.
 
@@ -269,7 +269,7 @@ class ThermoInterface:
         float
             Temperature (in input units) such that h(T, P) = h_target
         """
-        raise NotImplementedError("Subclass must implement T_from_hP")
+        raise NotImplementedError("Subclass must implement set_total_hP")
 
     def T_from_SP(self, S, P):
         """
@@ -293,7 +293,7 @@ class ThermoInterface:
     # Static property calculations (from total conditions)
     # =========================================================================
 
-    def static_from_MN(self, Tt, Pt, MN, W):
+    def set_static_MN(self, Tt, Pt, MN, W):
         """
         Compute static properties from total conditions and Mach number.
 
@@ -313,9 +313,9 @@ class ThermoInterface:
         StaticProps
             Named tuple with (Ts, Ps, hs, rhos, MN, V, Vsonic, area) in input units
         """
-        raise NotImplementedError("Subclass must implement static_from_MN")
+        raise NotImplementedError("Subclass must implement set_static_MN")
 
-    def static_from_area(self, Tt, Pt, area, W, MN_guess=0.5, subsonic=True):
+    def set_static_area(self, Tt, Pt, area, W, MN_guess=0.5, subsonic=True):
         """
         Compute static properties from total conditions and flow area.
 
@@ -339,7 +339,7 @@ class ThermoInterface:
         StaticProps
             Named tuple with (Ts, Ps, hs, rhos, MN, V, Vsonic, area) in input units
         """
-        raise NotImplementedError("Subclass must implement static_from_area")
+        raise NotImplementedError("Subclass must implement set_static_area")
 
     def static_from_Ps(self, Tt, Pt, Ps, W):
         """
@@ -441,7 +441,7 @@ class ThermoInterface:
 
     def linearize_static_MN(self, Tt, Pt, MN, W, FAR=None):
         """
-        Compute and cache gradients for static_from_MN at the given state.
+        Compute and cache gradients for set_static_MN at the given state.
 
         Parameters
         ----------
@@ -460,7 +460,7 @@ class ThermoInterface:
 
     def jvp_static_MN(self, Tt_dot, Pt_dot, MN_dot, W_dot, FAR_dot=0.0):
         """
-        Compute JVP for static_from_MN. Must call linearize_static_MN() first.
+        Compute JVP for set_static_MN. Must call linearize_static_MN() first.
 
         Parameters
         ----------
@@ -478,7 +478,7 @@ class ThermoInterface:
 
     def linearize_static_area(self, Tt, Pt, area, W, FAR=None):
         """
-        Compute and cache gradients for static_from_area at the given state.
+        Compute and cache gradients for set_static_area at the given state.
 
         Parameters
         ----------
@@ -497,7 +497,7 @@ class ThermoInterface:
 
     def jvp_static_area(self, Tt_dot, Pt_dot, area_dot, W_dot, FAR_dot=0.0):
         """
-        Compute JVP for static_from_area. Must call linearize_static_area() first.
+        Compute JVP for set_static_area. Must call linearize_static_area() first.
 
         Parameters
         ----------

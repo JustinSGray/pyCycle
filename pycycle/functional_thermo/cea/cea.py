@@ -336,7 +336,7 @@ class CEAThermo(ThermoInterface):
     # Public API - Total property calculations
     # =========================================================================
 
-    def props_TP(self, T, P):
+    def set_total_TP(self, T, P):
         """Compute all thermodynamic properties from T and P."""
         # Convert inputs to SI
         T_si = self._convert_T_to_si(T)
@@ -355,37 +355,37 @@ class CEAThermo(ThermoInterface):
 
     def h(self, T, P):
         """Compute enthalpy from T and P."""
-        return self.props_TP(T, P).h
+        return self.set_total_TP(T, P).h
 
     def S(self, T, P):
         """Compute entropy from T and P."""
-        return self.props_TP(T, P).S
+        return self.set_total_TP(T, P).S
 
     def gamma(self, T, P):
         """Compute ratio of specific heats from T and P."""
-        return self.props_TP(T, P).gamma
+        return self.set_total_TP(T, P).gamma
 
     def Cp(self, T, P):
         """Compute specific heat at constant pressure."""
-        return self.props_TP(T, P).Cp
+        return self.set_total_TP(T, P).Cp
 
     def Cv(self, T, P):
         """Compute specific heat at constant volume."""
-        return self.props_TP(T, P).Cv
+        return self.set_total_TP(T, P).Cv
 
     def rho(self, T, P):
         """Compute density from T and P."""
-        return self.props_TP(T, P).rho
+        return self.set_total_TP(T, P).rho
 
     def R(self, T, P):
         """Compute specific gas constant."""
-        return self.props_TP(T, P).R
+        return self.set_total_TP(T, P).R
 
     # =========================================================================
     # Inverse calculations
     # =========================================================================
 
-    def T_from_hP(self, h_target, P):
+    def set_total_hP(self, h_target, P):
         """Solve for temperature given enthalpy and pressure."""
         # Convert inputs to SI
         h_si = h_target * self._h_to_si
@@ -428,7 +428,7 @@ class CEAThermo(ThermoInterface):
     # Static property calculations
     # =========================================================================
 
-    def _static_from_MN_si(self, Tt_si, Pt_si, MN, W_si):
+    def _set_static_MN_si(self, Tt_si, Pt_si, MN, W_si):
         """Compute static properties in SI units."""
         # Get gamma and R at total conditions (in SI)
         n, pi, n_moles = self._solve_equilibrium(Tt_si, Pt_si)
@@ -467,19 +467,19 @@ class CEAThermo(ThermoInterface):
                           gamma=props_s.gamma, Cp=props_s.Cp, Cv=props_s.Cv,
                           S=props_s.S, R=props_s.R)
 
-    def static_from_MN(self, Tt, Pt, MN, W):
+    def set_static_MN(self, Tt, Pt, MN, W):
         """Compute static properties from total conditions and Mach number."""
         # Convert inputs to SI
         Tt_si = self._convert_T_to_si(Tt)
         Pt_si = Pt * self._P_to_si
         W_si = W * self._W_to_si
 
-        props_si = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si)
+        props_si = self._set_static_MN_si(Tt_si, Pt_si, MN, W_si)
 
         # Convert outputs from SI
         return self._convert_static_props_from_si(props_si)
 
-    def static_from_area(self, Tt, Pt, area, W, MN_guess=0.5, subsonic=True):
+    def set_static_area(self, Tt, Pt, area, W, MN_guess=0.5, subsonic=True):
         """Compute static properties from total conditions and flow area."""
         # Convert inputs to SI
         Tt_si = self._convert_T_to_si(Tt)
@@ -488,7 +488,7 @@ class CEAThermo(ThermoInterface):
         W_si = W * self._W_to_si
 
         def area_residual(MN):
-            props = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si)
+            props = self._set_static_MN_si(Tt_si, Pt_si, MN, W_si)
             return props.area - area_si
 
         if subsonic:
@@ -497,7 +497,7 @@ class CEAThermo(ThermoInterface):
             MN_min, MN_max = 1.001, 5.0
 
         MN = brentq(area_residual, MN_min, MN_max, xtol=1e-10)
-        props_si = self._static_from_MN_si(Tt_si, Pt_si, MN, W_si)
+        props_si = self._set_static_MN_si(Tt_si, Pt_si, MN, W_si)
 
         return self._convert_static_props_from_si(props_si)
 

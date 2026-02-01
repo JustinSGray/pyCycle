@@ -36,7 +36,7 @@ StaticPropsWithDeriv = namedtuple('StaticPropsWithDeriv', [
     'Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
     'gamma', 'Cp', 'Cv', 'S', 'R', 'darea_dMN'
 ])
-"""Static properties plus darea/dMN derivative (for static_from_MN)."""
+"""Static properties plus darea/dMN derivative (for set_static_MN)."""
 
 
 class JaxTrilinearInterp:
@@ -261,8 +261,8 @@ class JaxTabularThermo:
         h_to_si, h_from_si, P_to_si, T_to_si_scale, S_from_si, rho_from_si = self._unit_conversions
 
         @jax.jit
-        def _props_TP_jit(T, P, FAR):
-            """JIT-compiled props_TP."""
+        def _set_total_TP_jit(T, P, FAR):
+            """JIT-compiled set_total_TP."""
             T_si = T * T_to_si_scale
             P_si = P * P_to_si
             point = jnp.array([FAR, P_si, T_si])
@@ -279,8 +279,8 @@ class JaxTabularThermo:
             )
 
         @jax.jit
-        def _T_from_hP_jit(h_target, P, FAR):
-            """JIT-compiled T_from_hP with while_loop Newton solver."""
+        def _set_total_hP_jit(h_target, P, FAR):
+            """JIT-compiled set_total_hP with while_loop Newton solver."""
             h_target_si = h_target * h_to_si
             P_si = P * P_to_si
 
@@ -322,10 +322,10 @@ class JaxTabularThermo:
             final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
             return final_state[0] / T_to_si_scale
 
-        self._props_TP_jit = _props_TP_jit
-        self._T_from_hP_jit = _T_from_hP_jit
+        self._set_total_TP_jit = _set_total_TP_jit
+        self._set_total_hP_jit = _set_total_hP_jit
 
-    def T_from_hP(self, h_target, P, FAR):
+    def set_total_hP(self, h_target, P, FAR):
         """
         Solve for temperature given enthalpy and pressure.
 
@@ -343,9 +343,9 @@ class JaxTabularThermo:
         float
             Temperature (English units: Rankine)
         """
-        return self._T_from_hP_jit(h_target, P, FAR)
+        return self._set_total_hP_jit(h_target, P, FAR)
 
-    def props_TP(self, T, P, FAR):
+    def set_total_TP(self, T, P, FAR):
         """
         Get all thermodynamic properties at given T, P, FAR.
 
@@ -363,9 +363,9 @@ class JaxTabularThermo:
         TotalProps
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in English units
         """
-        return self._props_TP_jit(T, P, FAR)
+        return self._set_total_TP_jit(T, P, FAR)
 
-    def static_from_MN(self, Tt, Pt, MN, W, FAR):
+    def set_static_MN(self, Tt, Pt, MN, W, FAR):
         """
         Compute static properties from total conditions and Mach number.
 
@@ -387,9 +387,9 @@ class JaxTabularThermo:
         StaticPropsWithDeriv
             Named tuple with static properties plus darea/dMN derivative
         """
-        return self._static_from_MN_jit(Tt, Pt, MN, W, FAR)
+        return self._set_static_MN_jit(Tt, Pt, MN, W, FAR)
 
-    def static_from_area(self, Tt, Pt, area, W, FAR):
+    def set_static_area(self, Tt, Pt, area, W, FAR):
         """
         Compute static properties from total conditions and flow area.
 
@@ -411,7 +411,7 @@ class JaxTabularThermo:
         StaticProps
             Named tuple with static properties
         """
-        return self._static_from_area_jit(Tt, Pt, area, W, FAR)
+        return self._set_static_area_jit(Tt, Pt, area, W, FAR)
 
     def _setup_static_functions(self):
         """Create JIT-compiled versions of static property functions."""
@@ -495,11 +495,11 @@ class JaxTabularThermo:
             )
 
         # =====================================================================
-        # static_from_MN: 2D Newton solver for (Ts, Ps) given MN
+        # set_static_MN: 2D Newton solver for (Ts, Ps) given MN
         # =====================================================================
 
-        def static_from_MN_impl(Tt, Pt, MN, W, FAR):
-            """Pure JAX static_from_MN: solve for (Ts, Ps) given MN."""
+        def set_static_MN_impl(Tt, Pt, MN, W, FAR):
+            """Pure JAX set_static_MN: solve for (Ts, Ps) given MN."""
             # Convert inputs to SI
             Tt_si = Tt * T_to_si_scale
             Pt_si = Pt * P_to_si
@@ -643,11 +643,11 @@ class JaxTabularThermo:
             )
 
         # =====================================================================
-        # static_from_area: 3D Newton solver for (Ts, Ps, MN) given area
+        # set_static_area: 3D Newton solver for (Ts, Ps, MN) given area
         # =====================================================================
 
-        def static_from_area_impl(Tt, Pt, area, W, FAR):
-            """Pure JAX static_from_area: solve for (Ts, Ps, MN) given area."""
+        def set_static_area_impl(Tt, Pt, area, W, FAR):
+            """Pure JAX set_static_area: solve for (Ts, Ps, MN) given area."""
             # Convert inputs to SI
             Tt_si = Tt * T_to_si_scale
             Pt_si = Pt * P_to_si
@@ -767,5 +767,5 @@ class JaxTabularThermo:
             )
 
         # JIT compile
-        self._static_from_MN_jit = jax.jit(static_from_MN_impl)
-        self._static_from_area_jit = jax.jit(static_from_area_impl)
+        self._set_static_MN_jit = jax.jit(set_static_MN_impl)
+        self._set_static_area_jit = jax.jit(set_static_area_impl)

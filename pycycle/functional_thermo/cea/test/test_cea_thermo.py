@@ -15,9 +15,9 @@ class CEAThermoPropsTestCase(unittest.TestCase):
         self.T = 1500.0  # K
         self.P = 101325.0  # Pa (1 atm)
 
-    def test_props_TP(self):
-        """Test that props_TP returns all properties."""
-        props = self.thermo.props_TP(self.T, self.P)
+    def test_set_total_TP(self):
+        """Test that set_total_TP returns all properties."""
+        props = self.thermo.set_total_TP(self.T, self.P)
 
         # Check all properties are returned
         self.assertIsNotNone(props.h)
@@ -38,8 +38,8 @@ class CEAThermoPropsTestCase(unittest.TestCase):
         self.assertGreater(props.R, 200)  # R ~ 287 for air
 
     def test_individual_properties(self):
-        """Test individual property methods match props_TP."""
-        props = self.thermo.props_TP(self.T, self.P)
+        """Test individual property methods match set_total_TP."""
+        props = self.thermo.set_total_TP(self.T, self.P)
 
         self.assertAlmostEqual(self.thermo.h(self.T, self.P), props.h)
         self.assertAlmostEqual(self.thermo.S(self.T, self.P), props.S)
@@ -60,7 +60,7 @@ class CEAThermoPropsTestCase(unittest.TestCase):
     def test_temperature_range(self):
         """Test properties across temperature range."""
         for T in [500.0, 1000.0, 1500.0, 2000.0]:
-            props = self.thermo.props_TP(T, self.P)
+            props = self.thermo.set_total_TP(T, self.P)
 
             # All properties should be physically reasonable
             self.assertGreater(props.S, 0, f"S not positive at T={T}")
@@ -75,13 +75,13 @@ class CEAThermoInverseTestCase(unittest.TestCase):
     def setUp(self):
         self.thermo = CEAThermo()
 
-    def test_T_from_hP(self):
+    def test_set_total_hP(self):
         """Test recovering T from h and P."""
         T_original = 1500.0
         P = 101325.0
 
         h = self.thermo.h(T_original, P)
-        T_recovered = self.thermo.T_from_hP(h, P)
+        T_recovered = self.thermo.set_total_hP(h, P)
 
         self.assertAlmostEqual(T_original, T_recovered, places=2)
 
@@ -95,13 +95,13 @@ class CEAThermoInverseTestCase(unittest.TestCase):
 
         self.assertAlmostEqual(T_original, T_recovered, places=2)
 
-    def test_T_from_hP_range(self):
-        """Test T_from_hP across temperature range."""
+    def test_set_total_hP_range(self):
+        """Test set_total_hP across temperature range."""
         P = 101325.0
 
         for T_original in [500.0, 800.0, 1200.0, 1500.0]:
             h = self.thermo.h(T_original, P)
-            T_recovered = self.thermo.T_from_hP(h, P)
+            T_recovered = self.thermo.set_total_hP(h, P)
             self.assertAlmostEqual(T_original, T_recovered, places=1,
                                    msg=f"Round-trip failed at T={T_original}K")
 
@@ -115,10 +115,10 @@ class CEAThermoStaticTestCase(unittest.TestCase):
         self.Pt = 300000.0  # Pa
         self.W = 10.0  # kg/s
 
-    def test_static_from_MN(self):
+    def test_set_static_MN(self):
         """Test static properties from Mach number."""
         MN = 0.5
-        static = self.thermo.static_from_MN(self.Tt, self.Pt, MN, self.W)
+        static = self.thermo.set_static_MN(self.Tt, self.Pt, MN, self.W)
 
         # Static temperature < total temperature
         self.assertLess(static.Ts, self.Tt)
@@ -136,19 +136,19 @@ class CEAThermoStaticTestCase(unittest.TestCase):
         self.assertGreater(static.area, 0)
         self.assertGreater(static.rhos, 0)
 
-    def test_static_from_area(self):
-        """Test that static_from_area recovers correct Mach number."""
+    def test_set_static_area(self):
+        """Test that set_static_area recovers correct Mach number."""
         MN_original = 0.6
-        static1 = self.thermo.static_from_MN(self.Tt, self.Pt, MN_original, self.W)
+        static1 = self.thermo.set_static_MN(self.Tt, self.Pt, MN_original, self.W)
 
-        static2 = self.thermo.static_from_area(self.Tt, self.Pt, static1.area, self.W)
+        static2 = self.thermo.set_static_area(self.Tt, self.Pt, static1.area, self.W)
 
         self.assertAlmostEqual(static2.MN, MN_original, places=3)
 
     def test_static_from_Ps(self):
         """Test that static_from_Ps recovers correct Mach number."""
         MN_original = 0.4
-        static1 = self.thermo.static_from_MN(self.Tt, self.Pt, MN_original, self.W)
+        static1 = self.thermo.set_static_MN(self.Tt, self.Pt, MN_original, self.W)
 
         static2 = self.thermo.static_from_Ps(self.Tt, self.Pt, static1.Ps, self.W)
 

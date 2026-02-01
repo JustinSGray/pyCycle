@@ -17,7 +17,7 @@ class ChemEqTestCase(unittest.TestCase):
         p.model.suppress_solver_output = True
         p.model.set_input_defaults('P', 1.034210, units="bar")
 
-    def test_set_total_tp(self):
+    def test_set_total_hP(self):
         p = self.p
         p.model.add_subsystem('ceq', ChemEq(thermo=self.thermo), promotes=["*"])
         p.model.set_input_defaults('T', 1500., units='degK')

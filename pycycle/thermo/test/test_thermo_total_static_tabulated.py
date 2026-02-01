@@ -15,7 +15,7 @@ from pycycle import constants
 class SetTotalSimpleTestCase(unittest.TestCase):
     """Sanity check that compares TP, hP, SP sets manually""" 
 
-    def test_set_total_TP(self):
+    def test_set_total_hP(self):
         p = om.Problem()
         ivc = p.model.add_subsystem('ivc', om.IndepVarComp(), promotes=['*'])
         ivc.add_output('composition', val=np.zeros(1))
@@ -194,23 +194,23 @@ class TestStaticTabular(unittest.TestCase):
                            method='TABULAR', 
                            thermo_kwargs={'composition': constants.TAB_AIR_FUEL_COMPOSITION, 
                                            'spec': constants.AIR_JETA_TAB_SPEC }) 
-        p.model.add_subsystem('set_total_TP', total_TP, promotes=['composition'])
+        p.model.add_subsystem('set_total_hP', total_TP, promotes=['composition'])
 
         static_Ps =  Thermo(mode='static_Ps', 
                             method='TABULAR', 
                             thermo_kwargs={'composition': constants.TAB_AIR_FUEL_COMPOSITION, 
                                            'spec': constants.AIR_JETA_TAB_SPEC }) 
         p.model.add_subsystem('set_static_Ps', static_Ps, promotes_inputs=['composition'])
-        p.model.connect('set_total_TP.flow:S', 'set_static_Ps.S')
-        p.model.connect('set_total_TP.flow:h', 'set_static_Ps.ht')
+        p.model.connect('set_total_hP.flow:S', 'set_static_Ps.S')
+        p.model.connect('set_total_hP.flow:h', 'set_static_Ps.ht')
        
         static_MN =  Thermo(mode='static_MN', 
                             method='TABULAR', 
                             thermo_kwargs={'composition': constants.TAB_AIR_FUEL_COMPOSITION, 
                                            'spec': constants.AIR_JETA_TAB_SPEC }) 
         p.model.add_subsystem('set_static_MN', static_MN, promotes_inputs=['composition'])
-        p.model.connect('set_total_TP.flow:S', 'set_static_MN.S')
-        p.model.connect('set_total_TP.flow:h', 'set_static_MN.ht')
+        p.model.connect('set_total_hP.flow:S', 'set_static_MN.S')
+        p.model.connect('set_total_hP.flow:h', 'set_static_MN.ht')
         p.model.connect('set_static_Ps.flow:MN', 'set_static_MN.MN')
         
         static_area =  Thermo(mode='static_A', 
@@ -218,17 +218,17 @@ class TestStaticTabular(unittest.TestCase):
                             thermo_kwargs={'composition': constants.TAB_AIR_FUEL_COMPOSITION, 
                                            'spec': constants.AIR_JETA_TAB_SPEC }) 
         p.model.add_subsystem('set_static_area', static_area, promotes_inputs=['composition'])
-        p.model.connect('set_total_TP.flow:S', 'set_static_area.S')
-        p.model.connect('set_total_TP.flow:h', 'set_static_area.ht')
+        p.model.connect('set_total_hP.flow:S', 'set_static_area.S')
+        p.model.connect('set_total_hP.flow:h', 'set_static_area.ht')
         p.model.connect('set_static_Ps.flow:area', 'set_static_area.area')
-        p.model.connect('set_total_TP.flow:P',['set_static_MN.guess:Pt','set_static_area.guess:Pt'])
+        p.model.connect('set_total_hP.flow:P',['set_static_MN.guess:Pt','set_static_area.guess:Pt'])
 
         p.setup(force_alloc_complex=True)
         p.set_solver_print(level=2)
         p.final_setup()
 
-        p.set_val('set_total_TP.T', 1500, units='degR')
-        p.set_val('set_total_TP.P', 45, units='psi')
+        p.set_val('set_total_hP.T', 1500, units='degR')
+        p.set_val('set_total_hP.P', 45, units='psi')
 
         p.set_val('set_static_Ps.Ps', 30, units='psi')
         p.set_val('set_static_Ps.W', 1, units='lbm/s')

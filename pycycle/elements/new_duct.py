@@ -171,8 +171,8 @@ class NewDuct(JaxElement):
         # Total properties
         Pt_out = Pt_in * (1.0 - dPqP)
         ht_out = jnp.where(W_in > _EXPMN_THRESHOLD, ht_in + Q_dot / W_in, ht_in)
-        Tt_out = thermo.T_from_hP(ht_out, Pt_out, FAR)
-        props = thermo.props_TP(Tt_out, Pt_out, FAR)
+        Tt_out = thermo.set_total_hP(ht_out, Pt_out, FAR)
+        props = thermo.set_total_TP(Tt_out, Pt_out, FAR)
 
         # Build output list - must match add_primal_output order
         outputs = [
@@ -189,9 +189,9 @@ class NewDuct(JaxElement):
         # Static properties
         if statics:
             if design:
-                static_props = thermo.static_from_MN(Tt_out, Pt_out, MN_or_area, W_in, FAR)
+                static_props = thermo.set_static_MN(Tt_out, Pt_out, MN_or_area, W_in, FAR)
             else:
-                static_props = thermo.static_from_area(Tt_out, Pt_out, MN_or_area, W_in, FAR)
+                static_props = thermo.set_static_area(Tt_out, Pt_out, MN_or_area, W_in, FAR)
 
             # Corrected flow (normalized to standard day conditions)
             Wc = W_in * jnp.sqrt(Tt_out / _T_REF) / (Pt_out / _P_REF)
