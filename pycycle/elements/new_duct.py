@@ -36,21 +36,9 @@ class NewDuct(JaxElement):
 
         self.default_des_od_conns = [('Fl_O:stat:area', 'area')]
 
-    def _get_jit_config_key(self):
-        """
-        Return config key including NewDuct-specific options.
-
-        Includes design, statics, expMN, and jax_thermo identity to ensure
-        instances with different configurations get separate JIT compilations.
-        """
-        return (
-            type(self).__name__,
-            self.options['design'],
-            self.options['statics'],
-            self.options['expMN'],
-            id(self._jax_thermo) if self._jax_thermo is not None else None,
-        )
-
+    # used for initialization purposes in pycycle
+    # TODO: refactor to make this not needed later
+    # maybe combine behavior into `add_flow_output`
     def pyc_setup_output_ports(self):
         self.copy_flow('Fl_I', 'Fl_O')
 
@@ -63,139 +51,149 @@ class NewDuct(JaxElement):
         # Add all flow inputs for pyCycle flow connections
         self.add_flow_input('Fl_I')
 
-        # Register which inputs are used in compute_physics
-        self.add_primal_input('Fl_I:tot:P', 'Pt_in')
-        self.add_primal_input('Fl_I:tot:h', 'ht_in')
-        self.add_primal_input('Fl_I:stat:W', 'W_in')
-        self.add_primal_input('Fl_I:stat:MN', 'MN_in')
-        self.add_primal_input('Fl_I:tot:composition', 'composition')
-
         self.add_input('Q_dot', val=0.0, units='Btu/s',
                        desc='Heat flow rate into (positive) or out of (negative) the air')
-        self.add_primal_input('Q_dot', 'Q_dot')
 
         if expMN > _EXPMN_THRESHOLD:
             if design:
                 self.add_input('dPqP', val=0.0,
                                desc='Pressure differential as fraction of inlet pressure')
-                self.add_primal_input('dPqP', 'dPqP_or_s')
             else:
                 self.add_input('s_dPqP', val=0.0, desc='Pressure loss scalar')
-                self.add_primal_input('s_dPqP', 'dPqP_or_s')
         else:
             self.add_input('dPqP', val=0.0,
                            desc='Pressure differential as fraction of inlet pressure')
-            self.add_primal_input('dPqP', 'dPqP_or_s')
 
         if statics:
             if design:
                 self.add_input('MN', val=0.5, desc='Exit Mach number')
-                self.add_primal_input('MN', 'MN_or_area')
             else:
                 self.add_input('area', val=1.0, units='inch**2', desc='Exit flow area')
-                self.add_primal_input('area', 'MN_or_area')
 
         # --- Outputs ---
-        # Add all flow outputs
         self.add_flow_output('Fl_O', statics=statics)
-
-        # Register which outputs are computed by compute_physics
-        # Order must match compute_physics return order
-        self.add_flow_total_primal_outputs('Fl_O')
-        self.add_primal_output('Fl_O:stat:W', 'W_out')
 
         if expMN > _EXPMN_THRESHOLD:
             if design:
                 self.add_output('s_dPqP', val=0.0, desc='Pressure loss scalar')
-                self.add_primal_output('s_dPqP', 's_dPqP_out')
             else:
                 self.add_output('dPqP', val=0.0,
                                 desc='Pressure differential as fraction of inlet pressure')
-                self.add_primal_output('dPqP', 'dPqP_out')
+
+        # --- Register primal inputs (order defines input vector layout) ---
+        self.add_primal_input('Fl_I:tot:P')
+        self.add_primal_input('Fl_I:tot:h')
+        self.add_primal_input('Fl_I:stat:W')
+        self.add_primal_input('Fl_I:stat:MN')
+        self.add_primal_input('Fl_I:tot:composition', size='dynamic')  # shape_by_conn
+        self.add_primal_input('Q_dot')
+
+        if expMN > _EXPMN_THRESHOLD:
+            if design:
+                self.add_primal_input('dPqP')
+            else:
+                self.add_primal_input('s_dPqP')
+        else:
+            self.add_primal_input('dPqP')
+
+        if statics:
+            if design:
+                self.add_primal_input('MN')
+            else:
+                self.add_primal_input('area')
+
+        # --- Register primal outputs (order must match add_output order) ---
+        # add_flow_output order: total props, static props (if statics), W, FAR
+        # Then we add s_dPqP/dPqP after add_flow_output
+        self.add_flow_total_primal_outputs('Fl_O')
 
         if statics:
             self.add_flow_static_primal_outputs('Fl_O')
 
-        # Declare partials between primal inputs and outputs
-        super().setup_partials()
+        self.add_primal_output('Fl_O:stat:W')
 
-    def compute_physics(self, Pt_in, ht_in, W_in, MN_in, composition, Q_dot, dPqP_or_s, MN_or_area=None):
+        if expMN > _EXPMN_THRESHOLD:
+            if design:
+                self.add_primal_output('s_dPqP')
+            else:
+                self.add_primal_output('dPqP')
+
+        # Build index mappings and declare partials
+        self.setup_partials()
+
+    def compute_physics(self, inputs):
         """
-        Pure JAX physics computation.
+        Pure JAX physics computation with vector I/O.
 
         Parameters
         ----------
-        Pt_in : float
-            Inlet total pressure
-        ht_in : float
-            Inlet total enthalpy
-        W_in : float
-            Inlet mass flow rate
-        MN_in : float
-            Inlet Mach number
-        composition : array
-            Flow composition. composition[0] = FAR (fuel-to-air ratio).
-        Q_dot : float
-            Heat flow rate
-        dPqP_or_s : float
-            Pressure loss parameter. When expMN > 0: dPqP in design mode,
-            s_dPqP in off-design mode. When expMN == 0: always dPqP.
-        MN_or_area : float, optional
-            Exit Mach number (design) or exit area (off-design)
+        inputs : jnp.ndarray
+            Flat input vector. Use self.inp(inputs, 'name') to access values.
 
         Returns
         -------
-        tuple
-            All output values in the order registered by add_primal_output
+        jnp.ndarray
+            Flat output vector matching add_primal_output order.
         """
         design = self.options['design']
         statics = self.options['statics']
         expMN = self.options['expMN']
         thermo = self.jax_thermo
 
+        # --- Extract inputs using OpenMDAO names ---
+        Pt_in = self.inp(inputs, 'Fl_I:tot:P')
+        ht_in = self.inp(inputs, 'Fl_I:tot:h')
+        W_in = self.inp(inputs, 'Fl_I:stat:W')
+        MN_in = self.inp(inputs, 'Fl_I:stat:MN')
+        composition = self.inp(inputs, 'Fl_I:tot:composition')
+        Q_dot = self.inp(inputs, 'Q_dot')
+
         # Extract FAR from composition array
         FAR = composition[0]
 
-        # Pressure loss calculation
+        # --- Pressure loss calculation ---
         if expMN > _EXPMN_THRESHOLD:
             if design:
-                dPqP = dPqP_or_s
+                dPqP = self.inp(inputs, 'dPqP')
                 s_dPqP = jnp.where(MN_in > _EXPMN_THRESHOLD, dPqP / MN_in**expMN, 0.0)
             else:
-                s_dPqP = dPqP_or_s
+                s_dPqP = self.inp(inputs, 's_dPqP')
                 dPqP = s_dPqP * MN_in**expMN
         else:
-            dPqP = dPqP_or_s
+            dPqP = self.inp(inputs, 'dPqP')
             s_dPqP = 0.0
 
-        # Total properties
+        # --- Total properties ---
         Pt_out = Pt_in * (1.0 - dPqP)
         ht_out = jnp.where(W_in > _EXPMN_THRESHOLD, ht_in + Q_dot / W_in, ht_in)
         Tt_out = thermo.set_total_hP(ht_out, Pt_out, FAR)
         props = thermo.set_total_TP(Tt_out, Pt_out, FAR)
 
-        # Build output list - must match add_primal_output order
+        # --- Build output list (must match add_output order from add_flow_output) ---
+        # Order follows add_flow_output: total props, then static props, then W, then FAR
+        # We only include primal outputs (FAR and composition are passthrough)
+
+        # Total properties: h, T, P, rho, gamma, Cp, Cv, S, R (from _TOTAL_PROPS order)
         outputs = [
-            Pt_out, Tt_out, ht_out,
-            props.S, props.gamma, props.Cp,
-            props.Cv, props.rho, props.R,
-            W_in,  # Mass flow passthrough
+            ht_out, Tt_out, Pt_out,
+            props.rho, props.gamma, props.Cp,
+            props.Cv, props.S, props.R,
         ]
 
-        # s_dPqP or dPqP output (if expMN > 0)
-        if expMN > _EXPMN_THRESHOLD:
-            outputs.append(s_dPqP if design else dPqP)
-
-        # Static properties
+        # Static properties (if enabled) - come before W in add_output order
         if statics:
             if design:
-                static_props = thermo.set_static_MN(Tt_out, Pt_out, MN_or_area, W_in, FAR)
+                MN_exit = self.inp(inputs, 'MN')
+                static_props = thermo.set_static_MN(Tt_out, Pt_out, MN_exit, W_in, FAR)
             else:
-                static_props = thermo.set_static_area(Tt_out, Pt_out, MN_or_area, W_in, FAR)
+                area_exit = self.inp(inputs, 'area')
+                static_props = thermo.set_static_area(Tt_out, Pt_out, area_exit, W_in, FAR)
 
             # Corrected flow (normalized to standard day conditions)
             Wc = W_in * jnp.sqrt(Tt_out / _T_REF) / (Pt_out / _P_REF)
 
+            # Static properties order from _STATIC_PROPS:
+            # h, T, P, rho, gamma, Cp, Cv, S, R, V, Vsonic, MN, area, Wc
             outputs.extend([
                 static_props.hs, static_props.Ts, static_props.Ps,
                 static_props.rhos, static_props.gamma, static_props.Cp,
@@ -204,4 +202,11 @@ class NewDuct(JaxElement):
                 static_props.area, Wc,
             ])
 
-        return tuple(outputs)
+        # Fl_O:stat:W comes after static props in add_flow_output
+        outputs.append(W_in)
+
+        # s_dPqP or dPqP output (if expMN > 0) - added after add_flow_output
+        if expMN > _EXPMN_THRESHOLD:
+            outputs.append(s_dPqP if design else dPqP)
+
+        return jnp.array(outputs)

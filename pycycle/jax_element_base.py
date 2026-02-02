@@ -120,35 +120,18 @@ _STATIC_PROPS = [
     ('area', 1.0, 'inch**2'), ('Wc', 1.0, 'lbm/s'),
 ]
 
-# Primal output mappings: (om_property_suffix, primal_name)
-_TOTAL_PRIMAL_OUTPUTS = [
-    ('P', 'Pt_out'), ('T', 'Tt_out'), ('h', 'ht_out'),
-    ('S', 'S_out'), ('gamma', 'gamma_out'), ('Cp', 'Cp_out'),
-    ('Cv', 'Cv_out'), ('rho', 'rho_out'), ('R', 'R_out'),
-]
-
-_STATIC_PRIMAL_OUTPUTS = [
-    ('h', 'hs_out'), ('T', 'Ts_out'), ('P', 'Ps_out'),
-    ('rho', 'rhos_out'), ('gamma', 'gammas_out'), ('Cp', 'Cps_out'),
-    ('Cv', 'Cvs_out'), ('S', 'Ss_out'), ('R', 'Rs_out'),
-    ('V', 'V_out'), ('Vsonic', 'Vsonic_out'), ('MN', 'MN_out'),
-    ('area', 'area_out'), ('Wc', 'Wc_out'),
-]
-
 
 class JaxElement(om.ExplicitComponent):
     """
     Base class for pyCycle elements using JAX for automatic differentiation.
 
-    Subclasses implement `compute_physics` which is a pure JAX-traceable function.
-    The base class automatically handles all partial derivative computation.
+    Subclasses implement `compute_physics` which is a pure JAX-traceable function
+    that takes a flat input vector and returns a flat output vector.
 
-    JaxThermo objects are shared across instances with the same configuration
-    (thermo_method, thermo_data) to avoid redundant JAX tracing. The linearization
-    cache is kept per-instance to allow different operating points.
-
-    JIT-compiled JVP functions are cached at the class level to avoid redundant
-    JAX tracing/compilation across instances with the same configuration.
+    The base class automatically handles:
+    - Packing OpenMDAO inputs into the input vector
+    - Unpacking the output vector to OpenMDAO outputs
+    - Computing partial derivatives via JAX autodiff
 
     Example
     -------
@@ -159,10 +142,21 @@ class JaxElement(om.ExplicitComponent):
             self.add_input('dPqP', val=0.0)
             self.add_output('Fl_O:tot:P', val=1.0, units='psi')
 
-        def compute_physics(self, Pt_in, ht_in, dPqP):
-            '''Pure JAX computation.'''
+            # Register which inputs/outputs are used in compute_physics
+            self.add_primal_input('Fl_I:tot:P')
+            self.add_primal_input('dPqP')
+            self.add_primal_output('Fl_O:tot:P')
+
+            self.setup_partials()
+
+        def compute_physics(self, inputs):
+            '''Pure JAX computation with vector I/O.'''
+            Pt_in = self.inp(inputs, 'Fl_I:tot:P')
+            dPqP = self.inp(inputs, 'dPqP')
+
             Pt_out = Pt_in * (1.0 - dPqP)
-            return (Pt_out,)  # Tuple of outputs
+
+            return jnp.array([Pt_out])
     """
 
     # Class-level cache for shared JaxThermo objects
@@ -178,10 +172,38 @@ class JaxElement(om.ExplicitComponent):
     def initialize(self):
 
         self._jax_thermo = None
-        self._primal_input_names = []  # Maps primal arg name -> OpenMDAO input name
-        self._primal_output_names = []  # Maps primal return index -> OpenMDAO output name
-        self._cached_args = None
-        self._jit_jacfwd_fn = None  # Cached JIT-compiled full Jacobian function
+
+        # Track order of add_input/add_output calls
+        self._input_order = []   # [om_name, ...] in add_input call order
+        self._output_order = []  # [om_name, ...] in add_output call order
+
+        # Primal markers: which inputs/outputs are used in compute_physics
+        # size can be: None (scalar), int (fixed array), or 'dynamic' (shape_by_conn)
+        self._primal_input_set = {}   # om_name -> size
+        self._primal_output_set = {}  # om_name -> size
+
+        # Built by setup_partials(): primal I/O in add_input/add_output order
+        # These use declared sizes (may include 'dynamic' placeholders)
+        self._primal_inputs = []   # [(om_name, size), ...] filtered and ordered
+        self._primal_outputs = []  # [(om_name, size), ...] filtered and ordered
+
+        # Runtime-resolved primal lists (with actual sizes for dynamic vars)
+        self._runtime_primal_inputs = None   # [(om_name, size), ...] with resolved sizes
+        self._runtime_primal_outputs = None  # [(om_name, size), ...] with resolved sizes
+
+        # Index mappings built by setup_partials() or _rebuild_mappings()
+        self._input_idx = {}      # om_name -> index (for scalars)
+        self._input_slices = {}   # om_name -> slice (for arrays)
+        self._output_idx = {}     # om_name -> index (for scalars)
+        self._output_slices = {}  # om_name -> slice (for arrays)
+        self._n_primal_inputs = 0
+        self._n_primal_outputs = 0
+
+        # Flag to indicate if runtime rebuilding is needed
+        self._needs_runtime_rebuild = False
+
+        # Cached input vector for partials computation
+        self._cached_input_vec = None
 
         # For compatibility with Cycle's flow graph
         self.Fl_I_data = {}
@@ -260,39 +282,224 @@ class JaxElement(om.ExplicitComponent):
         self.Fl_O_data[port_name] = port_data
 
     # =========================================================================
+    # OpenMDAO add_input/add_output overrides to track creation order
+    # =========================================================================
+
+    def add_input(self, name, **kwargs):
+        """
+        Override to track input creation order.
+
+        The order of add_input calls determines the order of primal inputs
+        in the compute_physics input vector.
+        """
+        super().add_input(name, **kwargs)
+        # Track creation order (size will be set by add_primal_input if needed)
+        self._input_order.append(name)
+
+    def add_output(self, name, **kwargs):
+        """
+        Override to track output creation order.
+
+        The order of add_output calls determines the order of primal outputs
+        in the compute_physics output vector.
+        """
+        super().add_output(name, **kwargs)
+        # Track creation order (size will be set by add_primal_output if needed)
+        self._output_order.append(name)
+
+    # =========================================================================
     # Primal Input/Output Registration
     # =========================================================================
 
-    def add_primal_input(self, om_name, primal_name):
+    def add_primal_input(self, om_name, size=None):
         """
-        Register an OpenMDAO input as an argument to compute_physics.
+        Mark an OpenMDAO input to be included in the compute_physics input vector.
+
+        The position in the input vector is determined by the order of add_input
+        calls, not the order of add_primal_input calls.
 
         Parameters
         ----------
         om_name : str
             The OpenMDAO input variable name (e.g., 'Fl_I:tot:P')
-        primal_name : str
-            The argument name used in compute_physics (e.g., 'Pt_in')
+        size : int, optional
+            Size of the input if it's an array. None for scalars.
         """
-        self._primal_input_names.append((primal_name, om_name))
+        self._primal_input_set[om_name] = size
 
-    def add_primal_output(self, om_name, primal_name):
+    def add_primal_output(self, om_name, size=None):
         """
-        Register an OpenMDAO output as a return value from compute_physics.
+        Mark an OpenMDAO output to be included in the compute_physics output vector.
+
+        The position in the output vector is determined by the order of add_output
+        calls, not the order of add_primal_output calls.
 
         Parameters
         ----------
         om_name : str
             The OpenMDAO output variable name (e.g., 'Fl_O:tot:P')
-        primal_name : str
-            Descriptive name for this output position (e.g., 'Pt_out')
+        size : int, optional
+            Size of the output if it's an array. None for scalars.
         """
-        self._primal_output_names.append((primal_name, om_name))
+        self._primal_output_set[om_name] = size
 
     def setup_partials(self):
-        """Declare all partials between primal inputs and outputs."""
-        # Use wildcard declaration - OpenMDAO will handle sparsity detection
+        """
+        Build index mappings and declare partials.
+
+        Must be called at the end of subclass setup() after all
+        add_primal_input/add_primal_output calls.
+
+        The primal input/output order follows the add_input/add_output call order,
+        filtered to only include inputs/outputs marked as primal.
+        """
+        # Build _primal_inputs in add_input order (filtered to primal only)
+        self._primal_inputs = []
+        for om_name in self._input_order:
+            if om_name in self._primal_input_set:
+                size = self._primal_input_set[om_name]
+                self._primal_inputs.append((om_name, size))
+
+        # Build _primal_outputs in add_output order (filtered to primal only)
+        self._primal_outputs = []
+        for om_name in self._output_order:
+            if om_name in self._primal_output_set:
+                size = self._primal_output_set[om_name]
+                self._primal_outputs.append((om_name, size))
+
+        # Check if any primal has dynamic size (shape_by_conn)
+        has_dynamic = any(
+            size == 'dynamic' for _, size in self._primal_inputs
+        ) or any(
+            size == 'dynamic' for _, size in self._primal_outputs
+        )
+
+        if has_dynamic:
+            # Defer mapping construction to runtime when actual sizes are known
+            self._needs_runtime_rebuild = True
+            # Set placeholder values - will be rebuilt in compute()
+            self._n_primal_inputs = 0
+            self._n_primal_outputs = 0
+        else:
+            # Build mappings now with known sizes
+            self._build_index_mappings(self._primal_inputs, self._primal_outputs)
+
+        # Declare partials - use wildcard for simplicity
         self.declare_partials('*', '*')
+
+    def _build_index_mappings(self, primal_inputs, primal_outputs):
+        """
+        Build index mappings for the given primal input/output lists.
+
+        Parameters
+        ----------
+        primal_inputs : list of (om_name, size) tuples
+            Primal inputs with resolved sizes (no 'dynamic' entries)
+        primal_outputs : list of (om_name, size) tuples
+            Primal outputs with resolved sizes (no 'dynamic' entries)
+        """
+        # Clear existing mappings
+        self._input_idx = {}
+        self._input_slices = {}
+        self._output_idx = {}
+        self._output_slices = {}
+
+        # Build input index mappings
+        # size=None means scalar, size>=1 means array (even size=1)
+        offset = 0
+        for om_name, size in primal_inputs:
+            if size is not None:
+                self._input_slices[om_name] = slice(offset, offset + size)
+                offset += size
+            else:
+                self._input_idx[om_name] = offset
+                offset += 1
+        self._n_primal_inputs = offset
+
+        # Build output index mappings
+        offset = 0
+        for om_name, size in primal_outputs:
+            if size is not None:
+                self._output_slices[om_name] = slice(offset, offset + size)
+                offset += size
+            else:
+                self._output_idx[om_name] = offset
+                offset += 1
+        self._n_primal_outputs = offset
+
+        # Store runtime-resolved lists
+        self._runtime_primal_inputs = primal_inputs
+        self._runtime_primal_outputs = primal_outputs
+
+    def _resolve_dynamic_sizes(self, inputs):
+        """
+        Resolve 'dynamic' sizes to actual sizes from OpenMDAO inputs.
+
+        Parameters
+        ----------
+        inputs : dict-like
+            OpenMDAO inputs dictionary
+
+        Returns
+        -------
+        tuple
+            (resolved_primal_inputs, resolved_primal_outputs)
+        """
+        resolved_inputs = []
+        for om_name, size in self._primal_inputs:
+            if size == 'dynamic':
+                # Get actual size from OpenMDAO input
+                # Always treat shape_by_conn variables as arrays, even if size is 1
+                actual_size = np.size(inputs[om_name])
+                resolved_inputs.append((om_name, actual_size))
+            else:
+                resolved_inputs.append((om_name, size))
+
+        resolved_outputs = []
+        for om_name, size in self._primal_outputs:
+            if size == 'dynamic':
+                # For outputs, we need to infer from corresponding input
+                # This is element-specific; for now assume same as declared
+                resolved_outputs.append((om_name, size))
+            else:
+                resolved_outputs.append((om_name, size))
+
+        return resolved_inputs, resolved_outputs
+
+    # =========================================================================
+    # Input/Output Accessors for compute_physics
+    # =========================================================================
+
+    def inp(self, inputs, om_name):
+        """
+        Get an input value from the input vector by OpenMDAO name.
+
+        The dictionary lookup happens at JAX trace time, not runtime,
+        so there is zero performance cost in the compiled function.
+
+        Parameters
+        ----------
+        inputs : jnp.ndarray
+            The input vector passed to compute_physics
+        om_name : str
+            The OpenMDAO input name (e.g., 'Fl_I:tot:P')
+
+        Returns
+        -------
+        float or jnp.ndarray
+            The input value (scalar or array slice)
+        """
+        if om_name in self._input_idx:
+            return inputs[self._input_idx[om_name]]
+        elif om_name in self._input_slices:
+            return inputs[self._input_slices[om_name]]
+        else:
+            raise KeyError(f"Input '{om_name}' not registered as primal input. "
+                          f"Registered inputs: {[name for name, _ in self._primal_inputs]}")
+
+    # =========================================================================
+    # Flow Registration Helpers
+    # =========================================================================
 
     def add_flow_total_primal_outputs(self, fl_name='Fl_O'):
         """
@@ -301,8 +508,8 @@ class JaxElement(om.ExplicitComponent):
         Registers: P, T, h, S, gamma, Cp, Cv, rho, R (in that order).
         Does NOT include W (mass flow) - register that separately if needed.
         """
-        for prop, primal_name in _TOTAL_PRIMAL_OUTPUTS:
-            self.add_primal_output(f'{fl_name}:tot:{prop}', primal_name)
+        for prop, _, _ in _TOTAL_PROPS:
+            self.add_primal_output(f'{fl_name}:tot:{prop}')
 
     def add_flow_static_primal_outputs(self, fl_name='Fl_O'):
         """
@@ -310,22 +517,23 @@ class JaxElement(om.ExplicitComponent):
 
         Registers: h, T, P, rho, gamma, Cp, Cv, S, R, V, Vsonic, MN, area, Wc
         """
-        for prop, primal_name in _STATIC_PRIMAL_OUTPUTS:
-            self.add_primal_output(f'{fl_name}:stat:{prop}', primal_name)
+        for prop, _, _ in _STATIC_PROPS:
+            self.add_primal_output(f'{fl_name}:stat:{prop}')
 
-    def compute_physics(self, *args):
+    def compute_physics(self, inputs):
         """
         Pure JAX-traceable computation. Override in subclass.
 
         Parameters
         ----------
-        *args : floats
-            Input values in order of add_primal_input calls
+        inputs : jnp.ndarray
+            Flat input vector containing all primal inputs.
+            Use self.inp(inputs, 'name') to access values.
 
         Returns
         -------
-        tuple
-            Output values in order of add_primal_output calls
+        jnp.ndarray
+            Flat output vector in order of add_primal_output calls.
         """
         raise NotImplementedError("Subclass must implement compute_physics")
 
@@ -337,101 +545,153 @@ class JaxElement(om.ExplicitComponent):
         Instances with the same key can share the same JIT-compiled JVP function,
         avoiding redundant JAX tracing.
 
-        Subclasses should override to include any options that affect compute_physics.
+        Automatically scans all declared options using OpenMDAO's options system.
+        For recordable options, the value is included directly.
+        For non-recordable options (like thermo_data objects), id() is used.
 
         Returns
         -------
         tuple
             Hashable configuration key
         """
-        return (
-            type(self).__name__,
-            self.options.get('design', True),
-            id(self._jax_thermo) if self._jax_thermo is not None else None,
-        )
+        # Start with class name to distinguish different element types
+        key_parts = [type(self).__name__]
 
-    def _is_array_primal(self, om_name):
-        """
-        Check if an OpenMDAO variable should be treated as an array primal.
+        # Include all options - iterate through the internal dict to access metadata
+        for name, meta in self.options._dict.items():
+            value = self.options[name]
+            recordable = meta.get('recordable', True)
 
-        Override in subclass to mark specific inputs as array-valued (not scalar).
-        By default, 'composition' variables are treated as arrays.
+            if recordable:
+                # For recordable options, include the value directly
+                # Must be hashable (bool, int, float, str, tuple, None, etc.)
+                try:
+                    hash(value)
+                    key_parts.append((name, value))
+                except TypeError:
+                    # Value not hashable, use id
+                    key_parts.append((name, id(value)))
+            else:
+                # For non-recordable options (objects), use id
+                key_parts.append((name, id(value)))
 
-        Parameters
-        ----------
-        om_name : str
-            OpenMDAO variable name
+        # Include I/O structure (input/output names and sizes affect tracing)
+        # Use runtime-resolved lists if available (handles dynamic sizes)
+        primal_inputs = self._runtime_primal_inputs or self._primal_inputs
+        primal_outputs = self._runtime_primal_outputs or self._primal_outputs
+        key_parts.append(('_primal_inputs', tuple(primal_inputs)))
+        key_parts.append(('_primal_outputs', tuple(primal_outputs)))
 
-        Returns
-        -------
-        bool
-            True if this variable should be treated as an array in compute_physics
-        """
-        return 'composition' in om_name
+        # Include thermo object identity (may be initialized lazily)
+        key_parts.append(('_jax_thermo', id(self._jax_thermo) if self._jax_thermo is not None else None))
+
+        return tuple(key_parts)
 
     def compute(self, inputs, outputs):
-        """Extract inputs, call compute_physics, assign outputs."""
-        # Extract inputs in registered order, handling array primals
-        args = []
-        for primal_name, om_name in self._primal_input_names:
-            if self._is_array_primal(om_name):
-                args.append(jnp.array(inputs[om_name]))
+        """Pack inputs, call compute_physics, unpack outputs."""
+        # Handle dynamic sizes on first call
+        if self._needs_runtime_rebuild:
+            resolved_inputs, resolved_outputs = self._resolve_dynamic_sizes(inputs)
+            self._build_index_mappings(resolved_inputs, resolved_outputs)
+            self._needs_runtime_rebuild = False
+
+        # Get the runtime-resolved primal lists (or original if no dynamic sizes)
+        primal_inputs = self._runtime_primal_inputs or self._primal_inputs
+        primal_outputs = self._runtime_primal_outputs or self._primal_outputs
+
+        # Pack OpenMDAO inputs into flat vector
+        input_vec = np.zeros(self._n_primal_inputs)
+        for om_name, size in primal_inputs:
+            if om_name in self._input_slices:
+                input_vec[self._input_slices[om_name]] = inputs[om_name]
             else:
-                args.append(float(inputs[om_name][0]))
+                input_vec[self._input_idx[om_name]] = inputs[om_name][0]
+
+        input_vec = jnp.array(input_vec)
 
         # Call pure computation with timing
         t_start = time.perf_counter()
-        result = self.compute_physics(*args)
+        output_vec = self.compute_physics(input_vec)
         _jax_element_timing_stats['compute_calls'] += 1
         _jax_element_timing_stats['compute_time'] += (time.perf_counter() - t_start)
 
-        # Validate output count matches registration
-        expected = len(self._primal_output_names)
-        actual = len(result)
+        # Validate output size
+        expected = self._n_primal_outputs
+        actual = len(output_vec)
         if actual != expected:
             raise ValueError(
                 f"{type(self).__name__}.compute_physics returned {actual} outputs, "
-                f"but {expected} were registered via add_primal_output. "
-                f"Ensure compute_physics return order matches add_primal_output call order."
+                f"but {expected} were registered via add_primal_output."
             )
 
-        # Assign outputs in registered order
-        for i, (primal_name, om_name) in enumerate(self._primal_output_names):
-            outputs[om_name] = float(result[i])
+        # Unpack to OpenMDAO outputs
+        output_vec = np.asarray(output_vec)
+        for om_name, size in primal_outputs:
+            if om_name in self._output_slices:
+                outputs[om_name] = output_vec[self._output_slices[om_name]]
+            else:
+                outputs[om_name] = output_vec[self._output_idx[om_name]]
 
         # Pass through composition and FAR (not part of JAX computation)
         if hasattr(self, '_passthrough_vars'):
             for src, dst in self._passthrough_vars:
                 outputs[dst] = inputs[src]
 
-        # Cache args for partials
-        self._cached_args = args
+        # Cache input vector for partials
+        self._cached_input_vec = input_vec
 
     def compute_partials(self, inputs, partials):
         """Compute partial derivatives using JAX autodiff."""
-        args = self._cached_args
+        input_vec = self._cached_input_vec
 
-        # Compute Jacobian (subclass can override compute_jacobian for efficiency)
+        # Get the runtime-resolved primal lists (or original if no dynamic sizes)
+        primal_inputs = self._runtime_primal_inputs or self._primal_inputs
+        primal_outputs = self._runtime_primal_outputs or self._primal_outputs
+
+        # Compute full Jacobian
         t_start = time.perf_counter()
-        if hasattr(self, 'compute_jacobian'):
-            jacs = self.compute_jacobian(args)
-        else:
-            jacs = self._compute_jacobian_fwd(args)
+        jac = self._compute_jacobian(input_vec)
         _jax_element_timing_stats['jacobian_compute_calls'] += 1
         _jax_element_timing_stats['jacobian_compute_time'] += (time.perf_counter() - t_start)
 
-        # Assign to partials dict, handling array primals
+        # Convert JAX array to numpy once (avoid repeated conversions in loop)
+        jac_np = np.asarray(jac)
+
+        # Assign to partials dict
         t_start = time.perf_counter()
-        for j, (_, in_name) in enumerate(self._primal_input_names):
-            for i, (_, out_name) in enumerate(self._primal_output_names):
-                deriv = jacs[j][i]
-                if self._is_array_primal(in_name):
-                    if np.isscalar(deriv):
-                        partials[out_name, in_name] = np.array([[deriv]])
-                    else:
-                        partials[out_name, in_name] = np.array(deriv).reshape(1, -1)
+        for out_name, out_size in primal_outputs:
+            for in_name, in_size in primal_inputs:
+                # Get row/column indices from mappings
+                if out_name in self._output_slices:
+                    out_slice = self._output_slices[out_name]
+                    is_out_array = True
                 else:
-                    partials[out_name, in_name] = deriv
+                    out_slice = self._output_idx[out_name]
+                    is_out_array = False
+
+                if in_name in self._input_slices:
+                    in_slice = self._input_slices[in_name]
+                    is_in_array = True
+                else:
+                    in_slice = self._input_idx[in_name]
+                    is_in_array = False
+
+                # Extract submatrix from numpy Jacobian (fast indexing)
+                sub_jac = jac_np[out_slice, in_slice]
+
+                # Handle scalar vs array shapes for OpenMDAO
+                if not is_out_array and not is_in_array:
+                    # scalar -> scalar
+                    partials[out_name, in_name] = float(sub_jac)
+                elif not is_out_array and is_in_array:
+                    # array -> scalar: row vector
+                    partials[out_name, in_name] = sub_jac.reshape(1, -1)
+                elif is_out_array and not is_in_array:
+                    # scalar -> array: column vector
+                    partials[out_name, in_name] = sub_jac.reshape(-1, 1)
+                else:
+                    # array -> array: matrix
+                    partials[out_name, in_name] = sub_jac
 
         # Handle passthrough variable partials (identity derivatives)
         if hasattr(self, '_passthrough_vars'):
@@ -441,63 +701,47 @@ class JaxElement(om.ExplicitComponent):
                     partials[dst, src] = 1.0
                 else:
                     partials[dst, src] = np.eye(len(src_val))
+
         _jax_element_timing_stats['jacobian_assign_calls'] += 1
         _jax_element_timing_stats['jacobian_assign_time'] += (time.perf_counter() - t_start)
 
-    def _compute_jacobian_fwd(self, args):
-        """Compute Jacobian using forward-mode with cached JIT-compiled JVP calls.
-
-        JIT-compiled functions are cached at the class level, keyed by configuration.
-        This allows instances with the same config to share the compiled function,
-        avoiding redundant JAX tracing which is expensive.
+    def _compute_jacobian(self, input_vec):
         """
-        n_inputs = len(args)
-        n_outputs = len(self._primal_output_names)
-        jacs = [np.zeros(n_outputs) for _ in range(n_inputs)]
-        args_tuple = tuple(args)
+        Compute full Jacobian matrix using JAX.
 
-        # Get config key for class-level cache lookup
+        Uses forward-mode AD (jacfwd) which is efficient when
+        n_inputs <= n_outputs.
+
+        Parameters
+        ----------
+        input_vec : jnp.ndarray
+            The input vector
+
+        Returns
+        -------
+        jnp.ndarray
+            Jacobian matrix of shape (n_outputs, n_inputs)
+        """
         config_key = self._get_jit_config_key()
 
-        # Get or create JIT-compiled JVP function for this configuration
         if config_key not in JaxElement._jit_jvp_cache:
-            # First instance with this config creates the JIT function
-            # The function captures self.compute_physics which uses the shared jax_thermo
             _jax_element_timing_stats['jit_cache_misses'] += 1
+
+            # Create JIT-compiled Jacobian function
             compute_physics = self.compute_physics
-            def jvp_wrapper(args_tuple, tangents_tuple):
-                _, jvp_out = jax.jvp(compute_physics, args_tuple, tangents_tuple)
-                return jnp.array(jvp_out)
-            # JIT compile and cache at class level
-            JaxElement._jit_jvp_cache[config_key] = jax.jit(jvp_wrapper)
+            jac_fn = jax.jacfwd(compute_physics)
+            JaxElement._jit_jvp_cache[config_key] = jax.jit(jac_fn)
         else:
             _jax_element_timing_stats['jit_cache_hits'] += 1
 
-        jit_fn = JaxElement._jit_jvp_cache[config_key]
+        jit_jac_fn = JaxElement._jit_jvp_cache[config_key]
 
-        for j in range(n_inputs):
-            # Create tangent with same structure as args (handle arrays)
-            tangents = []
-            for i, arg in enumerate(args):
-                if i == j:
-                    if hasattr(arg, 'shape') and len(arg.shape) > 0:
-                        tangents.append(jnp.ones_like(arg))
-                    else:
-                        tangents.append(1.0)
-                else:
-                    if hasattr(arg, 'shape') and len(arg.shape) > 0:
-                        tangents.append(jnp.zeros_like(arg))
-                    else:
-                        tangents.append(0.0)
+        t_jvp = time.perf_counter()
+        jac = jit_jac_fn(input_vec)
+        _jax_element_timing_stats['jvp_calls'] += 1
+        _jax_element_timing_stats['jvp_time'] += (time.perf_counter() - t_jvp)
 
-            t_jvp = time.perf_counter()
-            jvp_out = jit_fn(args_tuple, tuple(tangents))
-            _jax_element_timing_stats['jvp_calls'] += 1
-            _jax_element_timing_stats['jvp_time'] += (time.perf_counter() - t_jvp)
-
-            jacs[j][:] = np.array(jvp_out)
-
-        return jacs
+        return jac
 
     # =========================================================================
     # Flow Input/Output Helpers (for pyCycle flow connections)
@@ -558,4 +802,3 @@ class JaxElement(om.ExplicitComponent):
             self._passthrough_vars = []
         self._passthrough_vars.append((f'{fl_src}:tot:composition', f'{fl_name}:tot:composition'))
         self._passthrough_vars.append((f'{fl_src}:FAR', f'{fl_name}:FAR'))
-
