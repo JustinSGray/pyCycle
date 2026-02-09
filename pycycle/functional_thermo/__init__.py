@@ -30,7 +30,7 @@ from .base import ThermoInterface, TotalProps, StaticProps
 from .units import UnitConverter, SI_UNITS, ENGLISH_UNITS
 from .tabular import ThermoAdd as TabularThermoAdd
 from .tabular import ThermoAddOutput as TabularThermoAddOutput
-from .cea import CEAThermo
+from .cea import JaxCEAThermo
 from .cea import ThermoAdd, ThermoAddOutput  # CEA ThermoAdd is the default
 
 # Explicit aliases for clarity

@@ -5,12 +5,10 @@ This module provides JAX-traceable versions of the tabular thermo operations,
 eliminating the need for pure_callback and enabling efficient JIT compilation.
 """
 
-from collections import namedtuple
-
 import jax
 import jax.numpy as jnp
 
-from pycycle.functional_thermo.base import TotalProps, StaticProps
+from ..base import TotalProps, StaticProps, StaticPropsWithDeriv
 
 
 # =============================================================================
@@ -26,17 +24,6 @@ _CP_IDX = 3
 _CV_IDX = 4
 _RHO_IDX = 5
 _R_IDX = 6
-
-
-# =============================================================================
-# Named Tuples for Property Returns
-# =============================================================================
-
-StaticPropsWithDeriv = namedtuple('StaticPropsWithDeriv', [
-    'Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
-    'gamma', 'Cp', 'Cv', 'S', 'R', 'darea_dMN'
-])
-"""Static properties plus darea/dMN derivative (for set_static_MN)."""
 
 
 class JaxTrilinearInterp:

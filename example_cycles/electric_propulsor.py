@@ -2,6 +2,10 @@ import openmdao.api as om
 
 import pycycle.api as pyc
 
+import jax
+
+jax.config.update("jax_compilation_cache_dir", ".") 
+
 # protection incase env doesn't have matplotlib installed, since its not strictly required
 try:
     import matplotlib
@@ -16,7 +20,7 @@ class Propulsor(pyc.Cycle):
 
         design = self.options['design']
 
-        USE_TABULAR = True
+        USE_TABULAR = False
         if USE_TABULAR:
             self.options['thermo_method'] = 'TABULAR'
             self.options['thermo_data'] = pyc.AIR_JETA_TAB_SPEC
@@ -30,6 +34,7 @@ class Propulsor(pyc.Cycle):
 
         self.add_subsystem('inlet', pyc.Inlet())
         self.add_subsystem('fan', pyc.Compressor(map_data=pyc.FanMap, map_extrap=True))
+        self.add_subsystem('duct', pyc.NewDuct())
         self.add_subsystem('nozz', pyc.Nozzle())
 
         self.add_subsystem('perf', pyc.Performance(num_nozzles=1, num_burners=0))
@@ -64,7 +69,8 @@ class Propulsor(pyc.Cycle):
 
         self.pyc_connect_flow('fc.Fl_O', 'inlet.Fl_I')
         self.pyc_connect_flow('inlet.Fl_O', 'fan.Fl_I')
-        self.pyc_connect_flow('fan.Fl_O', 'nozz.Fl_I')
+        self.pyc_connect_flow('fan.Fl_O', 'duct.Fl_I')
+        self.pyc_connect_flow('duct.Fl_O', 'nozz.Fl_I')
 
 
         self.connect('fc.Fl_O:stat:P', 'nozz.Ps_exhaust')
@@ -125,16 +131,22 @@ class MPpropulsor(pyc.MPCycle):
         self.pyc_add_cycle_param('pwr_target', 100.)
 
         # define the off-design conditions we want to run
-        self.od_pts = ['off_design']
-        self.od_MNs = [0.8,]
-        self.od_alts = [10000,]
-        self.od_Rlines = [2.2,]
+        # self.od_pts = ['off_design']
+        # self.od_MNs = [0.8,]
+        # self.od_alts = [10000,]
+        # self.od_Rlines = [2.2,]
+
+
+        self.od_pts = ['off_design', 'OD2', 'OD3', 'OD4', 'OD5']
+        self.od_MNs = [0.8,0.8,0.8,0.8,0.8]
+        self.od_alts = [10000,10000,10000,10000,10000]
+        self.od_Rlines = [2.2,2.2,2.2,2.2,2.2]
 
         for i, pt in enumerate(self.od_pts):
             self.pyc_add_pnt(pt, Propulsor(design=False, thermo_method='CEA'))
 
             self.set_input_defaults(pt+'.fc.MN', val=self.od_MNs[i])
-            self.set_input_defaults(pt+'.fc.alt', val=self.od_alts, units='m')
+            self.set_input_defaults(pt+'.fc.alt', val=self.od_alts[i], units='m')
             self.set_input_defaults(pt+'.fan.map.RlineMap', val=self.od_Rlines[i])
 
         self.pyc_use_default_des_od_conns()

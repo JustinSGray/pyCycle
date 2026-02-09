@@ -30,6 +30,10 @@ from openmdao.utils.units import unit_conversion
 TotalProps = namedtuple('TotalProps', ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R'])
 StaticProps = namedtuple('StaticProps', ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
                                           'gamma', 'Cp', 'Cv', 'S', 'R'])
+StaticPropsWithDeriv = namedtuple('StaticPropsWithDeriv', [
+    'Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+    'gamma', 'Cp', 'Cv', 'S', 'R', 'darea_dMN'
+])
 
 # SI units (internal)
 _SI_UNITS = {

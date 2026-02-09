@@ -227,21 +227,59 @@ class JaxElement(om.ExplicitComponent):
             self._jax_thermo = self._get_shared_jax_thermo()
         return self._jax_thermo
 
+    def _get_cea_composition(self):
+        """
+        Get the CEA composition for this element.
+
+        Checks Fl_I_data first (for flow-through elements like Duct, Compressor),
+        then Fl_O_data (for flow-start elements like FlowStart),
+        then falls back to the default CEA_AIR_COMPOSITION.
+
+        Returns
+        -------
+        dict
+            Elemental composition dict (e.g., {'N': 0.054, 'O': 0.014, ...})
+        """
+        if 'Fl_I' in self.Fl_I_data:
+            return self.Fl_I_data['Fl_I']
+        if 'Fl_O' in self.Fl_O_data:
+            return self.Fl_O_data['Fl_O']
+        from pycycle.constants import THERMO_DEFAULT_COMPOSITIONS
+        return THERMO_DEFAULT_COMPOSITIONS['CEA']
+
     def _get_shared_jax_thermo(self):
         """
-        Get or create a shared JaxTabularThermo for this configuration.
+        Get or create a shared JaxThermo for this configuration.
 
-        Uses class-level cache keyed by (thermo_method, thermo_data).
+        Uses class-level cache to share JIT-compiled thermo objects across
+        elements with the same configuration, avoiding redundant JAX tracing.
+
+        For TABULAR: keyed by (thermo_method, thermo_data_id)
+        For CEA: keyed by (thermo_method, thermo_data_id, composition)
+            because composition (b0, aij) is baked into JIT-compiled functions.
         """
         thermo_method = self.options['thermo_method']
         thermo_data = self.options['thermo_data']
-        key = (thermo_method, id(thermo_data))
 
-        if key not in JaxElement._shared_thermos:
-            # Create new JaxTabularThermo and cache at class level
-            spec = self._get_thermo_spec()
-            from pycycle.functional_thermo.jax_tabular import JaxTabularThermo
-            JaxElement._shared_thermos[key] = JaxTabularThermo(spec)
+        if thermo_method == 'TABULAR':
+            key = (thermo_method, id(thermo_data))
+            if key not in JaxElement._shared_thermos:
+                spec = self._get_thermo_spec()
+                from pycycle.functional_thermo.tabular.jax_tabular import JaxTabularThermo
+                JaxElement._shared_thermos[key] = JaxTabularThermo(spec)
+
+        elif thermo_method == 'CEA':
+            composition = self._get_cea_composition()
+            # Make composition hashable for cache key
+            comp_key = tuple(sorted(composition.items()))
+            key = (thermo_method, id(thermo_data), comp_key)
+            if key not in JaxElement._shared_thermos:
+                from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
+                JaxElement._shared_thermos[key] = JaxCEAThermo(
+                    thermo_data=thermo_data, composition=composition)
+
+        else:
+            raise ValueError(f"Unsupported thermo_method: {thermo_method}")
 
         return JaxElement._shared_thermos[key]
 
@@ -261,7 +299,7 @@ class JaxElement(om.ExplicitComponent):
         """
         method = self.options['thermo_method']
         if method != 'TABULAR':
-            raise ValueError(f"JaxElement only supports TABULAR thermo_method, got {method}")
+            raise ValueError(f"_get_thermo_spec only supports TABULAR thermo_method, got {method}")
 
         thermo_data = self.options['thermo_data']
         if thermo_data is None:
