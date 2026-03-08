@@ -309,10 +309,51 @@ class JaxTabularThermo:
             final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
             return final_state[0] / T_to_si_scale
 
+        @jax.jit
+        def _set_total_SP_jit(S_target, P, FAR):
+            """JIT-compiled set_total_SP with while_loop Newton solver."""
+            S_target_si = S_target / S_from_si
+            P_si = P * P_to_si
+
+            # Initial guess: start in the middle of the temperature range
+            T_si_init = 1000.0
+
+            def S_and_deriv(T_si):
+                """Get S and dS/dT using analytical derivatives from interpolator."""
+                point = jnp.array([FAR, P_si, T_si])
+                props, _, dprops_dT = interp.interpolate_with_derivs(point)
+                return props[_S_IDX], dprops_dT[_S_IDX]
+
+            def cond_fn(state):
+                T_si, residual, i = state
+                return (jnp.abs(residual) > 1e-8) & (i < 20)
+
+            def body_fn(state):
+                T_si, residual, i = state
+
+                S_si, dS_dT = S_and_deriv(T_si)
+                residual = S_si - S_target_si
+                dS_dT_safe = jnp.where(jnp.abs(dS_dT) < 1e-20, 1e-20, dS_dT)
+
+                dx = -residual / dS_dT_safe
+                T_si_new = jnp.clip(T_si + dx, 160.0, 2400.0)
+
+                return (T_si_new, residual, i + 1)
+
+            # Initialize state: (T_si, residual, iteration)
+            S_init, _ = S_and_deriv(T_si_init)
+            residual_init = S_init - S_target_si
+            init_state = (T_si_init, residual_init, 0)
+
+            # Run Newton iteration
+            final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
+            return final_state[0] / T_to_si_scale
+
         self._set_total_TP_jit = _set_total_TP_jit
         self._set_total_hP_jit = _set_total_hP_jit
+        self._set_total_SP_jit = _set_total_SP_jit
 
-    def set_total_hP(self, h_target, P, FAR):
+    def set_total_hP(self, h_target, P, composition):
         """
         Solve for temperature given enthalpy and pressure.
 
@@ -322,19 +363,39 @@ class JaxTabularThermo:
             Target enthalpy (English units: Btu/lbm)
         P : float
             Pressure (English units: psi)
-        FAR : float
-            Fuel-to-air ratio
+        composition : array-like
+            Component-ratio array, shape (1,) where composition[0] = FAR
 
         Returns
         -------
         float
             Temperature (English units: Rankine)
         """
-        return self._set_total_hP_jit(h_target, P, FAR)
+        return self._set_total_hP_jit(h_target, P, composition[0])
 
-    def set_total_TP(self, T, P, FAR):
+    def set_total_SP(self, S_target, P, composition):
         """
-        Get all thermodynamic properties at given T, P, FAR.
+        Solve for temperature given entropy and pressure.
+
+        Parameters
+        ----------
+        S_target : float
+            Target entropy (English units: Btu/(lbm*R))
+        P : float
+            Pressure (English units: psi)
+        composition : array-like
+            Component-ratio array, shape (1,) where composition[0] = FAR
+
+        Returns
+        -------
+        float
+            Temperature (English units: Rankine)
+        """
+        return self._set_total_SP_jit(S_target, P, composition[0])
+
+    def set_total_TP(self, T, P, composition):
+        """
+        Get all thermodynamic properties at given T, P.
 
         Parameters
         ----------
@@ -342,17 +403,17 @@ class JaxTabularThermo:
             Temperature (English units: Rankine)
         P : float
             Pressure (English units: psi)
-        FAR : float
-            Fuel-to-air ratio
+        composition : array-like
+            Component-ratio array, shape (1,) where composition[0] = FAR
 
         Returns
         -------
         TotalProps
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in English units
         """
-        return self._set_total_TP_jit(T, P, FAR)
+        return self._set_total_TP_jit(T, P, composition[0])
 
-    def set_static_MN(self, Tt, Pt, MN, W, FAR):
+    def set_static_MN(self, Tt, Pt, MN, W, composition):
         """
         Compute static properties from total conditions and Mach number.
 
@@ -366,17 +427,17 @@ class JaxTabularThermo:
             Mach number
         W : float
             Mass flow rate (English units: lbm/s)
-        FAR : float
-            Fuel-to-air ratio
+        composition : array-like
+            Component-ratio array, shape (1,) where composition[0] = FAR
 
         Returns
         -------
         StaticPropsWithDeriv
             Named tuple with static properties plus darea/dMN derivative
         """
-        return self._set_static_MN_jit(Tt, Pt, MN, W, FAR)
+        return self._set_static_MN_jit(Tt, Pt, MN, W, composition[0])
 
-    def set_static_area(self, Tt, Pt, area, W, FAR):
+    def set_static_area(self, Tt, Pt, area, W, composition):
         """
         Compute static properties from total conditions and flow area.
 
@@ -390,15 +451,15 @@ class JaxTabularThermo:
             Flow area (English units: inch^2)
         W : float
             Mass flow rate (English units: lbm/s)
-        FAR : float
-            Fuel-to-air ratio
+        composition : array-like
+            Component-ratio array, shape (1,) where composition[0] = FAR
 
         Returns
         -------
         StaticProps
             Named tuple with static properties
         """
-        return self._set_static_area_jit(Tt, Pt, area, W, FAR)
+        return self._set_static_area_jit(Tt, Pt, area, W, composition[0])
 
     def _setup_static_functions(self):
         """Create JIT-compiled versions of static property functions."""

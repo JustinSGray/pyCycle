@@ -1,4 +1,4 @@
-""" Tests the duct component. """
+""" Tests the NewDuct component. """
 
 import unittest
 import os
@@ -9,10 +9,10 @@ from openmdao.api import Problem, Group
 from openmdao.utils.assert_utils import assert_near_equal, assert_check_partials
 
 from pycycle.mp_cycle import Cycle
-from pycycle.elements.duct import Duct
+from pycycle.new_elements.duct import NewDuct
 from pycycle.elements.flow_start import FlowStart
 from pycycle import constants
-from pycycle.thermo.cea import species_data
+from pycycle.constants import AIR_JETA_TAB_SPEC
 
 
 fpath = os.path.dirname(os.path.realpath(__file__))
@@ -45,17 +45,17 @@ header = [
 h_map = dict(((v_name, i) for i, v_name in enumerate(header)))
 
 
-class DuctTestCase(unittest.TestCase):
+class NewDuctTestCase(unittest.TestCase):
 
     def test_case1(self):
 
         self.prob = Problem()
         cycle = self.prob.model = Cycle()
-        cycle.options['thermo_method'] = 'CEA'
-        cycle.options['thermo_data'] = species_data.janaf
+        cycle.options['thermo_method'] = 'TABULAR'
+        cycle.options['thermo_data'] = AIR_JETA_TAB_SPEC
 
         cycle.add_subsystem('flow_start', FlowStart(), promotes=['MN', 'P', 'T'])
-        cycle.add_subsystem('duct', Duct(), promotes=['MN'])
+        cycle.add_subsystem('duct', NewDuct(), promotes=['MN'])
 
         cycle.pyc_connect_flow('flow_start.Fl_O', 'duct.Fl_I')
 
@@ -112,13 +112,13 @@ class DuctTestCase(unittest.TestCase):
 
         # need two cycles, because we can't mix design and off-design
         cycle_DES = self.prob.model.add_subsystem('DESIGN', Cycle())
-        cycle_DES.options['thermo_method'] = 'CEA'
-        cycle_DES.options['thermo_data'] = species_data.janaf
+        cycle_DES.options['thermo_method'] = 'TABULAR'
+        cycle_DES.options['thermo_data'] = AIR_JETA_TAB_SPEC
 
         cycle_OD = self.prob.model.add_subsystem('OFF_DESIGN', Cycle())
         cycle_OD.options['design'] = False
-        cycle_OD.options['thermo_method'] = 'CEA'
-        cycle_OD.options['thermo_data'] = species_data.janaf
+        cycle_OD.options['thermo_method'] = 'TABULAR'
+        cycle_OD.options['thermo_data'] = AIR_JETA_TAB_SPEC
 
 
         cycle_DES.add_subsystem('flow_start', FlowStart(), promotes=['P', 'T', 'MN', 'W'])
@@ -126,8 +126,8 @@ class DuctTestCase(unittest.TestCase):
         cycle_OD.add_subsystem('flow_start_OD', FlowStart(), promotes=['P', 'T', 'W', 'MN'])
 
         expMN = 1.0
-        cycle_DES.add_subsystem('duct', Duct(expMN=expMN), promotes=['MN'])
-        cycle_OD.add_subsystem('duct', Duct(expMN=expMN, design=False))
+        cycle_DES.add_subsystem('duct', NewDuct(expMN=expMN), promotes=['MN'])
+        cycle_OD.add_subsystem('duct', NewDuct(expMN=expMN, design=False))
 
         cycle_DES.pyc_connect_flow('flow_start.Fl_O', 'duct.Fl_I')
         cycle_OD.pyc_connect_flow('flow_start_OD.Fl_O', 'duct.Fl_I')
@@ -141,7 +141,6 @@ class DuctTestCase(unittest.TestCase):
         cycle_OD.set_input_defaults('P', 17., units='psi')
         cycle_OD.set_input_defaults('T', 500., units='degR')
         cycle_OD.set_input_defaults('MN', 0.25)
-        cycle_OD.set_input_defaults('duct.dPqP', 0.0)
         cycle_OD.set_input_defaults('W', 500., units='lbm/s')
 
         self.prob.model.connect("DESIGN.duct.s_dPqP", "OFF_DESIGN.duct.s_dPqP")
@@ -181,7 +180,8 @@ class DuctTestCase(unittest.TestCase):
         ps_computed = self.prob['OFF_DESIGN.duct.Fl_O:stat:P']
         ts_computed = self.prob['OFF_DESIGN.duct.Fl_O:stat:T']
 
-        tol = 1.0e-4
+        # Tabular thermo gives slightly different results than CEA (up to ~0.3%)
+        tol = 5.0e-3
         assert_near_equal(pt_computed, 8.84073152, tol)
         assert_near_equal(ht_computed, ht, tol)
         assert_near_equal(ps_computed, 8.26348914, tol)

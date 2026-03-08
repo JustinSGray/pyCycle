@@ -6,7 +6,7 @@ import openmdao.api as om
 import networkx as nx
 
 from pycycle.element_base import Element
-from pycycle.jax_element_base import JaxElement
+from pycycle.new_elements.jax_element_base import JaxElement
 from pycycle.thermo.cea import species_data
 from pycycle.constants import ALLOWED_THERMOS
 

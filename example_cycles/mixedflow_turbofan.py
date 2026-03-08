@@ -11,7 +11,7 @@ class MixedFlowTurbofan(pyc.Cycle):
     def setup(self):
         design = self.options['design']
 
-        USE_TABULAR = False
+        USE_TABULAR = True
 
         if USE_TABULAR: 
             self.options['thermo_method'] = 'TABULAR'
@@ -273,10 +273,10 @@ class MPMixedFlowTurbofan(pyc.MPCycle):
         self.pyc_add_cycle_param('hpt.cool3:frac_P', 1.0)
         self.pyc_add_cycle_param('lpt.cool1:frac_P', 1.0)
 
-        self.od_pts = ['OD',]
-        self.od_T4s = [3100,]
-        self.od_alts = [35000,]
-        self.od_MNs = [0.8, ]
+        self.od_pts = ['OD1']
+        self.od_T4s = [3100]
+        self.od_alts = [35000]
+        self.od_MNs = [0.8]
 
         for i,pt in enumerate(self.od_pts):
             self.pyc_add_pnt(pt, MixedFlowTurbofan(design=False, thermo_method='CEA'))
@@ -397,25 +397,20 @@ if __name__ == "__main__":
     for pt in ['DESIGN']+mp_mixedflow.od_pts:
         page_viewer(pt)
 
+
+    for t4 in [3100, 3000, 2500, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200, 1100, 1000, 900]: 
+        prob['OD1.balance.rhs:FAR_core'] = t4
+        prob.run_model()
+
+        print("################################")
+        print(f"# OD1 - {t4}: Fnet {prob['OD1.perf.Fn']}") 
+        print("################################")
+        print("Fan Rmap:", prob[pt+'.fan.map.RlineMap'])
+        print("LPC Rmap:", prob[pt+'.lpc.map.RlineMap'])
+        print("HPC Rmap:", prob[pt+'.hpc.map.RlineMap'])
+
     print()
     print("time", time.time() - st)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

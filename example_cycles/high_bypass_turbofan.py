@@ -464,8 +464,11 @@ if __name__ == "__main__":
         prob['OD_part_pwr.fc.MN'] = MN
         prob['OD_part_pwr.fc.alt'] = alt
 
-        for PC in [1, 0.9, 0.8, .7]:
+        for PC in [1, 0.9, 0.8, .7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.15, 0.14, 0.13, 0.12, 0.11, 0.105]:
         # for PC in [1,]:
+
+            print()
+            print()
             print(f'## PC = {PC}')
             prob['OD_part_pwr.PC'] = PC
             prob.run_model()
@@ -473,10 +476,19 @@ if __name__ == "__main__":
             if first_pass:
                 viewer(prob, 'DESIGN')
                 first_pass = False
-            viewer(prob, 'OD_part_pwr', file=viewer_file)
+            # viewer(prob, 'OD_part_pwr', file=viewer_file)
+
+            print("################################")
+            print(f"# OD_part_pwr - {PC}: Fnet {prob['OD_part_pwr.perf.Fn']}") 
+            print("################################")
+            print("Fan Rmap:", prob['OD_part_pwr.fan.map.RlineMap'])
+            print("LPC Rmap:", prob['OD_part_pwr.lpc.map.RlineMap'])
+            print("HPC Rmap:", prob['OD_part_pwr.hpc.map.RlineMap'])
+            print("HPT PR: ", prob['OD_part_pwr.hpt.PR'])
+            print("LPT PR: ", prob['OD_part_pwr.lpt.PR'])
 
         # run throttle back up to full power
-        for PC in [1, 0.85]:
+        for PC in [1, 0.85, 0.6]:
             prob['OD_part_pwr.PC'] = PC
             prob.run_model()
 

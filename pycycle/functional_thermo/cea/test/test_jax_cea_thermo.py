@@ -15,13 +15,14 @@ class TestJaxCEATotalhP(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
     def test_hP_round_trip(self):
         """Get h from TP, then recover T from hP."""
         for T_R in [900.0, 1800.0, 2700.0, 3600.0]:
             P = 14.696  # psi
-            props = self.jax_thermo.set_total_TP(T_R, P)
-            T_recovered = self.jax_thermo.set_total_hP(float(props.h), P)
+            props = self.jax_thermo.set_total_TP(T_R, P, self.b0)
+            T_recovered = self.jax_thermo.set_total_hP(float(props.h), P, self.b0)
             np.testing.assert_allclose(
                 float(T_recovered), T_R, rtol=1e-3,
                 err_msg=f"hP round-trip failed at T={T_R}R"
@@ -33,6 +34,7 @@ class TestJaxCEAStaticMN(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
     def test_static_MN_sanity(self):
         """Static T < total T, static P < total P, V = MN * Vsonic."""
@@ -41,7 +43,7 @@ class TestJaxCEAStaticMN(unittest.TestCase):
         MN = 0.5
         W = 100.0    # lbm/s
 
-        static = self.jax_thermo.set_static_MN(Tt, Pt, MN, W)
+        static = self.jax_thermo.set_static_MN(Tt, Pt, MN, W, self.b0)
 
         self.assertLess(float(static.Ts), Tt, "Static T should be < total T")
         self.assertLess(float(static.Ps), Pt, "Static P should be < total P")
@@ -53,7 +55,7 @@ class TestJaxCEAStaticMN(unittest.TestCase):
     def test_darea_dMN_sign(self):
         """darea/dMN should be negative for subsonic flow."""
         Tt = 2700.0; Pt = 44.0; MN = 0.5; W = 100.0
-        static = self.jax_thermo.set_static_MN(Tt, Pt, MN, W)
+        static = self.jax_thermo.set_static_MN(Tt, Pt, MN, W, self.b0)
         self.assertLess(float(static.darea_dMN), 0,
                         "darea/dMN should be negative for subsonic flow")
 
@@ -63,6 +65,7 @@ class TestJaxCEAStaticArea(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
     def test_area_round_trip(self):
         """Get area from MN solver, recover MN from area solver."""
@@ -71,10 +74,10 @@ class TestJaxCEAStaticArea(unittest.TestCase):
         MN_orig = 0.6
         W = 100.0     # lbm/s
 
-        static1 = self.jax_thermo.set_static_MN(Tt, Pt, MN_orig, W)
+        static1 = self.jax_thermo.set_static_MN(Tt, Pt, MN_orig, W, self.b0)
         area = float(static1.area)
 
-        static2 = self.jax_thermo.set_static_area(Tt, Pt, area, W)
+        static2 = self.jax_thermo.set_static_area(Tt, Pt, area, W, self.b0)
 
         np.testing.assert_allclose(float(static2.MN), MN_orig, rtol=1e-4,
                                    err_msg="Area round-trip failed to recover MN")
@@ -83,10 +86,10 @@ class TestJaxCEAStaticArea(unittest.TestCase):
         """Round-trip at low Mach number."""
         Tt = 1800.0; Pt = 100.0; MN_orig = 0.3; W = 50.0
 
-        static1 = self.jax_thermo.set_static_MN(Tt, Pt, MN_orig, W)
+        static1 = self.jax_thermo.set_static_MN(Tt, Pt, MN_orig, W, self.b0)
         area = float(static1.area)
 
-        static2 = self.jax_thermo.set_static_area(Tt, Pt, area, W)
+        static2 = self.jax_thermo.set_static_area(Tt, Pt, area, W, self.b0)
 
         np.testing.assert_allclose(float(static2.MN), MN_orig, rtol=1e-4,
                                    err_msg="Area round-trip failed at low MN")
@@ -102,6 +105,7 @@ class TestChemEqJanaf(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
     def test_equilibrium_n_at_1500K(self):
         """Mole fractions at T=1500K, P=1.034210 bar should match OpenMDAO ChemEq reference.
@@ -113,7 +117,10 @@ class TestChemEqJanaf(unittest.TestCase):
         T_si = 1500.0       # K
         P_si = 103421.0     # Pa (1.034210 bar)
 
-        n, pi, n_moles = self.jax_thermo._solve_equilibrium(T_si, P_si)
+        n, pi, n_moles = self.jax_thermo._solve_equilibrium(
+            T_si, P_si, self.b0,
+            self.jax_thermo._n_init, np.zeros(self.jax_thermo.num_element)
+        )
 
         check_val = np.array([3.23319236e-04, 1.00000000e-10, 1.10138429e-05, 1.00000000e-10,
                               1.72853915e-08, 6.76015824e-09, 1.00000000e-10, 2.69578737e-02,
@@ -134,13 +141,14 @@ class TestTotalTP_CO2(unittest.TestCase):
             composition=constants.CEA_CO2_CO_O2_COMPOSITION,
             thermo_data=species_data.co2_co_o2
         )
+        self.b0 = self.jax_thermo._default_composition
 
     def test_gamma_at_4000K(self):
         """gamma at T=4000K, P=1.034210 bar should be 1.19054697."""
         T_R = 4000.0 * 9.0 / 5.0   # K -> Rankine
         P_psi = 1.034210 * 14.5038  # bar -> psi
 
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
         np.testing.assert_allclose(float(props.gamma), 1.19054697, rtol=1e-4)
 
     def test_gamma_at_1500K(self):
@@ -148,7 +156,7 @@ class TestTotalTP_CO2(unittest.TestCase):
         T_R = 1500.0 * 9.0 / 5.0
         P_psi = 1.034210 * 14.5038
 
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
         np.testing.assert_allclose(float(props.gamma), 1.16379233, rtol=1e-4)
 
 
@@ -166,14 +174,15 @@ class TestTotalhP_CO2(unittest.TestCase):
             composition=constants.CEA_CO2_CO_O2_COMPOSITION,
             thermo_data=species_data.co2_co_o2
         )
+        self.b0 = self.jax_thermo._default_composition
 
     def test_hP_at_4000K_condition(self):
         """h=340 cal/g, P=1.034210 bar should give gamma ~ 1.19039688581."""
         h_btu = 340.0 * self.CAL_G_TO_BTU_LBM
         P_psi = 1.034210 * 14.5038
 
-        T_R = float(self.jax_thermo.set_total_hP(h_btu, P_psi))
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        T_R = float(self.jax_thermo.set_total_hP(h_btu, P_psi, self.b0))
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
         np.testing.assert_allclose(float(props.gamma), 1.19039688581, rtol=1e-4)
 
     def test_hP_at_1500K_condition(self):
@@ -181,8 +190,8 @@ class TestTotalhP_CO2(unittest.TestCase):
         h_btu = -1801.35537381 * self.CAL_G_TO_BTU_LBM
         P_psi = 1.034210 * 14.5038
 
-        T_R = float(self.jax_thermo.set_total_hP(h_btu, P_psi))
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        T_R = float(self.jax_thermo.set_total_hP(h_btu, P_psi, self.b0))
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
         np.testing.assert_allclose(float(props.gamma), 1.16379012007, rtol=1e-4)
 
 
@@ -195,13 +204,14 @@ class TestTotalEquivalenceJanaf(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
     def _check_equivalence(self, T_R, P_psi):
         """Compute h from TP, then recover T from hP and verify match."""
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
         h = float(props.h)
 
-        T_recovered = float(self.jax_thermo.set_total_hP(h, P_psi))
+        T_recovered = float(self.jax_thermo.set_total_hP(h, P_psi, self.b0))
         np.testing.assert_allclose(T_recovered, T_R, rtol=1e-4,
                                    err_msg=f"hP round-trip failed at T={T_R}R, P={P_psi}psi")
 
@@ -229,6 +239,7 @@ class TestStaticMN_NPSS(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
         fpath = os.path.dirname(os.path.realpath(__file__))
         data_path = os.path.join(fpath, '..', '..', '..', 'thermo', 'test', 'NPSS_Static_CEA_Data.csv')
@@ -273,7 +284,8 @@ class TestStaticMN_NPSS(unittest.TestCase):
         for i, data in enumerate(self.ref_data):
             with self.subTest(case=i, MN=data[h['MN']], Tt=data[h['Tt']]):
                 static = self.jax_thermo.set_static_MN(
-                    data[h['Tt']], data[h['Pt']], data[h['MN']], data[h['W']])
+                    data[h['Tt']], data[h['Pt']], data[h['MN']], data[h['W']],
+                    self.b0)
                 self._check_static(static, data)
 
 
@@ -288,6 +300,7 @@ class TestStaticArea_NPSS(unittest.TestCase):
 
     def setUp(self):
         self.jax_thermo = JaxCEAThermo()
+        self.b0 = self.jax_thermo._default_composition
 
         fpath = os.path.dirname(os.path.realpath(__file__))
         data_path = os.path.join(fpath, '..', '..', '..', 'thermo', 'test', 'NPSS_Static_CEA_Data.csv')
@@ -332,7 +345,8 @@ class TestStaticArea_NPSS(unittest.TestCase):
                 continue
             with self.subTest(case=i, MN=data[h['MN']], Tt=data[h['Tt']]):
                 static = self.jax_thermo.set_static_area(
-                    data[h['Tt']], data[h['Pt']], data[h['A']], data[h['W']])
+                    data[h['Tt']], data[h['Pt']], data[h['A']], data[h['W']],
+                    self.b0)
                 self._check_static(static, data)
 
 
@@ -349,6 +363,7 @@ class TestPropsCalcs_CO2(unittest.TestCase):
             composition=constants.CEA_CO2_CO_O2_COMPOSITION,
             thermo_data=species_data.co2_co_o2
         )
+        self.b0 = self.jax_thermo._default_composition
 
     def test_props_at_4000K(self):
         """Properties at T=4000K, P=1.034210 bar.
@@ -361,7 +376,7 @@ class TestPropsCalcs_CO2(unittest.TestCase):
         T_R = 4000.0 * 9.0 / 5.0
         P_psi = 1.034210 * 14.5038
 
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
 
         np.testing.assert_allclose(float(props.gamma), 1.19039, rtol=2e-4)
         np.testing.assert_allclose(float(props.h), 340.324938088 * self.CAL_G_TO_BTU_LBM, rtol=3e-3)
@@ -371,11 +386,38 @@ class TestPropsCalcs_CO2(unittest.TestCase):
         T_R = 1500.0 * 9.0 / 5.0
         P_psi = 1.034210 * 14.5038
 
-        props = self.jax_thermo.set_total_TP(T_R, P_psi)
+        props = self.jax_thermo.set_total_TP(T_R, P_psi, self.b0)
 
         tol = 1e-4
         np.testing.assert_allclose(float(props.gamma), 1.16380, rtol=tol)
         np.testing.assert_allclose(float(props.h), -1801.35777129 * self.CAL_G_TO_BTU_LBM, rtol=tol)
+
+
+class TestDifferentCompositions(unittest.TestCase):
+    """Test that a single JaxCEAThermo instance works with different b0 values."""
+
+    def test_same_instance_different_b0(self):
+        """Calling with different b0 values should produce different results."""
+        thermo = JaxCEAThermo()
+        b0_air = thermo._default_composition
+
+        T_R = 1800.0
+        P_psi = 14.696
+
+        props_air = thermo.set_total_TP(T_R, P_psi, b0_air)
+
+        # Perturb b0 slightly (simulate different composition)
+        import jax.numpy as jnp
+        b0_perturbed = b0_air * 1.01
+        props_perturbed = thermo.set_total_TP(T_R, P_psi, b0_perturbed)
+
+        # Results should be different
+        self.assertNotAlmostEqual(float(props_air.h), float(props_perturbed.h),
+                                  places=4, msg="Different compositions should give different h")
+
+        # But calling with same b0 again should give same result
+        props_air2 = thermo.set_total_TP(T_R, P_psi, b0_air)
+        np.testing.assert_allclose(float(props_air2.h), float(props_air.h), rtol=1e-10)
 
 
 if __name__ == "__main__":

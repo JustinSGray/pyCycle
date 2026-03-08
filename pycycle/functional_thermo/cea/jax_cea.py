@@ -300,8 +300,17 @@ class JaxCEAThermo:
         self.num_prod = self._data['num_prod']
         self.num_element = self._data['num_element']
 
+        # Store the default composition (b0) for convenience
+        self._default_composition = self._data['b0']
+
         # Initial guess for species concentrations
         self._n_init = jnp.ones(self.num_prod) / self.num_prod / 10.0
+
+        # Warm-start cache (mutable state, outside JIT)
+        self._cached_n = self._n_init.copy()
+        self._cached_pi = jnp.zeros(self.num_element)
+        self._cached_T_si = 1500.0 * 5.0 / 9.0  # ~833K default
+        self._cached_MN = 0.5
 
         # Unit conversion factors (English <-> SI), same as jax_tabular
         h_to_si = 2326.0         # Btu/lbm -> J/kg
@@ -326,7 +335,6 @@ class JaxCEAThermo:
         aij = data['aij']
         aij_T = data['aij_T']
         aij_prod = data['aij_prod']
-        b0 = data['b0']
         num_prod = data['num_prod']
         num_element = data['num_element']
         n_init = self._n_init
@@ -344,7 +352,7 @@ class JaxCEAThermo:
         # Helper: compute equilibrium residuals and Jacobian
         # =====================================================================
 
-        def compute_equilibrium_residuals(n, pi, H0, S0, P_norm, n_moles):
+        def compute_equilibrium_residuals(n, pi, H0, S0, P_norm, n_moles, b0):
             """Compute residuals for the equilibrium system."""
             size = num_prod + num_element
 
@@ -404,7 +412,7 @@ class JaxCEAThermo:
         # Helper: compute thermodynamic properties from equilibrium state
         # =====================================================================
 
-        def compute_properties_si(T_si, P_si, n, n_moles, a):
+        def compute_properties_si(T_si, P_si, n, n_moles, a, b0):
             """Compute all thermo properties in SI from converged equilibrium."""
             P_bar = P_si / 100000.0
 
@@ -480,8 +488,12 @@ class JaxCEAThermo:
         # Equilibrium Newton solver
         # =====================================================================
 
-        def solve_equilibrium(T_si, P_si):
-            """Solve chemical equilibrium at given T, P via Newton iteration."""
+        def solve_equilibrium(T_si, P_si, b0, n_guess, pi_guess):
+            """Solve chemical equilibrium at given T, P via Newton iteration.
+
+            Accepts initial guesses for warm-starting. Falls back to default
+            initial guess if warm-start fails to converge.
+            """
             P_bar = P_si / 100000.0
             P_norm = P_bar / P_REF
 
@@ -490,17 +502,6 @@ class JaxCEAThermo:
             S0 = _compute_S0(T_si, a)
 
             size = num_prod + num_element
-
-            # State vector: [n, pi, residual_norm, iteration]
-            state_size = size + 2
-
-            def init_state():
-                n = n_init
-                pi = jnp.zeros(num_element)
-                n_moles = jnp.sum(n)
-                resids, _ = compute_equilibrium_residuals(n, pi, H0, S0, P_norm, n_moles)
-                resid_norm = jnp.linalg.norm(resids)
-                return jnp.concatenate([n, pi, jnp.array([resid_norm, 0.0])])
 
             def cond_fn(state):
                 resid_norm = state[size]
@@ -514,7 +515,7 @@ class JaxCEAThermo:
                 iteration = state[size + 1]
 
                 n_moles = jnp.sum(n)
-                resids, weights = compute_equilibrium_residuals(n, pi, H0, S0, P_norm, n_moles)
+                resids, weights = compute_equilibrium_residuals(n, pi, H0, S0, P_norm, n_moles, b0)
 
                 # Only remove trace species when close to convergence
                 remove_trace = resid_norm < 1e-4
@@ -536,17 +537,35 @@ class JaxCEAThermo:
 
                 # Recompute residual norm
                 n_moles_new = jnp.sum(n_new)
-                resids_new, _ = compute_equilibrium_residuals(n_new, pi_new, H0, S0, P_norm, n_moles_new)
+                resids_new, _ = compute_equilibrium_residuals(n_new, pi_new, H0, S0, P_norm, n_moles_new, b0)
                 resid_norm_new = jnp.linalg.norm(resids_new)
 
                 return jnp.concatenate([n_new, pi_new,
                                         jnp.array([resid_norm_new, iteration + 1])])
 
-            final_state = jax.lax.while_loop(cond_fn, body_fn, init_state())
+            def run_newton(init_n, init_pi):
+                n_moles = jnp.sum(init_n)
+                resids, _ = compute_equilibrium_residuals(init_n, init_pi, H0, S0, P_norm, n_moles, b0)
+                resid_norm = jnp.linalg.norm(resids)
+                init = jnp.concatenate([init_n, init_pi, jnp.array([resid_norm, 0.0])])
+                final_state = jax.lax.while_loop(cond_fn, body_fn, init)
+                n = final_state[:num_prod]
+                pi = final_state[num_prod:size]
+                n_moles = jnp.sum(n)
+                resid_norm = final_state[size]
+                return n, pi, n_moles, resid_norm
 
-            n = final_state[:num_prod]
-            pi = final_state[num_prod:size]
-            n_moles = jnp.sum(n)
+            # Try with warm-start guess
+            n_w, pi_w, nm_w, rn_w = run_newton(n_guess, pi_guess)
+            converged = rn_w <= 1e-7
+
+            # Fallback to default guess if warm-start failed
+            def use_warm(_):
+                return n_w, pi_w, nm_w
+            def use_default(_):
+                n_d, pi_d, nm_d, _ = run_newton(n_init, jnp.zeros(num_element))
+                return n_d, pi_d, nm_d
+            n, pi, n_moles = jax.lax.cond(converged, use_warm, use_default, None)
             return n, pi, n_moles
 
         # =====================================================================
@@ -554,16 +573,16 @@ class JaxCEAThermo:
         # =====================================================================
 
         @jax.jit
-        def _set_total_TP_jit(T, P):
+        def _set_total_TP_jit(T, P, b0, n_guess, pi_guess):
             """JIT-compiled set_total_TP."""
             T_si = T * T_to_si_scale
             P_si = P * P_to_si
 
-            n, pi, n_moles = solve_equilibrium(T_si, P_si)
+            n, pi, n_moles = solve_equilibrium(T_si, P_si, b0, n_guess, pi_guess)
             a = get_coeffs(T_si)
-            props_si = compute_properties_si(T_si, P_si, n, n_moles, a)
+            props_si = compute_properties_si(T_si, P_si, n, n_moles, a, b0)
 
-            return TotalProps(
+            props = TotalProps(
                 h=props_si.h * h_from_si,
                 S=props_si.S * S_from_si,
                 gamma=props_si.gamma,
@@ -572,13 +591,14 @@ class JaxCEAThermo:
                 rho=props_si.rho * rho_from_si,
                 R=props_si.R * S_from_si,
             )
+            return props, n, pi
 
         # =====================================================================
         # set_total_hP: combined Newton for (T, n, pi)
         # =====================================================================
 
         @jax.jit
-        def _set_total_hP_jit(h_target, P):
+        def _set_total_hP_jit(h_target, P, b0, n_guess, pi_guess):
             """JIT-compiled set_total_hP with combined Newton solver."""
             h_target_si = h_target * h_to_si
             P_si = P * P_to_si
@@ -587,12 +607,6 @@ class JaxCEAThermo:
 
             # State vector: [T, n, pi, residual_norm, iteration]
             full_size = 1 + num_prod + num_element
-            state_size = full_size + 2
-
-            def compute_h_si(T_si, n, a):
-                """Compute enthalpy in SI (J/kg) from state."""
-                H0 = _compute_H0(T_si, a)
-                return jnp.sum(n * H0) * R_UNIVERSAL_ENG * T_si * CAL_G_TO_J_KG
 
             def compute_residuals_hP(T_si, n, pi):
                 """Compute residuals for the combined hP system."""
@@ -673,18 +687,6 @@ class JaxCEAThermo:
 
                 return J
 
-            # Initial guess
-            T_si_init = jnp.clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 3000.0)
-
-            def init_state():
-                T_si = T_si_init
-                n = n_init
-                pi = jnp.zeros(num_element)
-                resids, _ = compute_residuals_hP(T_si, n, pi)
-                resid_norm = jnp.linalg.norm(resids)
-                return jnp.concatenate([jnp.array([T_si]), n, pi,
-                                        jnp.array([resid_norm, 0.0])])
-
             def cond_fn(state):
                 resid_norm = state[full_size]
                 iteration = state[full_size + 1]
@@ -711,10 +713,34 @@ class JaxCEAThermo:
                 return jnp.concatenate([jnp.array([T_new]), n_new, pi_new,
                                         jnp.array([resid_norm_new, iteration + 1])])
 
-            final_state = jax.lax.while_loop(cond_fn, body_fn, init_state())
-            T_si = final_state[0]
+            def run_hP_newton(T_init, n_init_local, pi_init_local):
+                resids, _ = compute_residuals_hP(T_init, n_init_local, pi_init_local)
+                resid_norm = jnp.linalg.norm(resids)
+                init = jnp.concatenate([jnp.array([T_init]), n_init_local, pi_init_local,
+                                        jnp.array([resid_norm, 0.0])])
+                final_state = jax.lax.while_loop(cond_fn, body_fn, init)
+                T_si = final_state[0]
+                n = final_state[1:1 + num_prod]
+                pi = final_state[1 + num_prod:full_size]
+                resid_norm = final_state[full_size]
+                return T_si, n, pi, resid_norm
 
-            return T_si / T_to_si_scale
+            # Always use h-based T estimate (avoids local minima from far-off T guess)
+            T_si_init = jnp.clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 3000.0)
+
+            # Try with warm-start n/pi from cache
+            T_w, n_w, pi_w, rn_w = run_hP_newton(T_si_init, n_guess, pi_guess)
+            converged = rn_w <= 1e-7
+
+            # Fallback to default n/pi if warm-start failed
+            def use_warm(_):
+                return T_w, n_w, pi_w
+            def use_default(_):
+                T_d, n_d, pi_d, _ = run_hP_newton(T_si_init, n_init, jnp.zeros(num_element))
+                return T_d, n_d, pi_d
+            T_si, n_final, pi_final = jax.lax.cond(converged, use_warm, use_default, None)
+
+            return T_si / T_to_si_scale, T_si, n_final, pi_final
 
         # Store references
         self._set_total_TP_jit = _set_total_TP_jit
@@ -732,7 +758,6 @@ class JaxCEAThermo:
         aij = data['aij']
         aij_T = data['aij_T']
         aij_prod = data['aij_prod']
-        b0 = data['b0']
         num_prod = data['num_prod']
         num_element = data['num_element']
         n_init = self._n_init
@@ -772,12 +797,12 @@ class JaxCEAThermo:
         # set_static_MN: isentropic relations + equilibrium at static conditions
         # =====================================================================
 
-        def compute_static_MN_si(Tt_si, Pt_si, MN, W_si):
+        def compute_static_MN_si(Tt_si, Pt_si, MN, W_si, b0, n_guess, pi_guess):
             """Compute static properties in SI from total conditions and MN."""
-            # Get total properties via equilibrium
-            n_t, pi_t, n_moles_t = solve_equilibrium(Tt_si, Pt_si)
+            # Get total properties via equilibrium (warm-started)
+            n_t, pi_t, n_moles_t = solve_equilibrium(Tt_si, Pt_si, b0, n_guess, pi_guess)
             a_t = get_coeffs(Tt_si)
-            props_t = compute_properties_si(Tt_si, Pt_si, n_t, n_moles_t, a_t)
+            props_t = compute_properties_si(Tt_si, Pt_si, n_t, n_moles_t, a_t, b0)
 
             gam = props_t.gamma
             R_t = props_t.R
@@ -790,10 +815,10 @@ class JaxCEAThermo:
             Ts = Tt_si * temp_ratio
             Ps = Pt_si * temp_ratio ** (gam / (gam - 1.0))
 
-            # Solve equilibrium at static conditions
-            n_s, pi_s, n_moles_s = solve_equilibrium(Ts, Ps)
+            # Solve equilibrium at static conditions (use total state as initial guess)
+            n_s, pi_s, n_moles_s = solve_equilibrium(Ts, Ps, b0, n_t, pi_t)
             a_s = get_coeffs(Ts)
-            props_s = compute_properties_si(Ts, Ps, n_s, n_moles_s, a_s)
+            props_s = compute_properties_si(Ts, Ps, n_s, n_moles_s, a_s, b0)
 
             # Speed of sound and velocity using static properties
             Vsonic = jnp.sqrt(props_s.gamma * props_s.R * Ts)
@@ -807,17 +832,17 @@ class JaxCEAThermo:
 
             return (Ts, Ps, props_s.h, rhos, MN, V, Vsonic, area,
                     props_s.gamma, props_s.Cp, props_s.Cv, props_s.S, props_s.R,
-                    props_t)
+                    props_t, n_t, pi_t)
 
-        def set_static_MN_impl(Tt, Pt, MN, W):
+        def set_static_MN_impl(Tt, Pt, MN, W, b0, n_guess, pi_guess):
             """Pure JAX set_static_MN."""
             Tt_si = Tt * T_to_si_scale
             Pt_si = Pt * P_to_si
             W_si = W * W_to_si
 
             (Ts_si, Ps_si, hs_si, rho_s, MN_out, V, Vsonic, area_si,
-             gamma_s, Cp_s, Cv_s, S_s, R_s, props_t) = compute_static_MN_si(
-                Tt_si, Pt_si, MN, W_si)
+             gamma_s, Cp_s, Cv_s, S_s, R_s, props_t, n_t, pi_t) = compute_static_MN_si(
+                Tt_si, Pt_si, MN, W_si, b0, n_guess, pi_guess)
 
             # Handle zero MN
             is_zero_MN = MN < 1e-10
@@ -842,25 +867,26 @@ class JaxCEAThermo:
 
             # darea/dMN via forward-mode autodiff (reverse mode doesn't support while_loop)
             def area_from_MN(mn):
-                _, _, _, rho, _, _, _, a, _, _, _, _, _, _ = compute_static_MN_si(
-                    Tt_si, Pt_si, mn, W_si)
+                _, _, _, rho, _, _, _, a, _, _, _, _, _, _, _, _ = compute_static_MN_si(
+                    Tt_si, Pt_si, mn, W_si, b0, n_guess, pi_guess)
                 return a
 
             darea_dMN_si = jax.jvp(area_from_MN, (MN,), (jnp.ones_like(MN),))[1]
             darea_dMN = jnp.where(is_zero_MN, -1e30, darea_dMN_si * area_from_si)
 
-            return StaticPropsWithDeriv(
+            result = StaticPropsWithDeriv(
                 Ts=static.Ts, Ps=static.Ps, hs=static.hs, rhos=static.rhos,
                 MN=static.MN, V=static.V, Vsonic=static.Vsonic, area=static.area,
                 gamma=static.gamma, Cp=static.Cp, Cv=static.Cv, S=static.S, R=static.R,
                 darea_dMN=darea_dMN,
             )
+            return result, n_t, pi_t
 
         # =====================================================================
         # set_static_area: 1D Newton on MN to match target area
         # =====================================================================
 
-        def set_static_area_impl(Tt, Pt, area, W):
+        def set_static_area_impl(Tt, Pt, area, W, b0, MN_guess, n_guess, pi_guess):
             """Pure JAX set_static_area with 1D Newton on MN."""
             Tt_si = Tt * T_to_si_scale
             Pt_si = Pt * P_to_si
@@ -869,8 +895,8 @@ class JaxCEAThermo:
 
             def area_residual(MN):
                 """Compute area - area_target at given MN."""
-                _, _, _, rho_s, _, _, _, a_computed, _, _, _, _, _, _ = \
-                    compute_static_MN_si(Tt_si, Pt_si, MN, W_si)
+                _, _, _, rho_s, _, _, _, a_computed, _, _, _, _, _, _, _, _ = \
+                    compute_static_MN_si(Tt_si, Pt_si, MN, W_si, b0, n_guess, pi_guess)
                 return a_computed - area_si
 
             # 1D Newton on MN using forward-mode AD for derivative
@@ -895,24 +921,36 @@ class JaxCEAThermo:
 
                 return jnp.array([MN_new, r_new, iteration + 1])
 
-            MN0 = 0.5
-            r0 = area_residual(MN0)
-            init = jnp.array([MN0, r0, 0.0])
+            def run_MN_newton(MN0):
+                r0 = area_residual(MN0)
+                init = jnp.array([MN0, r0, 0.0])
+                final = jax.lax.while_loop(cond_fn, body_fn, init)
+                return final[0], jnp.abs(final[1])
 
-            final = jax.lax.while_loop(cond_fn, body_fn, init)
-            MN_final = final[0]
+            # Try with warm-start guess
+            MN_w, rn_w = run_MN_newton(MN_guess)
+            converged = rn_w <= 1e-10
+
+            # Fallback to default MN=0.5 if warm-start failed
+            def use_warm_MN(_):
+                return MN_w
+            def use_default_MN(_):
+                MN_d, _ = run_MN_newton(0.5)
+                return MN_d
+            MN_final = jax.lax.cond(converged, use_warm_MN, use_default_MN, None)
 
             # Get full static properties at converged MN
             (Ts_si, Ps_si, hs_si, rho_s, _, V, Vsonic, _,
-             gamma_s, Cp_s, Cv_s, S_s, R_s, _) = compute_static_MN_si(
-                Tt_si, Pt_si, MN_final, W_si)
+             gamma_s, Cp_s, Cv_s, S_s, R_s, _, n_t, pi_t) = compute_static_MN_si(
+                Tt_si, Pt_si, MN_final, W_si, b0, n_guess, pi_guess)
 
             area_final = W_si / (rho_s * V)
 
-            return convert_static_to_english(
+            props = convert_static_to_english(
                 Ts_si, Ps_si, hs_si, rho_s, MN_final, V, Vsonic,
                 area_final, gamma_s, Cp_s, Cv_s, S_s, R_s
             )
+            return props, MN_final, n_t, pi_t
 
         # JIT compile
         self._set_static_MN_jit = jax.jit(set_static_MN_impl)
@@ -922,7 +960,7 @@ class JaxCEAThermo:
     # Public API
     # =========================================================================
 
-    def set_total_TP(self, T, P, FAR=None):
+    def set_total_TP(self, T, P, composition):
         """
         Get all thermodynamic properties at given T, P.
 
@@ -932,17 +970,21 @@ class JaxCEAThermo:
             Temperature (English units: Rankine)
         P : float
             Pressure (English units: psi)
-        FAR : ignored
-            Accepted for API compatibility with JaxTabularThermo.
+        composition : array-like
+            Elemental molar concentrations (b0 array), shape (num_element,)
 
         Returns
         -------
         TotalProps
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in English units
         """
-        return self._set_total_TP_jit(T, P)
+        b0 = jnp.asarray(composition)
+        props, n, pi = self._set_total_TP_jit(T, P, b0, self._cached_n, self._cached_pi)
+        self._cached_n = n
+        self._cached_pi = pi
+        return props
 
-    def set_total_hP(self, h_target, P, FAR=None):
+    def set_total_hP(self, h_target, P, composition):
         """
         Solve for temperature given enthalpy and pressure.
 
@@ -955,20 +997,27 @@ class JaxCEAThermo:
             Target enthalpy (English units: Btu/lbm)
         P : float
             Pressure (English units: psi)
-        FAR : ignored
+        composition : array-like
+            Elemental molar concentrations (b0 array), shape (num_element,)
 
         Returns
         -------
         float
             Temperature (English units: Rankine)
         """
-        return self._set_total_hP_jit(h_target, P)
+        b0 = jnp.asarray(composition)
+        T_R, T_si, n, pi = self._set_total_hP_jit(
+            h_target, P, b0, self._cached_n, self._cached_pi)
+        self._cached_T_si = T_si
+        self._cached_n = n
+        self._cached_pi = pi
+        return T_R
 
-    def set_static_MN(self, Tt, Pt, MN, W, FAR=None):
+    def set_static_MN(self, Tt, Pt, MN, W, composition):
         """
         Compute static properties from total conditions and Mach number.
 
-        Uses a combined Newton solver for (Ts, Ps, n, pi) simultaneously.
+        Uses isentropic relations + sequential equilibrium solve.
 
         Parameters
         ----------
@@ -980,20 +1029,26 @@ class JaxCEAThermo:
             Mach number
         W : float
             Mass flow rate (English units: lbm/s)
-        FAR : ignored
+        composition : array-like
+            Elemental molar concentrations (b0 array), shape (num_element,)
 
         Returns
         -------
         StaticPropsWithDeriv
             Named tuple with static properties plus darea/dMN
         """
-        return self._set_static_MN_jit(Tt, Pt, MN, W)
+        b0 = jnp.asarray(composition)
+        result, n, pi = self._set_static_MN_jit(
+            Tt, Pt, MN, W, b0, self._cached_n, self._cached_pi)
+        self._cached_n = n
+        self._cached_pi = pi
+        return result
 
-    def set_static_area(self, Tt, Pt, area, W, FAR=None):
+    def set_static_area(self, Tt, Pt, area, W, composition):
         """
         Compute static properties from total conditions and flow area.
 
-        Uses a combined Newton solver for (Ts, Ps, MN, n, pi) simultaneously.
+        Uses 1D Newton on MN with isentropic relations.
 
         Parameters
         ----------
@@ -1005,11 +1060,18 @@ class JaxCEAThermo:
             Flow area (English units: inch^2)
         W : float
             Mass flow rate (English units: lbm/s)
-        FAR : ignored
+        composition : array-like
+            Elemental molar concentrations (b0 array), shape (num_element,)
 
         Returns
         -------
         StaticProps
             Named tuple with static properties
         """
-        return self._set_static_area_jit(Tt, Pt, area, W)
+        b0 = jnp.asarray(composition)
+        result, MN, n, pi = self._set_static_area_jit(
+            Tt, Pt, area, W, b0, self._cached_MN, self._cached_n, self._cached_pi)
+        self._cached_MN = MN
+        self._cached_n = n
+        self._cached_pi = pi
+        return result
