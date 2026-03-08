@@ -33,13 +33,15 @@ class HBTF(pyc.Cycle):
             FUEL_TYPE = 'Jet-A(g)'
 
 
+        # DUCT_CLASS=pyc.NewDuct
+        DUCT_CLASS=pyc.Duct
+        INLET_CLASS=pyc.NewInlet
+        # INLET_CLASS=pyc.Inlet
+
+
         #Add subsystems to build the engine deck:
         self.add_subsystem('fc', pyc.FlightConditions())
-        self.add_subsystem('inlet', pyc.Inlet())
-
-
-        duct_class=pyc.NewDuct
-        # duct_class=pyc.Duct
+        self.add_subsystem('inlet', INLET_CLASS())
 
         # Note variable promotion for the fan --
         # the LP spool speed and the fan speed are INPUTS that are promoted:
@@ -48,24 +50,24 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('fan', pyc.Compressor(map_data=pyc.FanMap,
                                         bleed_names=[], map_extrap=True), promotes_inputs=[('Nmech','LP_Nmech')])
         self.add_subsystem('splitter', pyc.Splitter())
-        self.add_subsystem('duct4', duct_class())
+        self.add_subsystem('duct4', DUCT_CLASS())
         self.add_subsystem('lpc', pyc.Compressor(map_data=pyc.LPCMap,
                                         map_extrap=True),promotes_inputs=[('Nmech','LP_Nmech')])
-        self.add_subsystem('duct6', duct_class())
+        self.add_subsystem('duct6', DUCT_CLASS())
         self.add_subsystem('hpc', pyc.Compressor(map_data=pyc.HPCMap,
                                         bleed_names=['cool1','cool2','cust'], map_extrap=True),promotes_inputs=[('Nmech','HP_Nmech')])
         self.add_subsystem('bld3', pyc.BleedOut(bleed_names=['cool3','cool4']))
         self.add_subsystem('burner', pyc.Combustor(fuel_type=FUEL_TYPE))
         self.add_subsystem('hpt', pyc.Turbine(map_data=pyc.HPTMap,
                                         bleed_names=['cool3','cool4'], map_extrap=True),promotes_inputs=[('Nmech','HP_Nmech')])
-        self.add_subsystem('duct11', duct_class())
+        self.add_subsystem('duct11', DUCT_CLASS())
         self.add_subsystem('lpt', pyc.Turbine(map_data=pyc.LPTMap,
                                         bleed_names=['cool1','cool2'], map_extrap=True),promotes_inputs=[('Nmech','LP_Nmech')])
-        self.add_subsystem('duct13', duct_class())
+        self.add_subsystem('duct13', DUCT_CLASS())
         self.add_subsystem('core_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 
         self.add_subsystem('byp_bld', pyc.BleedOut(bleed_names=['bypBld']))
-        self.add_subsystem('duct15', duct_class())
+        self.add_subsystem('duct15', DUCT_CLASS())
         self.add_subsystem('byp_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 
         #Create shaft instances. Note that LP shaft has 3 ports! => no gearbox

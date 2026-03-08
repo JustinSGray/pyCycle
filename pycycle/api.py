@@ -9,7 +9,6 @@ from pycycle.elements.flow_start import FlowStart
 from pycycle.elements.cfd_start import CFDStart
 from pycycle.elements.inlet import Inlet, MilSpecRecovery
 from pycycle.elements.duct import Duct
-from pycycle.new_elements.duct import NewDuct
 from pycycle.elements.compressor import Compressor
 from pycycle.elements.combustor import Combustor
 from pycycle.elements.turbine import Turbine
@@ -23,6 +22,8 @@ from pycycle.elements.bleed_out import BleedOut
 from pycycle.elements.cooling import TurbineCooling, CombineCooling
 from pycycle.elements.gearbox import Gearbox
 
+from pycycle.new_elements.duct import NewDuct
+from pycycle.new_elements.inlet import NewInlet
 
 from pycycle.maps.axi5 import AXI5
 from pycycle.maps.axi3_2 import AXI3_2
