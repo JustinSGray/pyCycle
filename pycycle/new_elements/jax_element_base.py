@@ -45,12 +45,13 @@ def get_timing_stats():
 
 
 def clear_jit_cache():
-    """Clear the class-level JIT function cache.
+    """Clear all class-level JIT function caches.
 
-    This forces recompilation on the next compute_partials call.
+    This forces recompilation on the next compute/compute_partials call.
     Useful for testing or when thermo objects have changed.
     """
     JaxElement._jit_jvp_cache.clear()
+    JaxElement._jit_compute_cache.clear()
 
 def print_timing_stats():
     """Print detailed JaxElement timing statistics."""
@@ -168,6 +169,11 @@ class JaxElement(om.ExplicitComponent):
     # Key: configuration tuple from _get_jit_config_key()
     # Value: JIT-compiled jvp_wrapper function
     _jit_jvp_cache = {}
+
+    # Class-level cache for JIT-compiled compute_physics functions
+    # Key: configuration tuple from _get_jit_config_key()
+    # Value: (jit_fn, thermo_type) where thermo_type is 'CEA' or other
+    _jit_compute_cache = {}
 
     def initialize(self):
 
@@ -624,8 +630,40 @@ class JaxElement(om.ExplicitComponent):
 
         return tuple(key_parts)
 
+    def _make_jit_compute_wrapper(self):
+        """
+        Create a JIT-compiled wrapper around compute_physics.
+
+        For CEA thermo, threads warm-start caches through the JIT boundary
+        as explicit function arguments. For other thermos (e.g. TABULAR),
+        just JIT-compiles compute_physics directly.
+
+        Returns
+        -------
+        tuple
+            (jit_fn, thermo_type) where thermo_type indicates the calling convention.
+        """
+        from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
+
+        thermo = self.jax_thermo
+        compute_physics = self.compute_physics
+
+        if isinstance(thermo, JaxCEAThermo):
+            def wrapper(input_vec, cached_n, cached_pi, cached_MN):
+                # Pre-load caches as traced values
+                thermo._cached_n = cached_n
+                thermo._cached_pi = cached_pi
+                thermo._cached_MN = cached_MN
+                output_vec = compute_physics(input_vec)
+                # Return updated caches
+                return output_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN
+
+            return jax.jit(wrapper), 'CEA'
+        else:
+            return jax.jit(compute_physics), 'OTHER'
+
     def compute(self, inputs, outputs):
-        """Pack inputs, call compute_physics, unpack outputs."""
+        """Pack inputs, call JIT-compiled compute_physics, unpack outputs."""
         # Handle dynamic sizes on first call
         if self._needs_runtime_rebuild:
             resolved_inputs, resolved_outputs = self._resolve_dynamic_sizes(inputs)
@@ -646,9 +684,24 @@ class JaxElement(om.ExplicitComponent):
 
         input_vec = jnp.array(input_vec)
 
-        # Call pure computation with timing
+        # Get or create JIT-compiled compute function
+        config_key = self._get_jit_config_key()
+        if config_key not in JaxElement._jit_compute_cache:
+            JaxElement._jit_compute_cache[config_key] = self._make_jit_compute_wrapper()
+
+        jit_fn, thermo_type = JaxElement._jit_compute_cache[config_key]
+
+        # Call JIT-compiled computation with timing
         t_start = time.perf_counter()
-        output_vec = self.compute_physics(input_vec)
+        if thermo_type == 'CEA':
+            thermo = self.jax_thermo
+            output_vec, new_n, new_pi, new_MN = jit_fn(
+                input_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN)
+            thermo._cached_n = new_n
+            thermo._cached_pi = new_pi
+            thermo._cached_MN = new_MN
+        else:
+            output_vec = jit_fn(input_vec)
         _jax_element_timing_stats['compute_calls'] += 1
         _jax_element_timing_stats['compute_time'] += (time.perf_counter() - t_start)
 

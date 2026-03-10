@@ -35,8 +35,8 @@ class HBTF(pyc.Cycle):
 
         # DUCT_CLASS=pyc.NewDuct
         DUCT_CLASS=pyc.Duct
-        INLET_CLASS=pyc.NewInlet
-        # INLET_CLASS=pyc.Inlet
+        # INLET_CLASS=pyc.NewInlet
+        INLET_CLASS=pyc.Inlet
 
 
         #Add subsystems to build the engine deck:
