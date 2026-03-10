@@ -57,29 +57,6 @@ class NewInlet(JaxElement):
 
         self.add_output('F_ram', val=1.0, units='lbf', desc='Ram drag')
 
-        # --- Register primal inputs ---
-        self.add_primal_input('Fl_I:tot:P')
-        self.add_primal_input('Fl_I:tot:T')
-        self.add_primal_input('Fl_I:stat:W')
-        self.add_primal_input('Fl_I:stat:V')
-        self.add_primal_input('Fl_I:tot:composition', size='dynamic')
-        self.add_primal_input('ram_recovery')
-
-        if statics:
-            if design:
-                self.add_primal_input('MN')
-            else:
-                self.add_primal_input('area')
-
-        # --- Register primal outputs ---
-        self.add_flow_total_primal_outputs('Fl_O')
-
-        if statics:
-            self.add_flow_static_primal_outputs('Fl_O')
-
-        self.add_primal_output('Fl_O:stat:W')
-        self.add_primal_output('F_ram')
-
         # Build index mappings and declare partials
         self.setup_partials()
 

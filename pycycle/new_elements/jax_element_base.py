@@ -330,25 +330,32 @@ class JaxElement(om.ExplicitComponent):
 
     def add_input(self, name, **kwargs):
         """
-        Override to track input creation order.
+        Override to track input creation order and auto-register as primal.
 
-        The order of add_input calls determines the order of primal inputs
-        in the compute_physics input vector.
+        All inputs are automatically registered as primal (included in the
+        compute_physics input vector) unless primal=False is passed.
+        Inputs with shape_by_conn=True are registered with size='dynamic'.
         """
+        primal = kwargs.pop('primal', True)
+        shape_by_conn = kwargs.get('shape_by_conn', False)
         super().add_input(name, **kwargs)
-        # Track creation order (size will be set by add_primal_input if needed)
         self._input_order.append(name)
+        if primal:
+            size = 'dynamic' if shape_by_conn else None
+            self._primal_input_set[name] = size
 
     def add_output(self, name, **kwargs):
         """
-        Override to track output creation order.
+        Override to track output creation order and auto-register as primal.
 
-        The order of add_output calls determines the order of primal outputs
-        in the compute_physics output vector.
+        All outputs are automatically registered as primal (included in the
+        compute_physics output vector) unless primal=False is passed.
         """
+        primal = kwargs.pop('primal', True)
         super().add_output(name, **kwargs)
-        # Track creation order (size will be set by add_primal_output if needed)
         self._output_order.append(name)
+        if primal:
+            self._primal_output_set[name] = None
 
     # =========================================================================
     # Primal Input/Output Registration
@@ -875,8 +882,9 @@ class JaxElement(om.ExplicitComponent):
             if prop == 'P':
                 kwargs['lower'] = 1e-4
             self.add_output(f'{fl_name}:tot:{prop}', **kwargs)
+        # Composition is a passthrough, not computed by JAX
         self.add_output(f'{fl_name}:tot:composition', shape_by_conn=True,
-                        copy_shape=f'{fl_src}:tot:composition')
+                        copy_shape=f'{fl_src}:tot:composition', primal=False)
 
         # Static properties
         if statics:
@@ -885,7 +893,8 @@ class JaxElement(om.ExplicitComponent):
 
         # Always output mass flow and FAR
         self.add_output(f'{fl_name}:stat:W', val=1.0, units='lbm/s')
-        self.add_output(f'{fl_name}:FAR', val=0.0)
+        # FAR is a passthrough, not computed by JAX
+        self.add_output(f'{fl_name}:FAR', val=0.0, primal=False)
 
         # Track passthrough variables for compute() (not part of JAX computation)
         if not hasattr(self, '_passthrough_vars'):

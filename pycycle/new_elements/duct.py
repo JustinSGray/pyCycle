@@ -80,44 +80,6 @@ class NewDuct(JaxElement):
                 self.add_output('dPqP', val=0.0,
                                 desc='Pressure differential as fraction of inlet pressure')
 
-        # --- Register primal inputs (order defines input vector layout) ---
-        self.add_primal_input('Fl_I:tot:P')
-        self.add_primal_input('Fl_I:tot:h')
-        self.add_primal_input('Fl_I:stat:W')
-        self.add_primal_input('Fl_I:stat:MN')
-        self.add_primal_input('Fl_I:tot:composition', size='dynamic')  # shape_by_conn
-        self.add_primal_input('Q_dot')
-
-        if expMN > _EXPMN_THRESHOLD:
-            if design:
-                self.add_primal_input('dPqP')
-            else:
-                self.add_primal_input('s_dPqP')
-        else:
-            self.add_primal_input('dPqP')
-
-        if statics:
-            if design:
-                self.add_primal_input('MN')
-            else:
-                self.add_primal_input('area')
-
-        # --- Register primal outputs (order must match add_output order) ---
-        # add_flow_output order: total props, static props (if statics), W, FAR
-        # Then we add s_dPqP/dPqP after add_flow_output
-        self.add_flow_total_primal_outputs('Fl_O')
-
-        if statics:
-            self.add_flow_static_primal_outputs('Fl_O')
-
-        self.add_primal_output('Fl_O:stat:W')
-
-        if expMN > _EXPMN_THRESHOLD:
-            if design:
-                self.add_primal_output('s_dPqP')
-            else:
-                self.add_primal_output('dPqP')
-
         # Build index mappings and declare partials
         self.setup_partials()
 

@@ -33,10 +33,10 @@ class HBTF(pyc.Cycle):
             FUEL_TYPE = 'Jet-A(g)'
 
 
-        # DUCT_CLASS=pyc.NewDuct
-        DUCT_CLASS=pyc.Duct
-        # INLET_CLASS=pyc.NewInlet
-        INLET_CLASS=pyc.Inlet
+        DUCT_CLASS=pyc.NewDuct
+        # DUCT_CLASS=pyc.Duct
+        INLET_CLASS=pyc.NewInlet
+        # INLET_CLASS=pyc.Inlet
 
 
         #Add subsystems to build the engine deck:
