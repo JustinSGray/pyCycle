@@ -328,6 +328,29 @@ class JaxElement(om.ExplicitComponent):
     # OpenMDAO add_input/add_output overrides to track creation order
     # =========================================================================
 
+    @staticmethod
+    def _infer_size(kwargs):
+        """
+        Infer the primal size for an input/output from its kwargs.
+
+        Returns
+        -------
+        size : None, int, or 'dynamic'
+            None for scalars, int for fixed-size arrays, 'dynamic' for shape_by_conn.
+        """
+        if kwargs.get('shape_by_conn', False):
+            return 'dynamic'
+        # Check explicit shape kwarg
+        shape = kwargs.get('shape', None)
+        if shape is not None:
+            total = int(np.prod(shape))
+            return total if total > 1 else None
+        # Check val kwarg
+        val = kwargs.get('val', None)
+        if val is not None and np.ndim(val) > 0 and np.size(val) > 1:
+            return int(np.size(val))
+        return None
+
     def add_input(self, name, **kwargs):
         """
         Override to track input creation order and auto-register as primal.
@@ -335,13 +358,14 @@ class JaxElement(om.ExplicitComponent):
         All inputs are automatically registered as primal (included in the
         compute_physics input vector) unless primal=False is passed.
         Inputs with shape_by_conn=True are registered with size='dynamic'.
+        Array inputs (val with ndim>0 or explicit shape) are registered with
+        their size.
         """
         primal = kwargs.pop('primal', True)
-        shape_by_conn = kwargs.get('shape_by_conn', False)
+        size = self._infer_size(kwargs)
         super().add_input(name, **kwargs)
         self._input_order.append(name)
         if primal:
-            size = 'dynamic' if shape_by_conn else None
             self._primal_input_set[name] = size
 
     def add_output(self, name, **kwargs):
@@ -350,12 +374,15 @@ class JaxElement(om.ExplicitComponent):
 
         All outputs are automatically registered as primal (included in the
         compute_physics output vector) unless primal=False is passed.
+        Array outputs (val with ndim>0 or explicit shape) are registered with
+        their size.
         """
         primal = kwargs.pop('primal', True)
+        size = self._infer_size(kwargs)
         super().add_output(name, **kwargs)
         self._output_order.append(name)
         if primal:
-            self._primal_output_set[name] = None
+            self._primal_output_set[name] = size
 
     # =========================================================================
     # Primal Input/Output Registration
@@ -642,32 +669,38 @@ class JaxElement(om.ExplicitComponent):
         Create a JIT-compiled wrapper around compute_physics.
 
         For CEA thermo, threads warm-start caches through the JIT boundary
-        as explicit function arguments. For other thermos (e.g. TABULAR),
-        just JIT-compiles compute_physics directly.
+        as explicit function arguments. For other thermos (e.g. TABULAR)
+        or elements without thermo, just JIT-compiles compute_physics directly.
 
         Returns
         -------
         tuple
             (jit_fn, thermo_type) where thermo_type indicates the calling convention.
         """
-        from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
-
-        thermo = self.jax_thermo
         compute_physics = self.compute_physics
 
-        if isinstance(thermo, JaxCEAThermo):
-            def wrapper(input_vec, cached_n, cached_pi, cached_MN):
-                # Pre-load caches as traced values
-                thermo._cached_n = cached_n
-                thermo._cached_pi = cached_pi
-                thermo._cached_MN = cached_MN
-                output_vec = compute_physics(input_vec)
-                # Return updated caches
-                return output_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN
-
-            return jax.jit(wrapper), 'CEA'
+        # Ensure thermo is initialized before JIT tracing starts.
+        # If thermo_data is None, the element doesn't use thermo.
+        if self.options['thermo_data'] is not None:
+            thermo = self.jax_thermo  # Trigger lazy init outside JIT scope
         else:
-            return jax.jit(compute_physics), 'OTHER'
+            thermo = self._jax_thermo  # May be None for non-thermo elements
+
+        if thermo is not None:
+            from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
+            if isinstance(thermo, JaxCEAThermo):
+                def wrapper(input_vec, cached_n, cached_pi, cached_MN):
+                    # Pre-load caches as traced values
+                    thermo._cached_n = cached_n
+                    thermo._cached_pi = cached_pi
+                    thermo._cached_MN = cached_MN
+                    output_vec = compute_physics(input_vec)
+                    # Return updated caches
+                    return output_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN
+
+                return jax.jit(wrapper), 'CEA'
+
+        return jax.jit(compute_physics), 'OTHER'
 
     def compute(self, inputs, outputs):
         """Pack inputs, call JIT-compiled compute_physics, unpack outputs."""
@@ -682,7 +715,9 @@ class JaxElement(om.ExplicitComponent):
         primal_outputs = self._runtime_primal_outputs or self._primal_outputs
 
         # Pack OpenMDAO inputs into flat vector
-        input_vec = np.zeros(self._n_primal_inputs)
+        # Use dtype from inputs to support complex step derivatives
+        sample_name = primal_inputs[0][0]
+        input_vec = np.zeros(self._n_primal_inputs, dtype=inputs[sample_name].dtype)
         for om_name, size in primal_inputs:
             if om_name in self._input_slices:
                 input_vec[self._input_slices[om_name]] = inputs[om_name]
@@ -863,7 +898,8 @@ class JaxElement(om.ExplicitComponent):
         self.add_input(f'{fl_name}:stat:W', val=1.0, units='lbm/s')
         self.add_input(f'{fl_name}:FAR', val=0.0)
 
-    def add_flow_output(self, fl_name='Fl_O', statics=True, fl_src='Fl_I'):
+    def add_flow_output(self, fl_name='Fl_O', statics=True, fl_src='Fl_I',
+                        passthrough_composition=True, passthrough_FAR=True):
         """
         Add a complete set of flow output variables for a flow port.
 
@@ -875,16 +911,33 @@ class JaxElement(om.ExplicitComponent):
             If True, include static property outputs.
         fl_src : str
             Source flow port for composition passthrough (e.g., 'Fl_I')
+        passthrough_composition : bool
+            If True (default), composition is passed through from fl_src input
+            to fl_name output outside of JAX. If False, composition is treated
+            as a primal output that must be computed by compute_physics.
+        passthrough_FAR : bool
+            If True (default), FAR is passed through from fl_src input to
+            fl_name output outside of JAX. If False, FAR is treated as a
+            primal output that must be computed by compute_physics.
         """
+        if not hasattr(self, '_passthrough_vars'):
+            self._passthrough_vars = []
+
         # Total properties
         for prop, val, units in _TOTAL_PROPS:
             kwargs = {'val': val, 'units': units}
             if prop == 'P':
                 kwargs['lower'] = 1e-4
             self.add_output(f'{fl_name}:tot:{prop}', **kwargs)
-        # Composition is a passthrough, not computed by JAX
-        self.add_output(f'{fl_name}:tot:composition', shape_by_conn=True,
-                        copy_shape=f'{fl_src}:tot:composition', primal=False)
+
+        if passthrough_composition:
+            self.add_output(f'{fl_name}:tot:composition', shape_by_conn=True,
+                            copy_shape=f'{fl_src}:tot:composition', primal=False)
+            self._passthrough_vars.append(
+                (f'{fl_src}:tot:composition', f'{fl_name}:tot:composition'))
+        else:
+            self.add_output(f'{fl_name}:tot:composition', shape_by_conn=True,
+                            copy_shape=f'{fl_src}:tot:composition')
 
         # Static properties
         if statics:
@@ -893,11 +946,10 @@ class JaxElement(om.ExplicitComponent):
 
         # Always output mass flow and FAR
         self.add_output(f'{fl_name}:stat:W', val=1.0, units='lbm/s')
-        # FAR is a passthrough, not computed by JAX
-        self.add_output(f'{fl_name}:FAR', val=0.0, primal=False)
 
-        # Track passthrough variables for compute() (not part of JAX computation)
-        if not hasattr(self, '_passthrough_vars'):
-            self._passthrough_vars = []
-        self._passthrough_vars.append((f'{fl_src}:tot:composition', f'{fl_name}:tot:composition'))
-        self._passthrough_vars.append((f'{fl_src}:FAR', f'{fl_name}:FAR'))
+        if passthrough_FAR:
+            self.add_output(f'{fl_name}:FAR', val=0.0, primal=False)
+            self._passthrough_vars.append(
+                (f'{fl_src}:FAR', f'{fl_name}:FAR'))
+        else:
+            self.add_output(f'{fl_name}:FAR', val=0.0)
