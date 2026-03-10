@@ -25,6 +25,7 @@ from pycycle.elements.gearbox import Gearbox
 from pycycle.new_elements.duct import NewDuct
 from pycycle.new_elements.inlet import NewInlet
 from pycycle.new_elements.shaft import NewShaft
+from pycycle.new_elements.performance import NewPerformance
 
 from pycycle.maps.axi5 import AXI5
 from pycycle.maps.axi3_2 import AXI3_2
