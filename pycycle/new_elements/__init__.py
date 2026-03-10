@@ -7,3 +7,4 @@ from pycycle.new_elements.jax_element_base import (
 )
 from pycycle.new_elements.duct import NewDuct
 from pycycle.new_elements.inlet import NewInlet
+from pycycle.new_elements.shaft import NewShaft

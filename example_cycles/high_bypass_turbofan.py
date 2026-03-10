@@ -37,6 +37,7 @@ class HBTF(pyc.Cycle):
         # DUCT_CLASS=pyc.Duct
         INLET_CLASS=pyc.NewInlet
         # INLET_CLASS=pyc.Inlet
+        SHAFT_CLASS=pyc.NewShaft
 
 
         #Add subsystems to build the engine deck:
@@ -71,8 +72,8 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('byp_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 
         #Create shaft instances. Note that LP shaft has 3 ports! => no gearbox
-        self.add_subsystem('lp_shaft', pyc.Shaft(num_ports=3),promotes_inputs=[('Nmech','LP_Nmech')])
-        self.add_subsystem('hp_shaft', pyc.Shaft(num_ports=2),promotes_inputs=[('Nmech','HP_Nmech')])
+        self.add_subsystem('lp_shaft', SHAFT_CLASS(num_ports=3),promotes_inputs=[('Nmech','LP_Nmech')])
+        self.add_subsystem('hp_shaft', SHAFT_CLASS(num_ports=2),promotes_inputs=[('Nmech','HP_Nmech')])
         self.add_subsystem('perf', pyc.Performance(num_nozzles=2, num_burners=1))
 
         # Now use the explicit connect method to make connections -- connect(<from>, <to>)

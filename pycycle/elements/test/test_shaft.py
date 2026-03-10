@@ -8,7 +8,7 @@ from openmdao.utils.assert_utils import assert_near_equal, assert_check_partials
 from pycycle.elements.shaft import Shaft
 
 fpath = os.path.dirname(os.path.realpath(__file__))
-ref_data = np.loadtxt(fpath + "/reg_data/shaft.csv",
+ref_data = np.loadtxt(os.path.join(fpath, '..', '..', 'test_data', 'shaft.csv'),
                       delimiter=",", skiprows=1)
 
 header = [
