@@ -276,8 +276,10 @@ class JaxElement(om.ExplicitComponent):
 
         elif thermo_method == 'CEA':
             composition = self._get_cea_composition()
-            # b0 values are now runtime, so cache key only needs structure info
-            key = (thermo_method, id(thermo_data))
+            # Include the element set in the cache key so that elements with
+            # different species sets (e.g., air vs air+fuel) get separate thermos.
+            comp_key = tuple(sorted(composition.keys()))
+            key = (thermo_method, id(thermo_data), comp_key)
             if key not in JaxElement._shared_thermos:
                 from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
                 JaxElement._shared_thermos[key] = JaxCEAThermo(
