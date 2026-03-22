@@ -301,9 +301,13 @@ class JaxTabularThermo:
                 return (T_si_new, residual, i + 1)
 
             # Initialize state: (T_si, residual, iteration)
+            # Promote all carry components to a common dtype for complex-step
             h_init, _ = h_and_deriv(T_si_init)
             residual_init = h_init - h_target_si
-            init_state = (T_si_init, residual_init, 0)
+            target_dtype = jnp.result_type(T_si_init, residual_init)
+            init_state = (jnp.asarray(T_si_init, dtype=target_dtype),
+                          jnp.asarray(residual_init, dtype=target_dtype),
+                          jnp.asarray(0, dtype=target_dtype))
 
             # Run Newton iteration
             final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)
@@ -341,9 +345,13 @@ class JaxTabularThermo:
                 return (T_si_new, residual, i + 1)
 
             # Initialize state: (T_si, residual, iteration)
+            # Promote all carry components to a common dtype for complex-step
             S_init, _ = S_and_deriv(T_si_init)
             residual_init = S_init - S_target_si
-            init_state = (T_si_init, residual_init, 0)
+            target_dtype = jnp.result_type(T_si_init, residual_init)
+            init_state = (jnp.asarray(T_si_init, dtype=target_dtype),
+                          jnp.asarray(residual_init, dtype=target_dtype),
+                          jnp.asarray(0, dtype=target_dtype))
 
             # Run Newton iteration
             final_state = jax.lax.while_loop(cond_fn, body_fn, init_state)

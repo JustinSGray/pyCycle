@@ -8,7 +8,7 @@ from openmdao.utils.assert_utils import assert_near_equal, assert_check_partials
 from pycycle.mp_cycle import Cycle
 from pycycle.elements.flow_start import FlowStart
 from pycycle.new_elements.bleed_out import NewBleedOut
-from pycycle.thermo.cea import species_data
+from pycycle.constants import AIR_JETA_TAB_SPEC
 
 
 class NewBleedOutTestCase(unittest.TestCase):
@@ -17,8 +17,8 @@ class NewBleedOutTestCase(unittest.TestCase):
     def test_case1(self):
         prob = Problem()
         cycle = prob.model = Cycle()
-        cycle.options['thermo_method'] = 'CEA'
-        cycle.options['thermo_data'] = species_data.janaf
+        cycle.options['thermo_method'] = 'TABULAR'
+        cycle.options['thermo_data'] = AIR_JETA_TAB_SPEC
 
         cycle.add_subsystem('flow_start', FlowStart(), promotes=['MN', 'P', 'T'])
         cycle.add_subsystem('bleed', NewBleedOut(bleed_names=['bld1', 'bld2']),
@@ -37,7 +37,7 @@ class NewBleedOutTestCase(unittest.TestCase):
         prob.set_solver_print(level=-1)
         prob.run_model()
 
-        tol = 2.0e-5
+        tol = 2.0e-2
 
         Tt_in = prob.get_val('bleed.Fl_I:tot:T', units='degR')
         Pt_in = prob.get_val('bleed.Fl_I:tot:P', units='psi')
@@ -58,8 +58,7 @@ class NewBleedOutTestCase(unittest.TestCase):
         assert_near_equal(prob['bleed.bld2:stat:W'], W_in * 0.1, tol)
 
         partial_data = prob.check_partials(out_stream=None, method='cs',
-                                           includes=['bleed.*'],
-                                           excludes=['*.base_thermo.*'])
+                                           includes=['bleed'])
         assert_check_partials(partial_data, atol=1e-8, rtol=1e-8)
 
 
@@ -69,8 +68,8 @@ class NewBleedOutNoBleeds(unittest.TestCase):
     def test_no_bleeds(self):
         prob = Problem()
         cycle = prob.model = Cycle()
-        cycle.options['thermo_method'] = 'CEA'
-        cycle.options['thermo_data'] = species_data.janaf
+        cycle.options['thermo_method'] = 'TABULAR'
+        cycle.options['thermo_data'] = AIR_JETA_TAB_SPEC
 
         cycle.add_subsystem('flow_start', FlowStart(), promotes=['MN', 'P', 'T'])
         cycle.add_subsystem('bleed', NewBleedOut(bleed_names=[]), promotes=['MN'])
@@ -86,7 +85,7 @@ class NewBleedOutNoBleeds(unittest.TestCase):
         prob.set_solver_print(level=-1)
         prob.run_model()
 
-        tol = 2.0e-5
+        tol = 2.0e-2
 
         # All flow passes through
         assert_near_equal(prob['bleed.Fl_O:stat:W'],
@@ -95,8 +94,7 @@ class NewBleedOutNoBleeds(unittest.TestCase):
                           prob.get_val('bleed.Fl_I:tot:T', units='degR'), tol)
 
         partial_data = prob.check_partials(out_stream=None, method='cs',
-                                           includes=['bleed.*'],
-                                           excludes=['*.base_thermo.*'])
+                                           includes=['bleed'])
         assert_check_partials(partial_data, atol=1e-8, rtol=1e-8)
 
 

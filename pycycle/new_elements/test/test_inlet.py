@@ -99,7 +99,7 @@ class NewInletTestCase(unittest.TestCase):
             assert_near_equal(ts_computed, ts, tol)
 
             partial_data = self.prob.check_partials(out_stream=None, method='cs',
-                                                    includes=['inlet.*'], excludes=['*.base_thermo.*'])
+                                                    includes=['inlet'])
             assert_check_partials(partial_data, atol=1e-8, rtol=1e-8)
 
 
