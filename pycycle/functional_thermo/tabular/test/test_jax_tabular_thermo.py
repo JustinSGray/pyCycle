@@ -144,5 +144,151 @@ class TestSetTotalEquivalence(unittest.TestCase):
         self._check_equivalence(1500.0, 80.0)
 
 
+class TestDerivatives_CS(unittest.TestCase):
+    """Verify JAX jacfwd derivatives match complex-step for all tabular thermo methods."""
+
+    CS_STEP = 1e-20
+
+    def setUp(self):
+        self.thermo = JaxTabularThermo(AIR_JETA_TAB_SPEC)
+        self.comp = _COMP_ZERO
+
+    def _check_derivs(self, fn, x0, labels, atol=1e-8, rtol=1e-8):
+        """Compare jacfwd vs complex-step for a scalar-input, vector-output function."""
+        import jax
+        import jax.numpy as jnp
+
+        jac_ad = np.asarray(jax.jacfwd(fn)(x0))
+        out_cs = fn(x0 + self.CS_STEP * 1j)
+        jac_cs = np.imag(np.asarray(out_cs)) / self.CS_STEP
+
+        for i, label in enumerate(labels):
+            with self.subTest(output=label):
+                np.testing.assert_allclose(
+                    jac_ad[i], jac_cs[i], atol=atol, rtol=rtol,
+                    err_msg=f"Derivative mismatch for {label}")
+
+    # ----- set_total_TP -----
+
+    def test_total_TP_wrt_T(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696
+        labels = ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']
+
+        def fn(T_in):
+            p = self.thermo.set_total_TP(T_in, P, self.comp)
+            return jnp.array([p.h, p.S, p.gamma, p.Cp, p.Cv, p.rho, p.R])
+
+        self._check_derivs(fn, T, labels)
+
+    def test_total_TP_wrt_P(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696
+        labels = ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R']
+
+        def fn(P_in):
+            p = self.thermo.set_total_TP(T, P_in, self.comp)
+            return jnp.array([p.h, p.S, p.gamma, p.Cp, p.Cv, p.rho, p.R])
+
+        self._check_derivs(fn, P, labels)
+
+    # ----- set_total_hP -----
+
+    def test_total_hP_wrt_h(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696
+        props = self.thermo.set_total_TP(T, P, self.comp)
+        h = float(props.h)
+
+        def fn(h_in):
+            return jnp.array([self.thermo.set_total_hP(h_in, P, self.comp)])
+
+        self._check_derivs(fn, h, ['T_from_hP'])
+
+    def test_total_hP_wrt_P(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696
+        props = self.thermo.set_total_TP(T, P, self.comp)
+        h = float(props.h)
+
+        def fn(P_in):
+            return jnp.array([self.thermo.set_total_hP(h, P_in, self.comp)])
+
+        self._check_derivs(fn, P, ['T_from_hP'])
+
+    # ----- set_static_MN -----
+
+    def test_static_MN_wrt_MN(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696; MN = 0.5; W = 100.0
+        labels = ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                  'gamma', 'Cp', 'Cv', 'S', 'R']
+
+        def fn(MN_in):
+            r = self.thermo.set_static_MN(T, P, MN_in, W, self.comp)
+            return jnp.array([r.Ts, r.Ps, r.hs, r.rhos, r.MN, r.V, r.Vsonic,
+                              r.area, r.gamma, r.Cp, r.Cv, r.S, r.R])
+
+        self._check_derivs(fn, MN, labels)
+
+    def test_static_MN_wrt_T(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696; MN = 0.5; W = 100.0
+        labels = ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                  'gamma', 'Cp', 'Cv', 'S', 'R']
+
+        def fn(T_in):
+            r = self.thermo.set_static_MN(T_in, P, MN, W, self.comp)
+            return jnp.array([r.Ts, r.Ps, r.hs, r.rhos, r.MN, r.V, r.Vsonic,
+                              r.area, r.gamma, r.Cp, r.Cv, r.S, r.R])
+
+        self._check_derivs(fn, T, labels)
+
+    def test_static_MN_wrt_W(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696; MN = 0.5; W = 100.0
+        labels = ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                  'gamma', 'Cp', 'Cv', 'S', 'R']
+
+        def fn(W_in):
+            r = self.thermo.set_static_MN(T, P, MN, W_in, self.comp)
+            return jnp.array([r.Ts, r.Ps, r.hs, r.rhos, r.MN, r.V, r.Vsonic,
+                              r.area, r.gamma, r.Cp, r.Cv, r.S, r.R])
+
+        self._check_derivs(fn, W, labels)
+
+    # ----- set_static_area -----
+
+    def test_static_area_wrt_area(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696; MN = 0.5; W = 100.0
+        static_mn = self.thermo.set_static_MN(T, P, MN, W, self.comp)
+        area = float(static_mn.area)
+        labels = ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                  'gamma', 'Cp', 'Cv', 'S', 'R']
+
+        def fn(area_in):
+            r = self.thermo.set_static_area(T, P, area_in, W, self.comp)
+            return jnp.array([r.Ts, r.Ps, r.hs, r.rhos, r.MN, r.V, r.Vsonic,
+                              r.area, r.gamma, r.Cp, r.Cv, r.S, r.R])
+
+        self._check_derivs(fn, area, labels)
+
+    def test_static_area_wrt_T(self):
+        import jax.numpy as jnp
+        T = 1800.0; P = 14.696; MN = 0.5; W = 100.0
+        static_mn = self.thermo.set_static_MN(T, P, MN, W, self.comp)
+        area = float(static_mn.area)
+        labels = ['Ts', 'Ps', 'hs', 'rhos', 'MN', 'V', 'Vsonic', 'area',
+                  'gamma', 'Cp', 'Cv', 'S', 'R']
+
+        def fn(T_in):
+            r = self.thermo.set_static_area(T_in, P, area, W, self.comp)
+            return jnp.array([r.Ts, r.Ps, r.hs, r.rhos, r.MN, r.V, r.Vsonic,
+                              r.area, r.gamma, r.Cp, r.Cv, r.S, r.R])
+
+        self._check_derivs(fn, T, labels)
+
+
 if __name__ == "__main__":
     unittest.main()

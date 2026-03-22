@@ -372,9 +372,6 @@ class JaxCEAThermo:
 
         def compute_equilibrium_jacobian(n, pi, n_moles, weights, remove_trace):
             """Compute Jacobian for the equilibrium Newton system."""
-            size = num_prod + num_element
-            J = jnp.zeros((size, size))
-
             MW = 1.0 / n_moles
 
             # dR_n/dn block: (1/n_j - 1/n_moles) on diagonal, -1/n_moles off-diagonal
@@ -391,10 +388,10 @@ class JaxCEAThermo:
             # dR_pi/dn block
             J_pin = aij
 
-            # Assemble
-            J = J.at[:num_prod, :num_prod].set(J_nn)
-            J = J.at[:num_prod, num_prod:].set(J_npi)
-            J = J.at[num_prod:, :num_prod].set(J_pin)
+            # Assemble using concatenate to preserve complex dtype
+            J_top = jnp.concatenate([J_nn, J_npi], axis=1)    # (num_prod, size)
+            J_bot = jnp.concatenate([J_pin, jnp.zeros((num_element, num_element), dtype=jnp.result_type(n))], axis=1)
+            J = jnp.concatenate([J_top, J_bot], axis=0)       # (size, size)
 
             # Handle trace species: zero row, set diagonal to -1
             # Only active when remove_trace is True (near convergence)
@@ -404,7 +401,7 @@ class JaxCEAThermo:
             J_top = jnp.where(row_mask, 0.0, J_top)
             trace_diag = jnp.where(trace_mask, -1.0, J_top[jnp.arange(num_prod), jnp.arange(num_prod)])
             J_top = J_top.at[jnp.arange(num_prod), jnp.arange(num_prod)].set(trace_diag)
-            J = J.at[:num_prod, :].set(J_top)
+            J = jnp.concatenate([J_top, J[num_prod:, :]], axis=0)
 
             return J
 
@@ -421,27 +418,26 @@ class JaxCEAThermo:
             Cp0 = _compute_Cp0(T_si, a)
 
             # Build the (ne+1 x ne+1) property matrix and RHS
+            # Use concatenate/stack instead of zeros+at.set to preserve complex dtype
+            # for complex-step derivatives.
             ne1 = num_element + 1
-            lhs_TP = jnp.zeros((ne1, ne1))
 
             # lhs_TP[i, :ne] = sum_j(aij_prod[i,k,j] * n_j) for each element pair
+            lhs_rows = []
             for i in range(num_element):
                 row = jnp.sum(aij_prod[i] * n[None, :], axis=1)  # (num_element,)
-                lhs_TP = lhs_TP.at[i, :num_element].set(row)
-
-            lhs_TP = lhs_TP.at[num_element, :num_element].set(b0)
-            lhs_TP = lhs_TP.at[:num_element, num_element].set(b0)
+                lhs_rows.append(jnp.append(row, b0[i]))
+            # Last row: [b0, 0]
+            lhs_rows.append(jnp.append(b0, 0.0))
+            lhs_TP = jnp.stack(lhs_rows)
 
             # RHS for temperature derivative
             n_H0 = n * H0
-            rhs_T = jnp.zeros(ne1)
-            rhs_T = rhs_T.at[:num_element].set(jnp.sum(aij * n_H0[None, :], axis=1))
-            rhs_T = rhs_T.at[num_element].set(jnp.sum(n_H0))
+            rhs_T = jnp.append(jnp.sum(aij * n_H0[None, :], axis=1),
+                                jnp.sum(n_H0))
 
             # RHS for pressure derivative
-            rhs_P = jnp.zeros(ne1)
-            rhs_P = rhs_P.at[:num_element].set(b0)
-            rhs_P = rhs_P.at[num_element].set(n_moles)
+            rhs_P = jnp.append(b0, n_moles)
 
             # Solve the linear systems
             result_T = jnp.linalg.solve(lhs_TP, rhs_T)
@@ -544,10 +540,18 @@ class JaxCEAThermo:
                                         jnp.array([resid_norm_new, iteration + 1])])
 
             def run_newton(init_n, init_pi):
+                # Compute a trial residual to determine the target dtype.
+                # The residual mixes all closure inputs (H0, S0, P_norm, b0),
+                # so its dtype reflects the correct promotion for complex-step.
                 n_moles = jnp.sum(init_n)
                 resids, _ = compute_equilibrium_residuals(init_n, init_pi, H0, S0, P_norm, n_moles, b0)
+                target_dtype = resids.dtype
+
+                init_n = jnp.asarray(init_n, dtype=target_dtype)
+                init_pi = jnp.asarray(init_pi, dtype=target_dtype)
                 resid_norm = jnp.linalg.norm(resids)
-                init = jnp.concatenate([init_n, init_pi, jnp.array([resid_norm, 0.0])])
+                init = jnp.concatenate([init_n, init_pi,
+                                        jnp.array([resid_norm, 0.0], dtype=target_dtype)])
                 final_state = jax.lax.while_loop(cond_fn, body_fn, init)
                 n = final_state[:num_prod]
                 pi = final_state[num_prod:size]
@@ -646,47 +650,40 @@ class JaxCEAThermo:
                 dS0_dT = _compute_dS0_dT(T_si, a)
                 n_moles = jnp.sum(n)
 
-                J = jnp.zeros((full_size, full_size))
-
-                # Row 0: dR_h/dT, dR_h/dn, dR_h/dpi
+                # Row 0: dR_h/dT, dR_h/dn, dR_h/dpi=0
                 dh_dT = (jnp.sum(n * dH0_dT) * T_si + jnp.sum(n * H0)) * R_UNIVERSAL_ENG * CAL_G_TO_J_KG
                 dh_dn = R_UNIVERSAL_ENG * T_si * H0 * CAL_G_TO_J_KG  # (num_prod,)
-                J = J.at[0, 0].set(dh_dT)
-                J = J.at[0, 1:1 + num_prod].set(dh_dn)
-                # dR_h/dpi = 0 (enthalpy doesn't depend on Lagrange multipliers)
+                row0 = jnp.concatenate([jnp.array([dh_dT]), dh_dn,
+                                        jnp.zeros(num_element, dtype=jnp.result_type(T_si, n))])
 
                 # Rows 1..num_prod: equilibrium species residuals
-                # dR_n/dT: (dH0_dT - dS0_dT) * weights
-                J_n_T = (dH0_dT - dS0_dT) * weights
-                J = J.at[1:1 + num_prod, 0].set(J_n_T)
-
-                # dR_n/dn block
+                J_n_T = (dH0_dT - dS0_dT) * weights   # (num_prod,) - dR_n/dT column
                 MW = 1.0 / n_moles
                 diag = 1.0 / n - MW
                 J_nn = jnp.full((num_prod, num_prod), -MW)
                 J_nn = J_nn.at[jnp.arange(num_prod), jnp.arange(num_prod)].set(diag)
                 J_nn = J_nn * weights[:, None]
-                J = J.at[1:1 + num_prod, 1:1 + num_prod].set(J_nn)
-
-                # dR_n/dpi block
                 J_npi = -aij_T * weights[:, None]
-                J = J.at[1:1 + num_prod, 1 + num_prod:].set(J_npi)
+                J_mid = jnp.concatenate([J_n_T[:, None], J_nn, J_npi], axis=1)  # (num_prod, full_size)
 
                 # Rows num_prod+1..end: mass conservation
-                J = J.at[1 + num_prod:, 1:1 + num_prod].set(aij)
+                J_bot = jnp.concatenate([
+                    jnp.zeros((num_element, 1), dtype=jnp.result_type(T_si, n)),
+                    aij,
+                    jnp.zeros((num_element, num_element), dtype=jnp.result_type(T_si, n))
+                ], axis=1)
+
+                # Assemble full Jacobian
+                J = jnp.concatenate([row0[None, :], J_mid, J_bot], axis=0)
 
                 # Handle trace species
                 trace_mask = n <= MIN_VALID_CONCENTRATION + 1e-20
-                row_indices = jnp.arange(1, 1 + num_prod)
                 J_species = J[1:1 + num_prod, :]
                 J_species = jnp.where(trace_mask[:, None], 0.0, J_species)
                 species_diag = jnp.where(trace_mask, -1.0,
                                          J_species[jnp.arange(num_prod), jnp.arange(num_prod) + 1])
-                # The +1 offset is because we skip column 0 (T) when looking at diagonal
-                # Actually, trace species diagonal should be at J[j+1, j+1] in full matrix
-                # In J_species (which is rows 1..np of J), the diagonal at column j+1 is index j+1
                 J_species = J_species.at[jnp.arange(num_prod), jnp.arange(num_prod) + 1].set(species_diag)
-                J = J.at[1:1 + num_prod, :].set(J_species)
+                J = jnp.concatenate([J[:1, :], J_species, J[1 + num_prod:, :]], axis=0)
 
                 return J
 
@@ -717,10 +714,16 @@ class JaxCEAThermo:
                                         jnp.array([resid_norm_new, iteration + 1])])
 
             def run_hP_newton(T_init, n_init_local, pi_init_local):
+                # Compute trial residual to determine target dtype for complex-step
                 resids, _ = compute_residuals_hP(T_init, n_init_local, pi_init_local)
+                target_dtype = resids.dtype
+
+                n_init_local = jnp.asarray(n_init_local, dtype=target_dtype)
+                pi_init_local = jnp.asarray(pi_init_local, dtype=target_dtype)
                 resid_norm = jnp.linalg.norm(resids)
-                init = jnp.concatenate([jnp.array([T_init]), n_init_local, pi_init_local,
-                                        jnp.array([resid_norm, 0.0])])
+                init = jnp.concatenate([jnp.array([T_init], dtype=target_dtype),
+                                        n_init_local, pi_init_local,
+                                        jnp.array([resid_norm, 0.0], dtype=target_dtype)])
                 final_state = jax.lax.while_loop(cond_fn, body_fn, init)
                 T_si = final_state[0]
                 n = final_state[1:1 + num_prod]
@@ -977,13 +980,13 @@ class JaxCEAThermo:
         """
         return not isinstance(val, jax.core.Tracer)
 
-    def _cast_cache(self, cache_val, ref_val):
-        """Cast a cached value to match the dtype of a reference value.
+    def _cast_cache(self, cache_val, *ref_vals):
+        """Cast a cached value to match the promoted dtype of reference values.
 
         This ensures while_loop carry states have consistent dtypes when
         inputs are complex (e.g., during complex-step derivative checks).
         """
-        ref_dtype = jnp.result_type(ref_val)
+        ref_dtype = jnp.result_type(*ref_vals)
         return jnp.asarray(cache_val, dtype=ref_dtype)
 
     def set_total_TP(self, T, P, composition):
@@ -1005,8 +1008,8 @@ class JaxCEAThermo:
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in English units
         """
         b0 = jnp.asarray(composition)
-        n_guess = self._cast_cache(self._cached_n, T)
-        pi_guess = self._cast_cache(self._cached_pi, T)
+        n_guess = self._cast_cache(self._cached_n, T, P, b0)
+        pi_guess = self._cast_cache(self._cached_pi, T, P, b0)
         props, n, pi = self._set_total_TP_jit(T, P, b0, n_guess, pi_guess)
         if self._is_concrete(n):
             self._cached_n = n
@@ -1035,8 +1038,8 @@ class JaxCEAThermo:
             Temperature (English units: Rankine)
         """
         b0 = jnp.asarray(composition)
-        n_guess = self._cast_cache(self._cached_n, h_target)
-        pi_guess = self._cast_cache(self._cached_pi, h_target)
+        n_guess = self._cast_cache(self._cached_n, h_target, P, b0)
+        pi_guess = self._cast_cache(self._cached_pi, h_target, P, b0)
         T_R, T_si, n, pi = self._set_total_hP_jit(
             h_target, P, b0, n_guess, pi_guess)
         if self._is_concrete(n):
@@ -1070,8 +1073,8 @@ class JaxCEAThermo:
             Named tuple with static properties plus darea/dMN
         """
         b0 = jnp.asarray(composition)
-        n_guess = self._cast_cache(self._cached_n, Tt)
-        pi_guess = self._cast_cache(self._cached_pi, Tt)
+        n_guess = self._cast_cache(self._cached_n, Tt, Pt, MN, W, b0)
+        pi_guess = self._cast_cache(self._cached_pi, Tt, Pt, MN, W, b0)
         result, n, pi = self._set_static_MN_jit(
             Tt, Pt, MN, W, b0, n_guess, pi_guess)
         if self._is_concrete(n):
@@ -1104,9 +1107,9 @@ class JaxCEAThermo:
             Named tuple with static properties
         """
         b0 = jnp.asarray(composition)
-        MN_guess = self._cast_cache(self._cached_MN, Tt)
-        n_guess = self._cast_cache(self._cached_n, Tt)
-        pi_guess = self._cast_cache(self._cached_pi, Tt)
+        MN_guess = self._cast_cache(self._cached_MN, Tt, Pt, area, W, b0)
+        n_guess = self._cast_cache(self._cached_n, Tt, Pt, area, W, b0)
+        pi_guess = self._cast_cache(self._cached_pi, Tt, Pt, area, W, b0)
         result, MN, n, pi = self._set_static_area_jit(
             Tt, Pt, area, W, b0, MN_guess, n_guess, pi_guess)
         if self._is_concrete(n):
