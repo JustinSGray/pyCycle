@@ -8,7 +8,7 @@ eliminating the need for pure_callback and enabling efficient JIT compilation.
 import jax
 import jax.numpy as jnp
 
-from ..base import TotalProps, StaticProps, StaticPropsWithDeriv
+from ..base import TotalProps, StaticProps, StaticPropsWithDeriv, safe_clip
 
 
 # =============================================================================
@@ -63,7 +63,7 @@ class JaxTrilinearInterp:
         # searchsorted returns index where element would be inserted
         idx = jnp.searchsorted(grid, x, side='right') - 1
         # Clamp to valid range [0, len-2] for interpolation
-        return jnp.clip(idx, 0, len(grid) - 2)
+        return safe_clip(idx, 0, len(grid) - 2)
 
     def _find_cell_and_coords(self, point):
         """Find cell indices and compute normalized coordinates.
@@ -272,7 +272,7 @@ class JaxTabularThermo:
             P_si = P * P_to_si
 
             # Initial guess
-            T_si_init = jnp.clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 2000.0)
+            T_si_init = safe_clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 2000.0)
 
             def h_and_deriv(T_si):
                 """Get h and dh/dT using analytical derivatives from interpolator."""
@@ -294,7 +294,7 @@ class JaxTabularThermo:
 
                 # Newton step with bounds
                 dx = -residual / dh_dT_safe
-                T_si_new = jnp.clip(T_si + dx, 160.0, 2400.0)
+                T_si_new = safe_clip(T_si + dx, 160.0, 2400.0)
 
                 # Return current residual for convergence check
                 # (when residual is small, Newton step is small, so we're converged)
@@ -336,7 +336,7 @@ class JaxTabularThermo:
                 dS_dT_safe = jnp.where(jnp.abs(dS_dT) < 1e-20, 1e-20, dS_dT)
 
                 dx = -residual / dS_dT_safe
-                T_si_new = jnp.clip(T_si + dx, 160.0, 2400.0)
+                T_si_new = safe_clip(T_si + dx, 160.0, 2400.0)
 
                 return (T_si_new, residual, i + 1)
 
@@ -612,8 +612,8 @@ class JaxTabularThermo:
 
                 dTs, dPs = solve_2x2(dR1_dT, dR1_dP, dR2_dT, dR2_dP, R1, R2)
 
-                Ts_new = jnp.clip(Ts_si + dTs, 160.0, 2400.0)
-                Ps_new = jnp.clip(Ps_si + dPs, 100.0, 1e8)
+                Ts_new = safe_clip(Ts_si + dTs, 160.0, 2400.0)
+                Ps_new = safe_clip(Ps_si + dPs, 100.0, 1e8)
                 return compute_state_2d(Ts_new, Ps_new, i + 1)
 
             # Run 2D Newton
@@ -788,9 +788,9 @@ class JaxTabularThermo:
                 dMN = (J22_mod * R3_mod - R2_mod * J32_mod) / det2_safe
                 dTs = (-R1 - dR1_dP * dPs) / J11_safe
 
-                Ts_new = jnp.clip(Ts_si + dTs, 160.0, 2400.0)
-                Ps_new = jnp.clip(Ps_si + dPs, 100.0, 1e8)
-                MN_new = jnp.clip(MN + dMN, 0.01, 0.99)
+                Ts_new = safe_clip(Ts_si + dTs, 160.0, 2400.0)
+                Ps_new = safe_clip(Ps_si + dPs, 100.0, 1e8)
+                MN_new = safe_clip(MN + dMN, 0.01, 0.99)
                 return compute_state_3d(Ts_new, Ps_new, MN_new, i + 1)
 
             # Run 3D Newton

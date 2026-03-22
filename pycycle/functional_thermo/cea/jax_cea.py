@@ -14,7 +14,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-from ..base import TotalProps, StaticProps, StaticPropsWithDeriv
+from ..base import TotalProps, StaticProps, StaticPropsWithDeriv, safe_clip
 from pycycle.constants import (P_REF, R_UNIVERSAL_ENG, R_UNIVERSAL_SI,
                                 MIN_VALID_CONCENTRATION, CEA_AIR_COMPOSITION)
 from pycycle.thermo.cea import species_data
@@ -560,10 +560,13 @@ class JaxCEAThermo:
             converged = rn_w <= 1e-7
 
             # Fallback to default guess if warm-start failed
+            # Cast default guesses to match input dtype (needed for complex-step)
             def use_warm(_):
                 return n_w, pi_w, nm_w
             def use_default(_):
-                n_d, pi_d, nm_d, _ = run_newton(n_init, jnp.zeros(num_element))
+                n_d, pi_d, nm_d, _ = run_newton(
+                    jnp.asarray(n_init, dtype=n_guess.dtype),
+                    jnp.zeros(num_element, dtype=n_guess.dtype))
                 return n_d, pi_d, nm_d
             n, pi, n_moles = jax.lax.cond(converged, use_warm, use_default, None)
             return n, pi, n_moles
@@ -703,7 +706,7 @@ class JaxCEAThermo:
 
                 delta = jnp.linalg.solve(J, -resids)
 
-                T_new = jnp.clip(T_si + delta[0], 200.0, 6000.0)
+                T_new = safe_clip(T_si + delta[0], 200.0, 6000.0)
                 n_new = jnp.maximum(n + delta[1:1 + num_prod], MIN_VALID_CONCENTRATION)
                 pi_new = pi + delta[1 + num_prod:]
 
@@ -726,17 +729,21 @@ class JaxCEAThermo:
                 return T_si, n, pi, resid_norm
 
             # Always use h-based T estimate (avoids local minima from far-off T guess)
-            T_si_init = jnp.clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 3000.0)
+            T_si_init = safe_clip(jnp.abs(h_target_si) / 1000.0 + 300.0, 300.0, 3000.0)
 
             # Try with warm-start n/pi from cache
             T_w, n_w, pi_w, rn_w = run_hP_newton(T_si_init, n_guess, pi_guess)
             converged = rn_w <= 1e-7
 
             # Fallback to default n/pi if warm-start failed
+            # Cast default guesses to match input dtype (needed for complex-step)
             def use_warm(_):
                 return T_w, n_w, pi_w
             def use_default(_):
-                T_d, n_d, pi_d, _ = run_hP_newton(T_si_init, n_init, jnp.zeros(num_element))
+                T_d, n_d, pi_d, _ = run_hP_newton(
+                    T_si_init,
+                    jnp.asarray(n_init, dtype=n_guess.dtype),
+                    jnp.zeros(num_element, dtype=n_guess.dtype))
                 return T_d, n_d, pi_d
             T_si, n_final, pi_final = jax.lax.cond(converged, use_warm, use_default, None)
 
@@ -915,7 +922,7 @@ class JaxCEAThermo:
 
                 # Newton step with bounds
                 dMN = -r / dr
-                MN_new = jnp.clip(MN + dMN, 0.01, 0.999)
+                MN_new = safe_clip(MN + dMN, 0.01, 0.999)
 
                 r_new = area_residual(MN_new)
 
@@ -932,10 +939,11 @@ class JaxCEAThermo:
             converged = rn_w <= 1e-10
 
             # Fallback to default MN=0.5 if warm-start failed
+            # Cast to match input dtype (needed for complex-step)
             def use_warm_MN(_):
                 return MN_w
             def use_default_MN(_):
-                MN_d, _ = run_MN_newton(0.5)
+                MN_d, _ = run_MN_newton(jnp.asarray(0.5, dtype=MN_guess.dtype))
                 return MN_d
             MN_final = jax.lax.cond(converged, use_warm_MN, use_default_MN, None)
 
@@ -960,6 +968,24 @@ class JaxCEAThermo:
     # Public API
     # =========================================================================
 
+    @staticmethod
+    def _is_concrete(val):
+        """Check if a value is concrete (not a JAX tracer).
+
+        During JAX transforms (jacfwd, jit tracing, etc.), intermediate values
+        become Tracer objects. Caching these would cause tracer leaks.
+        """
+        return not isinstance(val, jax.core.Tracer)
+
+    def _cast_cache(self, cache_val, ref_val):
+        """Cast a cached value to match the dtype of a reference value.
+
+        This ensures while_loop carry states have consistent dtypes when
+        inputs are complex (e.g., during complex-step derivative checks).
+        """
+        ref_dtype = jnp.result_type(ref_val)
+        return jnp.asarray(cache_val, dtype=ref_dtype)
+
     def set_total_TP(self, T, P, composition):
         """
         Get all thermodynamic properties at given T, P.
@@ -979,9 +1005,12 @@ class JaxCEAThermo:
             Named tuple with (h, S, gamma, Cp, Cv, rho, R) in English units
         """
         b0 = jnp.asarray(composition)
-        props, n, pi = self._set_total_TP_jit(T, P, b0, self._cached_n, self._cached_pi)
-        self._cached_n = n
-        self._cached_pi = pi
+        n_guess = self._cast_cache(self._cached_n, T)
+        pi_guess = self._cast_cache(self._cached_pi, T)
+        props, n, pi = self._set_total_TP_jit(T, P, b0, n_guess, pi_guess)
+        if self._is_concrete(n):
+            self._cached_n = n
+            self._cached_pi = pi
         return props
 
     def set_total_hP(self, h_target, P, composition):
@@ -1006,11 +1035,14 @@ class JaxCEAThermo:
             Temperature (English units: Rankine)
         """
         b0 = jnp.asarray(composition)
+        n_guess = self._cast_cache(self._cached_n, h_target)
+        pi_guess = self._cast_cache(self._cached_pi, h_target)
         T_R, T_si, n, pi = self._set_total_hP_jit(
-            h_target, P, b0, self._cached_n, self._cached_pi)
-        self._cached_T_si = T_si
-        self._cached_n = n
-        self._cached_pi = pi
+            h_target, P, b0, n_guess, pi_guess)
+        if self._is_concrete(n):
+            self._cached_T_si = T_si
+            self._cached_n = n
+            self._cached_pi = pi
         return T_R
 
     def set_static_MN(self, Tt, Pt, MN, W, composition):
@@ -1038,10 +1070,13 @@ class JaxCEAThermo:
             Named tuple with static properties plus darea/dMN
         """
         b0 = jnp.asarray(composition)
+        n_guess = self._cast_cache(self._cached_n, Tt)
+        pi_guess = self._cast_cache(self._cached_pi, Tt)
         result, n, pi = self._set_static_MN_jit(
-            Tt, Pt, MN, W, b0, self._cached_n, self._cached_pi)
-        self._cached_n = n
-        self._cached_pi = pi
+            Tt, Pt, MN, W, b0, n_guess, pi_guess)
+        if self._is_concrete(n):
+            self._cached_n = n
+            self._cached_pi = pi
         return result
 
     def set_static_area(self, Tt, Pt, area, W, composition):
@@ -1069,9 +1104,13 @@ class JaxCEAThermo:
             Named tuple with static properties
         """
         b0 = jnp.asarray(composition)
+        MN_guess = self._cast_cache(self._cached_MN, Tt)
+        n_guess = self._cast_cache(self._cached_n, Tt)
+        pi_guess = self._cast_cache(self._cached_pi, Tt)
         result, MN, n, pi = self._set_static_area_jit(
-            Tt, Pt, area, W, b0, self._cached_MN, self._cached_n, self._cached_pi)
-        self._cached_MN = MN
-        self._cached_n = n
-        self._cached_pi = pi
+            Tt, Pt, area, W, b0, MN_guess, n_guess, pi_guess)
+        if self._is_concrete(n):
+            self._cached_MN = MN
+            self._cached_n = n
+            self._cached_pi = pi
         return result

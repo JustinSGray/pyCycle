@@ -726,24 +726,36 @@ class JaxElement(om.ExplicitComponent):
 
         input_vec = jnp.array(input_vec)
 
-        # Get or create JIT-compiled compute function
-        config_key = self._get_jit_config_key()
-        if config_key not in JaxElement._jit_compute_cache:
-            JaxElement._jit_compute_cache[config_key] = self._make_jit_compute_wrapper()
+        # Detect complex step (used by OpenMDAO check_partials with method='cs')
+        is_complex = np.issubdtype(inputs[sample_name].dtype, np.complexfloating)
 
-        jit_fn, thermo_type = JaxElement._jit_compute_cache[config_key]
-
-        # Call JIT-compiled computation with timing
-        t_start = time.perf_counter()
-        if thermo_type == 'CEA':
-            thermo = self.jax_thermo
-            output_vec, new_n, new_pi, new_MN = jit_fn(
-                input_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN)
-            thermo._cached_n = new_n
-            thermo._cached_pi = new_pi
-            thermo._cached_MN = new_MN
+        if is_complex:
+            # Bypass JIT for complex-step derivative checks.
+            # JAX JIT re-traces for complex dtypes, which causes issues:
+            # - CEA wrapper has side effects (cache assignment) that leak tracers
+            # - Re-tracing is expensive and unnecessary for CS validation
+            # Call compute_physics directly instead.
+            t_start = time.perf_counter()
+            output_vec = self.compute_physics(input_vec)
         else:
-            output_vec = jit_fn(input_vec)
+            # Get or create JIT-compiled compute function
+            config_key = self._get_jit_config_key()
+            if config_key not in JaxElement._jit_compute_cache:
+                JaxElement._jit_compute_cache[config_key] = self._make_jit_compute_wrapper()
+
+            jit_fn, thermo_type = JaxElement._jit_compute_cache[config_key]
+
+            # Call JIT-compiled computation with timing
+            t_start = time.perf_counter()
+            if thermo_type == 'CEA':
+                thermo = self.jax_thermo
+                output_vec, new_n, new_pi, new_MN = jit_fn(
+                    input_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN)
+                thermo._cached_n = new_n
+                thermo._cached_pi = new_pi
+                thermo._cached_MN = new_MN
+            else:
+                output_vec = jit_fn(input_vec)
         _jax_element_timing_stats['compute_calls'] += 1
         _jax_element_timing_stats['compute_time'] += (time.perf_counter() - t_start)
 
@@ -843,6 +855,11 @@ class JaxElement(om.ExplicitComponent):
 
         Uses forward-mode AD (jacfwd) which is efficient when
         n_inputs <= n_outputs.
+
+        For CEA thermo, uses the cache-threading wrapper with argnums=0
+        so that jacfwd differentiates only w.r.t. the input vector while
+        the warm-start caches are treated as constants. This prevents
+        tracer leaks from CEA thermo's cache side effects.
 
         Parameters
         ----------

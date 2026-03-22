@@ -24,7 +24,18 @@ The thermo classes can accept inputs in different unit systems via the
 
 from collections import namedtuple
 
+import jax.numpy as jnp
 from openmdao.utils.units import unit_conversion
+
+
+def safe_clip(x, lo, hi):
+    """Clip values to [lo, hi], supporting complex inputs for complex-step derivatives.
+
+    Unlike jnp.clip, this works with complex-valued inputs by using
+    jnp.minimum/jnp.maximum which compare by real part, preserving
+    the imaginary component needed for complex-step derivative propagation.
+    """
+    return jnp.minimum(jnp.maximum(x, lo), hi)
 
 # Named tuples for returning grouped properties
 TotalProps = namedtuple('TotalProps', ['h', 'S', 'gamma', 'Cp', 'Cv', 'rho', 'R'])

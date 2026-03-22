@@ -9,3 +9,5 @@ from pycycle.new_elements.duct import NewDuct
 from pycycle.new_elements.inlet import NewInlet
 from pycycle.new_elements.shaft import NewShaft
 from pycycle.new_elements.performance import NewPerformance
+from pycycle.new_elements.bleed_out import NewBleedOut
+from pycycle.new_elements.flow_start import NewFlowStart
