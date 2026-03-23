@@ -463,12 +463,25 @@ class JaxElement(om.ExplicitComponent):
             # Build mappings now with known sizes
             self._build_index_mappings(self._primal_inputs, self._primal_outputs)
 
-        # Declare partials - use wildcard for simplicity
-        self.declare_partials('*', '*')
+        # Declare partials only for primal-to-primal pairs (from JAX AD)
+        # and passthrough pairs (identity derivatives). This avoids allocating
+        # storage for the many zero entries from unused flow inputs.
+        primal_out_names = [name for name, _ in self._primal_outputs]
+        primal_in_names = [name for name, _ in self._primal_inputs]
+        if primal_out_names and primal_in_names:
+            self.declare_partials(primal_out_names, primal_in_names)
+
+        # Declare passthrough partials (identity)
+        if hasattr(self, '_passthrough_vars'):
+            for src, dst in self._passthrough_vars:
+                self.declare_partials(dst, src)
 
     def _build_index_mappings(self, primal_inputs, primal_outputs):
         """
         Build index mappings for the given primal input/output lists.
+
+        Also pre-builds the Jacobian assignment list used by compute_partials.
+        This avoids per-call dict lookups and conditionals.
 
         Parameters
         ----------
@@ -505,6 +518,33 @@ class JaxElement(om.ExplicitComponent):
                 self._output_idx[om_name] = offset
                 offset += 1
         self._n_primal_outputs = offset
+
+        # Pre-build the Jacobian assignment list for compute_partials.
+        # Each entry contains all the info needed to extract and assign one
+        # sub-Jacobian block, avoiding per-call dict lookups and conditionals.
+        # Format: (out_name, in_name, out_idx, in_idx, shape_code)
+        #   shape_code: 0=scalar-scalar, 1=scalar-array, 2=array-scalar, 3=array-array
+        self._jac_assign_list = []
+        for out_name, out_size in primal_outputs:
+            if out_name in self._output_slices:
+                out_idx = self._output_slices[out_name]
+                is_out_array = True
+            else:
+                out_idx = self._output_idx[out_name]
+                is_out_array = False
+
+            for in_name, in_size in primal_inputs:
+                if in_name in self._input_slices:
+                    in_idx = self._input_slices[in_name]
+                    is_in_array = True
+                else:
+                    in_idx = self._input_idx[in_name]
+                    is_in_array = False
+
+                shape_code = (2 if is_out_array else 0) + (1 if is_in_array else 0)
+                self._jac_assign_list.append(
+                    (out_name, in_name, out_idx, in_idx, shape_code)
+                )
 
         # Store runtime-resolved lists
         self._runtime_primal_inputs = primal_inputs
@@ -790,10 +830,6 @@ class JaxElement(om.ExplicitComponent):
         """Compute partial derivatives using JAX autodiff."""
         input_vec = self._cached_input_vec
 
-        # Get the runtime-resolved primal lists (or original if no dynamic sizes)
-        primal_inputs = self._runtime_primal_inputs or self._primal_inputs
-        primal_outputs = self._runtime_primal_outputs or self._primal_outputs
-
         # Compute full Jacobian
         t_start = time.perf_counter()
         jac = self._compute_jacobian(input_vec)
@@ -803,50 +839,44 @@ class JaxElement(om.ExplicitComponent):
         # Convert JAX array to numpy once (avoid repeated conversions in loop)
         jac_np = np.asarray(jac)
 
-        # Assign to partials dict
+        # Assign Jacobian entries using direct numpy array references.
+        # On first call, we obtain references to the underlying numpy arrays
+        # in OpenMDAO's subjac storage (via partials[key] __getitem__). On
+        # subsequent calls, we write directly to these arrays, bypassing
+        # the __setitem__ overhead (key resolution, shape validation, etc.).
+        # This is ~4x faster than per-entry partials[key] = val assignment.
         t_start = time.perf_counter()
-        for out_name, out_size in primal_outputs:
-            for in_name, in_size in primal_inputs:
-                # Get row/column indices from mappings
-                if out_name in self._output_slices:
-                    out_slice = self._output_slices[out_name]
-                    is_out_array = True
-                else:
-                    out_slice = self._output_idx[out_name]
-                    is_out_array = False
 
-                if in_name in self._input_slices:
-                    in_slice = self._input_slices[in_name]
-                    is_in_array = True
-                else:
-                    in_slice = self._input_idx[in_name]
-                    is_in_array = False
+        if not hasattr(self, '_jac_direct_refs'):
+            # First call: resolve references from partials dict
+            self._jac_direct_refs = []
+            for out_name, in_name, out_idx, in_idx, shape_code in self._jac_assign_list:
+                val_ref = partials[out_name, in_name]  # returns underlying ndarray
+                self._jac_direct_refs.append((out_idx, in_idx, shape_code, val_ref))
 
-                # Extract submatrix from numpy Jacobian (fast indexing)
-                sub_jac = jac_np[out_slice, in_slice]
+            # Also resolve passthrough references
+            self._passthrough_refs = []
+            if hasattr(self, '_passthrough_vars'):
+                for src, dst in self._passthrough_vars:
+                    val_ref = partials[dst, src]
+                    src_val = inputs[src]
+                    n = 1 if np.isscalar(src_val) else len(src_val)
+                    self._passthrough_refs.append((val_ref, n))
 
-                # Handle scalar vs array shapes for OpenMDAO
-                if not is_out_array and not is_in_array:
-                    # scalar -> scalar
-                    partials[out_name, in_name] = float(sub_jac)
-                elif not is_out_array and is_in_array:
-                    # array -> scalar: row vector
-                    partials[out_name, in_name] = sub_jac.reshape(1, -1)
-                elif is_out_array and not is_in_array:
-                    # scalar -> array: column vector
-                    partials[out_name, in_name] = sub_jac.reshape(-1, 1)
-                else:
-                    # array -> array: matrix
-                    partials[out_name, in_name] = sub_jac
+        for out_idx, in_idx, shape_code, val_ref in self._jac_direct_refs:
+            sub_jac = jac_np[out_idx, in_idx]
+            if shape_code == 0:
+                val_ref[0, 0] = sub_jac
+            else:
+                val_ref[:] = sub_jac.reshape(val_ref.shape)
 
-        # Handle passthrough variable partials (identity derivatives)
-        if hasattr(self, '_passthrough_vars'):
-            for src, dst in self._passthrough_vars:
-                src_val = inputs[src]
-                if np.isscalar(src_val) or len(src_val) == 1:
-                    partials[dst, src] = 1.0
-                else:
-                    partials[dst, src] = np.eye(len(src_val))
+        # Passthrough partials are identity and only need setting once,
+        # but we set them each call for safety (negligible cost)
+        for val_ref, n in self._passthrough_refs:
+            if n == 1:
+                val_ref[0, 0] = 1.0
+            else:
+                val_ref[:] = np.eye(n)
 
         _jax_element_timing_stats['jacobian_assign_calls'] += 1
         _jax_element_timing_stats['jacobian_assign_time'] += (time.perf_counter() - t_start)

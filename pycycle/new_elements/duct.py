@@ -51,6 +51,19 @@ class NewDuct(JaxElement):
         # Add all flow inputs for pyCycle flow connections
         self.add_flow_input('Fl_I')
 
+        # Performance optimization: exclude unused flow inputs from the primal set.
+        # add_flow_input registers ALL ~27 flow properties as primal by default,
+        # but compute_physics only reads a handful via self.inp(). Each unused
+        # primal input adds a zero-column to the Jacobian and wastes a JVP
+        # evaluation in jacfwd. Removing them cuts the Jacobian width significantly.
+        # NOTE: if you modify compute_physics to use additional flow inputs,
+        # you must add them to this set.
+        used_flow_inputs = {'Fl_I:tot:P', 'Fl_I:tot:h', 'Fl_I:stat:W',
+                            'Fl_I:stat:MN', 'Fl_I:tot:composition'}
+        for name in list(self._primal_input_set):
+            if name.startswith('Fl_I:') and name not in used_flow_inputs:
+                del self._primal_input_set[name]
+
         self.add_input('Q_dot', val=0.0, units='Btu/s',
                        desc='Heat flow rate into (positive) or out of (negative) the air')
 

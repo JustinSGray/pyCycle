@@ -33,11 +33,16 @@ class HBTF(pyc.Cycle):
             FUEL_TYPE = 'Jet-A(g)'
 
 
-        DUCT_CLASS=pyc.NewDuct
         # DUCT_CLASS=pyc.Duct
-        INLET_CLASS=pyc.NewInlet
+        DUCT_CLASS=pyc.NewDuct
+
         # INLET_CLASS=pyc.Inlet
+        INLET_CLASS=pyc.NewInlet
+        
         SHAFT_CLASS=pyc.NewShaft
+
+        # BLEED_CLASS=pyc.BleedOut
+        BLEED_CLASS=pyc.NewBleedOut
 
 
         #Add subsystems to build the engine deck:
@@ -57,7 +62,7 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('duct6', DUCT_CLASS())
         self.add_subsystem('hpc', pyc.Compressor(map_data=pyc.HPCMap,
                                         bleed_names=['cool1','cool2','cust'], map_extrap=True),promotes_inputs=[('Nmech','HP_Nmech')])
-        self.add_subsystem('bld3', pyc.BleedOut(bleed_names=['cool3','cool4']))
+        self.add_subsystem('bld3', BLEED_CLASS(bleed_names=['cool3','cool4']))
         self.add_subsystem('burner', pyc.Combustor(fuel_type=FUEL_TYPE))
         self.add_subsystem('hpt', pyc.Turbine(map_data=pyc.HPTMap,
                                         bleed_names=['cool3','cool4'], map_extrap=True),promotes_inputs=[('Nmech','HP_Nmech')])
@@ -67,7 +72,7 @@ class HBTF(pyc.Cycle):
         self.add_subsystem('duct13', DUCT_CLASS())
         self.add_subsystem('core_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 
-        self.add_subsystem('byp_bld', pyc.BleedOut(bleed_names=['bypBld']))
+        self.add_subsystem('byp_bld', BLEED_CLASS(bleed_names=['bypBld']))
         self.add_subsystem('duct15', DUCT_CLASS())
         self.add_subsystem('byp_nozz', pyc.Nozzle(nozzType='CV', lossCoef='Cv'))
 

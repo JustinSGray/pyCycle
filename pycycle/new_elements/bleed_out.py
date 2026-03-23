@@ -7,7 +7,7 @@ of the inlet mass flow at the same total conditions (T, P).
 
 import jax.numpy as jnp
 
-from pycycle.new_elements.jax_element_base import JaxElement
+from pycycle.new_elements.jax_element_base import JaxElement, _TOTAL_PROPS, _STATIC_PROPS
 
 # Standard reference conditions for corrected flow calculation
 _T_REF = 518.67   # Reference temperature (degR)
@@ -52,6 +52,19 @@ class NewBleedOut(JaxElement):
         # --- Inputs ---
         self.add_flow_input('Fl_I')
 
+        # Performance optimization: exclude unused flow inputs from the primal set.
+        # add_flow_input registers ALL ~27 flow properties as primal by default,
+        # but compute_physics only reads a handful via self.inp(). Each unused
+        # primal input adds a zero-column to the Jacobian and wastes a JVP
+        # evaluation in jacfwd. Removing them cuts the Jacobian width significantly.
+        # NOTE: if you modify compute_physics to use additional flow inputs,
+        # you must add them to this set.
+        used_flow_inputs = {'Fl_I:tot:T', 'Fl_I:tot:P', 'Fl_I:stat:W',
+                            'Fl_I:tot:composition'}
+        for name in list(self._primal_input_set):
+            if name.startswith('Fl_I:') and name not in used_flow_inputs:
+                del self._primal_input_set[name]
+
         for bn in bleeds:
             self.add_input(f'{bn}:frac_W', val=0.0,
                            desc=f'Bleed mass flow fraction for {bn}')
@@ -63,12 +76,63 @@ class NewBleedOut(JaxElement):
                 self.add_input('area', val=1.0, units='inch**2', desc='Exit flow area')
 
         # --- Outputs ---
-        # Main flow output (with statics if enabled)
-        self.add_flow_output('Fl_O', statics=statics)
+        # Performance optimization: total properties for both the main outlet and
+        # bleed ports are IDENTICAL to the inlet (same T, P, composition).
+        # Instead of recomputing them via set_total_TP (which adds an expensive
+        # thermo call to the JAX computation and enlarges the Jacobian), we pass
+        # them through directly from the inlet with identity derivatives.
+        # This eliminates the set_total_TP call entirely and removes
+        # (1 + n_bleeds) × 9 = many primal outputs from the Jacobian.
 
-        # Bleed port outputs (total properties only, no statics)
+        # Main outlet total properties — passthrough from Fl_I
+        if not hasattr(self, '_passthrough_vars'):
+            self._passthrough_vars = []
+
+        for prop, val, units in _TOTAL_PROPS:
+            kwargs = {'val': val, 'primal': False}
+            if units is not None:
+                kwargs['units'] = units
+            if prop == 'P':
+                kwargs['lower'] = 1e-4
+            self.add_output(f'Fl_O:tot:{prop}', **kwargs)
+            self._passthrough_vars.append((f'Fl_I:tot:{prop}', f'Fl_O:tot:{prop}'))
+
+        # Fl_O composition and FAR — passthrough
+        self.add_output('Fl_O:tot:composition', shape_by_conn=True,
+                        copy_shape='Fl_I:tot:composition', primal=False)
+        self._passthrough_vars.append(('Fl_I:tot:composition', 'Fl_O:tot:composition'))
+
+        # Static properties (computed by JAX — these DO depend on W_out)
+        if statics:
+            for prop, val, units in _STATIC_PROPS:
+                kwargs = {'val': val}
+                if units is not None:
+                    kwargs['units'] = units
+                self.add_output(f'Fl_O:stat:{prop}', **kwargs)
+
+        # W_out (primal — computed from W_in minus bleed extractions)
+        self.add_output('Fl_O:stat:W', val=1.0, units='lbm/s')
+
+        self.add_output('Fl_O:FAR', val=0.0, primal=False)
+        self._passthrough_vars.append(('Fl_I:FAR', 'Fl_O:FAR'))
+
+        # Bleed port outputs — total properties are passthroughs, W is primal
         for bn in bleeds:
-            self.add_flow_output(bn, statics=False)
+            for prop, val, units in _TOTAL_PROPS:
+                kwargs = {'val': val, 'primal': False}
+                if units is not None:
+                    kwargs['units'] = units
+                self.add_output(f'{bn}:tot:{prop}', **kwargs)
+                self._passthrough_vars.append((f'Fl_I:tot:{prop}', f'{bn}:tot:{prop}'))
+
+            self.add_output(f'{bn}:tot:composition', shape_by_conn=True,
+                            copy_shape='Fl_I:tot:composition', primal=False)
+            self._passthrough_vars.append(('Fl_I:tot:composition', f'{bn}:tot:composition'))
+
+            self.add_output(f'{bn}:stat:W', val=1.0, units='lbm/s')
+
+            self.add_output(f'{bn}:FAR', val=0.0, primal=False)
+            self._passthrough_vars.append(('Fl_I:FAR', f'{bn}:FAR'))
 
         # Build index mappings and declare partials
         self.setup_partials()
@@ -85,25 +149,17 @@ class NewBleedOut(JaxElement):
         W_in = self.inp(inputs, 'Fl_I:stat:W')
         composition = self.inp(inputs, 'Fl_I:tot:composition')
 
-        # --- Compute total properties at inlet conditions ---
-        # Outlet and all bleeds share the same total state as inlet
-        props = thermo.set_total_TP(Tt_in, Pt_in, composition)
+        # --- Compute W_out after bleed extraction ---
+        W_out = W_in
+        for bn in bleeds:
+            frac_W = self.inp(inputs, f'{bn}:frac_W')
+            W_out = W_out - W_in * frac_W
 
-        # --- Main outlet total properties ---
-        outputs = [
-            props.h, Tt_in, Pt_in,
-            props.rho, props.gamma, props.Cp,
-            props.Cv, props.S, props.R,
-        ]
+        outputs = []
 
         # --- Static properties for main outlet ---
+        # (total properties are handled as passthroughs, not computed here)
         if statics:
-            # Compute W_out after bleed extraction
-            W_out = W_in
-            for bn in bleeds:
-                frac_W = self.inp(inputs, f'{bn}:frac_W')
-                W_out = W_out - W_in * frac_W
-
             if design:
                 MN_exit = self.inp(inputs, 'MN')
                 static_props = thermo.set_static_MN(Tt_in, Pt_in, MN_exit, W_out, composition)
@@ -121,26 +177,12 @@ class NewBleedOut(JaxElement):
                 static_props.area, Wc,
             ])
 
-        # Fl_O:stat:W (mass flow out after bleeds)
-        W_out = W_in
-        for bn in bleeds:
-            frac_W = self.inp(inputs, f'{bn}:frac_W')
-            W_out = W_out - W_in * frac_W
+        # Fl_O:stat:W
         outputs.append(W_out)
 
-        # --- Bleed port outputs ---
+        # --- Bleed port W outputs ---
         for bn in bleeds:
             frac_W = self.inp(inputs, f'{bn}:frac_W')
-            W_bld = W_in * frac_W
-
-            # Total properties (same as inlet)
-            outputs.extend([
-                props.h, Tt_in, Pt_in,
-                props.rho, props.gamma, props.Cp,
-                props.Cv, props.S, props.R,
-            ])
-
-            # {bn}:stat:W
-            outputs.append(W_bld)
+            outputs.append(W_in * frac_W)
 
         return jnp.array(outputs)

@@ -43,6 +43,19 @@ class NewInlet(JaxElement):
         # --- Inputs ---
         self.add_flow_input('Fl_I')
 
+        # Performance optimization: exclude unused flow inputs from the primal set.
+        # add_flow_input registers ALL ~27 flow properties as primal by default,
+        # but compute_physics only reads a handful via self.inp(). Each unused
+        # primal input adds a zero-column to the Jacobian and wastes a JVP
+        # evaluation in jacfwd. Removing them cuts the Jacobian width significantly.
+        # NOTE: if you modify compute_physics to use additional flow inputs,
+        # you must add them to this set.
+        used_flow_inputs = {'Fl_I:tot:P', 'Fl_I:tot:T', 'Fl_I:stat:W',
+                            'Fl_I:stat:V', 'Fl_I:tot:composition'}
+        for name in list(self._primal_input_set):
+            if name.startswith('Fl_I:') and name not in used_flow_inputs:
+                del self._primal_input_set[name]
+
         self.add_input('ram_recovery', val=1.0,
                        desc='Inlet ram recovery factor')
 

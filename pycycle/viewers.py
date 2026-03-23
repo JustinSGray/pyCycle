@@ -246,8 +246,15 @@ def print_bleed(prob, element_names, file=sys.stdout):
                 frac_W = prob[bld_pwr_path +':frac_W'][0]
 
             except KeyError: # for stand alone bleeds
-                bld_clacs_path = bleed.pathname + '.bld_calcs.' + bn
-                frac_W = prob[bld_clacs_path +':frac_W'][0]
+                # TODO: remove the inner try/except once old Group-based elements
+                # are fully retired and only JaxElement-based elements remain.
+                try:
+                    # Old Group-based BleedOut (has bld_calcs sub-component)
+                    bld_calcs_path = bleed.pathname + '.bld_calcs.' + bn
+                    frac_W = prob[bld_calcs_path +':frac_W'][0]
+                except KeyError:
+                    # New JaxElement-based BleedOut (flat, no sub-components)
+                    frac_W = prob[bleed.pathname + '.' + bn + ':frac_W'][0]
                 frac_p = 1.0
                 frac_work = 1.0
 
