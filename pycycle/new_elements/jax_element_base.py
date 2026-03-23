@@ -11,7 +11,7 @@ import jax.numpy as jnp
 
 import openmdao.api as om
 
-from pycycle.constants import ALLOWED_THERMOS, AIR_JETA_TAB_SPEC
+from pycycle.constants import ALLOWED_THERMOS
 
 # =============================================================================
 # Detailed timing stats for compute_partials breakdown
@@ -172,7 +172,7 @@ class JaxElement(om.ExplicitComponent):
 
     # Class-level cache for JIT-compiled compute_physics functions
     # Key: configuration tuple from _get_jit_config_key()
-    # Value: (jit_fn, thermo_type) where thermo_type is 'CEA' or other
+    # Value: (jit_fn, has_cache) where has_cache indicates cache threading
     _jit_compute_cache = {}
 
     def initialize(self):
@@ -233,25 +233,25 @@ class JaxElement(om.ExplicitComponent):
             self._jax_thermo = self._get_shared_jax_thermo()
         return self._jax_thermo
 
-    def _get_cea_composition(self):
+    def _get_thermo_composition(self):
         """
-        Get the CEA composition for this element.
+        Get the composition dict for this element's thermo object.
 
         Checks Fl_I_data first (for flow-through elements like Duct, Compressor),
         then Fl_O_data (for flow-start elements like FlowStart),
-        then falls back to the default CEA_AIR_COMPOSITION.
+        then falls back to the default composition for the thermo method.
 
         Returns
         -------
         dict
-            Elemental composition dict (e.g., {'N': 0.054, 'O': 0.014, ...})
+            Composition dict appropriate for the thermo method.
         """
         if 'Fl_I' in self.Fl_I_data:
             return self.Fl_I_data['Fl_I']
         if 'Fl_O' in self.Fl_O_data:
             return self.Fl_O_data['Fl_O']
         from pycycle.constants import THERMO_DEFAULT_COMPOSITIONS
-        return THERMO_DEFAULT_COMPOSITIONS['CEA']
+        return THERMO_DEFAULT_COMPOSITIONS[self.options['thermo_method']]
 
     def _get_shared_jax_thermo(self):
         """
@@ -259,59 +259,25 @@ class JaxElement(om.ExplicitComponent):
 
         Uses class-level cache to share JIT-compiled thermo objects across
         elements with the same configuration, avoiding redundant JAX tracing.
-
-        For TABULAR: keyed by (thermo_method, thermo_data_id)
-        For CEA: keyed by (thermo_method, thermo_data_id, composition)
-            because composition (b0, aij) is baked into JIT-compiled functions.
+        Uses the factory function from functional_thermo to avoid importing
+        specific thermo implementations.
         """
+        from pycycle.functional_thermo import create_jax_thermo
+
         thermo_method = self.options['thermo_method']
         thermo_data = self.options['thermo_data']
+        composition = self._get_thermo_composition()
 
-        if thermo_method == 'TABULAR':
-            key = (thermo_method, id(thermo_data))
-            if key not in JaxElement._shared_thermos:
-                spec = self._get_thermo_spec()
-                from pycycle.functional_thermo.tabular.jax_tabular import JaxTabularThermo
-                JaxElement._shared_thermos[key] = JaxTabularThermo(spec)
+        # Build cache key: include composition keys for methods where
+        # composition is baked into JIT-compiled functions (e.g., CEA).
+        comp_key = tuple(sorted(composition.keys())) if isinstance(composition, dict) else ()
+        key = (thermo_method, id(thermo_data), comp_key)
 
-        elif thermo_method == 'CEA':
-            composition = self._get_cea_composition()
-            # Include the element set in the cache key so that elements with
-            # different species sets (e.g., air vs air+fuel) get separate thermos.
-            comp_key = tuple(sorted(composition.keys()))
-            key = (thermo_method, id(thermo_data), comp_key)
-            if key not in JaxElement._shared_thermos:
-                from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
-                JaxElement._shared_thermos[key] = JaxCEAThermo(
-                    thermo_data=thermo_data, composition=composition)
-
-        else:
-            raise ValueError(f"Unsupported thermo_method: {thermo_method}")
+        if key not in JaxElement._shared_thermos:
+            JaxElement._shared_thermos[key] = create_jax_thermo(
+                thermo_method, thermo_data, composition)
 
         return JaxElement._shared_thermos[key]
-
-    def _get_thermo_spec(self):
-        """
-        Get the tabular thermo spec dict based on options.
-
-        Returns
-        -------
-        dict
-            Tabular thermo specification dictionary.
-
-        Raises
-        ------
-        ValueError
-            If thermo_method is not 'TABULAR'.
-        """
-        method = self.options['thermo_method']
-        if method != 'TABULAR':
-            raise ValueError(f"_get_thermo_spec only supports TABULAR thermo_method, got {method}")
-
-        thermo_data = self.options['thermo_data']
-        if thermo_data is None:
-            return AIR_JETA_TAB_SPEC
-        return thermo_data
 
     def pyc_setup_output_ports(self):
         """Override in subclass to set up output port data for Cycle's flow graph."""
@@ -710,39 +676,29 @@ class JaxElement(om.ExplicitComponent):
         """
         Create a JIT-compiled wrapper around compute_physics.
 
-        For CEA thermo, threads warm-start caches through the JIT boundary
-        as explicit function arguments. For other thermos (e.g. TABULAR)
-        or elements without thermo, just JIT-compiles compute_physics directly.
+        Delegates to the thermo object's wrap_compute_for_jit method,
+        which handles cache threading for thermos that need it (e.g., CEA).
+        For thermos without caches (e.g., TABULAR) or elements without thermo,
+        just JIT-compiles compute_physics directly.
 
         Returns
         -------
         tuple
-            (jit_fn, thermo_type) where thermo_type indicates the calling convention.
+            (jit_fn, has_cache) where has_cache indicates whether jit_fn
+            takes/returns extra cache arguments.
         """
         compute_physics = self.compute_physics
 
         # Ensure thermo is initialized before JIT tracing starts.
-        # If thermo_data is None, the element doesn't use thermo.
         if self.options['thermo_data'] is not None:
             thermo = self.jax_thermo  # Trigger lazy init outside JIT scope
         else:
             thermo = self._jax_thermo  # May be None for non-thermo elements
 
-        if thermo is not None:
-            from pycycle.functional_thermo.cea.jax_cea import JaxCEAThermo
-            if isinstance(thermo, JaxCEAThermo):
-                def wrapper(input_vec, cached_n, cached_pi, cached_MN):
-                    # Pre-load caches as traced values
-                    thermo._cached_n = cached_n
-                    thermo._cached_pi = cached_pi
-                    thermo._cached_MN = cached_MN
-                    output_vec = compute_physics(input_vec)
-                    # Return updated caches
-                    return output_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN
+        if thermo is not None and hasattr(thermo, 'wrap_compute_for_jit'):
+            return thermo.wrap_compute_for_jit(compute_physics)
 
-                return jax.jit(wrapper), 'CEA'
-
-        return jax.jit(compute_physics), 'OTHER'
+        return jax.jit(compute_physics), False
 
     def compute(self, inputs, outputs):
         """Pack inputs, call JIT-compiled compute_physics, unpack outputs."""
@@ -774,7 +730,7 @@ class JaxElement(om.ExplicitComponent):
         if is_complex:
             # Bypass JIT for complex-step derivative checks.
             # JAX JIT re-traces for complex dtypes, which causes issues:
-            # - CEA wrapper has side effects (cache assignment) that leak tracers
+            # - Cache wrappers have side effects that leak tracers
             # - Re-tracing is expensive and unnecessary for CS validation
             # Call compute_physics directly instead.
             t_start = time.perf_counter()
@@ -785,17 +741,16 @@ class JaxElement(om.ExplicitComponent):
             if config_key not in JaxElement._jit_compute_cache:
                 JaxElement._jit_compute_cache[config_key] = self._make_jit_compute_wrapper()
 
-            jit_fn, thermo_type = JaxElement._jit_compute_cache[config_key]
+            jit_fn, has_cache = JaxElement._jit_compute_cache[config_key]
 
             # Call JIT-compiled computation with timing
             t_start = time.perf_counter()
-            if thermo_type == 'CEA':
+            if has_cache:
                 thermo = self.jax_thermo
-                output_vec, new_n, new_pi, new_MN = jit_fn(
-                    input_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN)
-                thermo._cached_n = new_n
-                thermo._cached_pi = new_pi
-                thermo._cached_MN = new_MN
+                cache_args = thermo.get_jit_cache()
+                result = jit_fn(input_vec, *cache_args)
+                output_vec = result[0]
+                thermo.set_jit_cache(result[1:])
             else:
                 output_vec = jit_fn(input_vec)
         _jax_element_timing_stats['compute_calls'] += 1
@@ -888,10 +843,9 @@ class JaxElement(om.ExplicitComponent):
         Uses forward-mode AD (jacfwd) which is efficient when
         n_inputs <= n_outputs.
 
-        For CEA thermo, uses the cache-threading wrapper with argnums=0
-        so that jacfwd differentiates only w.r.t. the input vector while
-        the warm-start caches are treated as constants. This prevents
-        tracer leaks from CEA thermo's cache side effects.
+        For thermos with warm-start caches, the cache-threading wrapper
+        ensures jacfwd differentiates only w.r.t. the input vector while
+        the caches are treated as constants.
 
         Parameters
         ----------

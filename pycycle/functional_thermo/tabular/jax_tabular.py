@@ -825,3 +825,44 @@ class JaxTabularThermo:
         # JIT compile
         self._set_static_MN_jit = jax.jit(set_static_MN_impl)
         self._set_static_area_jit = jax.jit(set_static_area_impl)
+
+    # =========================================================================
+    # Composition helpers
+    # =========================================================================
+
+    def get_composition_array(self, composition_dict):
+        """Convert a composition dict to an array of component ratios."""
+        import numpy as np
+        return np.array(list(composition_dict.values()))
+
+    def get_mixed_output_composition(self, thermo_data, inflow_composition, reactant):
+        """For tabular thermo, output composition is same as inflow (FAR changes at runtime)."""
+        return inflow_composition
+
+    def create_composition_mixer(self, thermo_data, inflow_composition, reactant):
+        """Create a tabular composition mixer."""
+        return TabularCompositionMixer(inflow_composition)
+
+
+class TabularCompositionMixer:
+    """Trivial composition mixer for tabular thermo.
+
+    For tabular thermo, composition is just [FAR] and mixing just
+    means setting FAR to the actual fuel-to-air ratio value.
+    """
+
+    def __init__(self, inflow_composition):
+        import numpy as np
+        self.output_composition = inflow_composition
+        self.base_b0 = np.array(list(inflow_composition.values()))
+        self.comp_size = len(self.base_b0)
+
+    def mix_jax(self, b0_in, W_in, W_reactant):
+        """For tabular, composition is [FAR] = [W_reactant / W_in]."""
+        FAR = W_reactant / W_in
+        return jnp.array([FAR])
+
+    def mix_base_jax(self, W_in, W_reactant):
+        """For tabular source elements, composition is [ratio] = [W_reactant / W_in]."""
+        ratio = W_reactant / W_in
+        return jnp.array([ratio])

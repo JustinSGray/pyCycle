@@ -1117,3 +1117,157 @@ class JaxCEAThermo:
             self._cached_n = n
             self._cached_pi = pi
         return result
+
+    # =========================================================================
+    # JIT cache interface
+    # =========================================================================
+
+    def get_jit_cache(self):
+        """Return warm-start cache tuple for JIT boundary threading."""
+        return (self._cached_n, self._cached_pi, self._cached_MN)
+
+    def set_jit_cache(self, cache):
+        """Restore warm-start cache from tuple."""
+        self._cached_n, self._cached_pi, self._cached_MN = cache
+
+    def wrap_compute_for_jit(self, compute_fn):
+        """Wrap compute function with CEA warm-start cache threading."""
+        thermo = self
+
+        def wrapper(input_vec, cached_n, cached_pi, cached_MN):
+            thermo._cached_n = cached_n
+            thermo._cached_pi = cached_pi
+            thermo._cached_MN = cached_MN
+            output_vec = compute_fn(input_vec)
+            return output_vec, thermo._cached_n, thermo._cached_pi, thermo._cached_MN
+
+        return jax.jit(wrapper), True
+
+    # =========================================================================
+    # Composition helpers
+    # =========================================================================
+
+    def get_composition_array(self, composition_dict):
+        """Convert an elemental composition dict to a b0 array."""
+        from pycycle.thermo.cea.species_data import Properties
+        props = Properties(self.thermo_data, init_elements=composition_dict)
+        return props.b0.copy()
+
+    def get_mixed_output_composition(self, thermo_data, inflow_composition, reactant):
+        """Return the output composition dict for a flow that mixes in a reactant."""
+        from pycycle.functional_thermo.cea.thermo_add import ThermoAdd
+        mixer = ThermoAdd(inflow_composition=inflow_composition,
+                          mix_mode='reactant',
+                          mix_composition=reactant,
+                          thermo_data=thermo_data)
+        return mixer.mixed_elements
+
+    def create_composition_mixer(self, thermo_data, inflow_composition, reactant):
+        """Create a CEA composition mixer."""
+        return CEACompositionMixer(thermo_data, inflow_composition, reactant)
+
+
+class CEACompositionMixer:
+    """Encapsulates CEA composition mixing logic for reactant addition.
+
+    Pre-computes all the mapping matrices and fuel composition constants
+    at setup time, and provides a JAX-traceable mix method for runtime.
+    """
+
+    def __init__(self, thermo_data, inflow_composition, reactant):
+        import numpy as np
+        from pycycle.thermo.cea.species_data import Properties
+        from pycycle.functional_thermo.cea.thermo_add import ThermoAdd
+
+        # Use ThermoAdd to compute the output element set
+        ta = ThermoAdd(inflow_composition=inflow_composition,
+                       mix_mode='reactant',
+                       mix_composition=reactant,
+                       thermo_data=thermo_data)
+
+        self.output_composition = ta.mixed_elements
+
+        inflow_props = Properties(thermo_data, init_elements=inflow_composition)
+        outflow_props = Properties(thermo_data, init_elements=self.output_composition)
+
+        self.base_b0 = outflow_props.b0.copy()
+        self.comp_size = len(outflow_props.b0)
+
+        # Remap inflow b0 to mixed element ordering
+        self.in_out_map = np.zeros((self.comp_size, len(inflow_props.b0)))
+        for i, e in enumerate(inflow_props.elements):
+            j = outflow_props.elements.index(e)
+            self.in_out_map[j, i] = 1.0
+
+        # Fuel composition for 1kg
+        if isinstance(reactant, str):
+            reactant = (reactant,)
+        self.fuel_1kg = np.zeros(self.comp_size)
+        for reactant_name in reactant:
+            for i, e in enumerate(outflow_props.elements):
+                self.fuel_1kg[i] = (thermo_data.reactants[reactant_name].get(e, 0)
+                                    * thermo_data.element_wts[e])
+        self.fuel_1kg /= np.sum(self.fuel_1kg)
+
+        self.wt_mole = outflow_props.element_wt.copy()
+
+        # Pre-compute base composition for non-mixing case
+        b0_remapped = self.in_out_map @ inflow_props.b0
+        b0_mass = b0_remapped * self.wt_mole
+        self.base_mass_norm = b0_mass / np.sum(b0_mass)
+
+    def mix_jax(self, b0_in, W_in, W_reactant):
+        """Mix inflow composition with reactant. JAX-traceable.
+
+        Parameters
+        ----------
+        b0_in : jnp.array
+            Inflow composition (b0 array in inflow element ordering)
+        W_in : scalar
+            Inflow mass flow rate
+        W_reactant : scalar
+            Reactant mass flow rate
+
+        Returns
+        -------
+        jnp.array
+            Mixed composition array suitable for set_total_TP etc.
+        """
+        in_out_map = jnp.array(self.in_out_map)
+        fuel_1kg = jnp.array(self.fuel_1kg)
+        wt_mole = jnp.array(self.wt_mole)
+
+        b0_remapped = in_out_map @ b0_in
+        b0_mass = b0_remapped * wt_mole
+        b0_mass = b0_mass / jnp.sum(b0_mass)
+        b0_mass = b0_mass * W_in
+
+        b0_out = b0_mass + fuel_1kg * W_reactant
+        b0_out = b0_out / jnp.sum(b0_out)
+        return b0_out / wt_mole
+
+    def mix_base_jax(self, W_in, W_reactant):
+        """Mix the pre-computed base composition with reactant. JAX-traceable.
+
+        Use this for source elements (e.g., FlowStart) that don't have an
+        inflow composition to remap — the base composition is known at setup time.
+
+        Parameters
+        ----------
+        W_in : scalar
+            Base flow mass flow rate
+        W_reactant : scalar
+            Reactant mass flow rate
+
+        Returns
+        -------
+        jnp.array
+            Mixed composition array suitable for set_total_TP etc.
+        """
+        base = jnp.array(self.base_mass_norm)
+        fuel_1kg = jnp.array(self.fuel_1kg)
+        wt_mole = jnp.array(self.wt_mole)
+
+        b0_out = base * W_in + fuel_1kg * W_reactant
+        b0_out = b0_out / jnp.sum(b0_out)
+        return b0_out / wt_mole

@@ -39,6 +39,7 @@ class HBTF(pyc.Cycle):
         # INLET_CLASS=pyc.Inlet
         INLET_CLASS=pyc.NewInlet
         
+        # SHAFT_CLASS=pyc.Shaft
         SHAFT_CLASS=pyc.NewShaft
 
         # BLEED_CLASS=pyc.BleedOut

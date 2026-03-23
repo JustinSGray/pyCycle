@@ -382,6 +382,122 @@ class ThermoInterface:
     # Linearization and JAX-compatible derivatives
     # =========================================================================
 
+    # =========================================================================
+    # JIT cache interface (for warm-start threading through JIT boundary)
+    # =========================================================================
+
+    def get_jit_cache(self):
+        """Return warm-start cache as a tuple for threading through JIT boundary.
+
+        Default implementation returns empty tuple (no cache needed).
+        Override in subclasses that maintain warm-start state (e.g., CEA).
+        """
+        return ()
+
+    def set_jit_cache(self, cache):
+        """Restore warm-start cache from a tuple.
+
+        Default implementation is a no-op.
+        Override in subclasses that maintain warm-start state.
+        """
+        pass
+
+    def wrap_compute_for_jit(self, compute_fn):
+        """Wrap a compute function for JIT compilation with cache threading.
+
+        Returns (jit_fn, has_cache) where:
+        - jit_fn: JIT-compiled function
+        - has_cache: if True, jit_fn takes extra cache args and returns
+          (output, *cache) instead of just output
+
+        Default implementation just JIT-compiles directly (no cache).
+        """
+        import jax
+        return jax.jit(compute_fn), False
+
+    # =========================================================================
+    # Composition helpers
+    # =========================================================================
+
+    def get_composition_array(self, composition_dict):
+        """Convert a composition dict to the array form used by this thermo's methods.
+
+        Parameters
+        ----------
+        composition_dict : dict
+            Composition specification (format depends on thermo method).
+
+        Returns
+        -------
+        ndarray
+            Composition array suitable for passing to set_total_TP, etc.
+        """
+        raise NotImplementedError("Subclass must implement get_composition_array")
+
+    def composition_size(self, composition_dict):
+        """Return the size of the composition array for a given composition dict.
+
+        Parameters
+        ----------
+        composition_dict : dict
+            Composition specification.
+
+        Returns
+        -------
+        int
+            Number of elements in the composition array.
+        """
+        return len(self.get_composition_array(composition_dict))
+
+    def get_mixed_output_composition(self, thermo_data, inflow_composition, reactant):
+        """Return the output composition dict for a flow that mixes in a reactant.
+
+        Parameters
+        ----------
+        thermo_data : object
+            Thermodynamic data.
+        inflow_composition : dict
+            Inflow composition specification.
+        reactant : str or tuple
+            Reactant name(s) to mix in.
+
+        Returns
+        -------
+        dict
+            Output composition dict suitable for port setup.
+        """
+        raise NotImplementedError("Subclass must implement get_mixed_output_composition")
+
+    def create_composition_mixer(self, thermo_data, inflow_composition, reactant):
+        """Create a composition mixer for combining a base flow with a reactant.
+
+        The returned mixer object has:
+        - output_composition: dict for port setup
+        - base_b0: numpy array of base composition (for non-mixing elements)
+        - comp_size: size of the output composition array
+        - mix_jax(b0_in, W_in, W_reactant): JAX-traceable function returning
+          mixed composition array suitable for set_total_TP etc.
+
+        Parameters
+        ----------
+        thermo_data : object
+            Thermodynamic data.
+        inflow_composition : dict
+            Inflow composition specification.
+        reactant : str or tuple
+            Reactant name(s) to mix in.
+
+        Returns
+        -------
+        object
+            Mixer object with the interface described above.
+        """
+        raise NotImplementedError("Subclass must implement create_composition_mixer")
+
+    # =========================================================================
+    # Linearization and JAX-compatible derivatives
+    # =========================================================================
+
     def linearize(self, T, P, FAR=None):
         """
         Compute and cache property gradients at the given state.

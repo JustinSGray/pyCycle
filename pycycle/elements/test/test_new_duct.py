@@ -9,7 +9,7 @@ from openmdao.api import Problem, Group
 from openmdao.utils.assert_utils import assert_near_equal, assert_check_partials
 
 from pycycle.mp_cycle import Cycle
-from pycycle.elements.new_duct import NewDuct
+from pycycle.new_elements.duct import NewDuct
 from pycycle.elements.flow_start import FlowStart
 from pycycle import constants
 from pycycle.constants import AIR_JETA_TAB_SPEC

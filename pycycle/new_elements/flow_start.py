@@ -5,7 +5,6 @@ Creates a flow from specified total conditions (T, P) and flow parameters (W, MN
 Optionally mixes in a reactant (e.g., water) at a specified mass ratio.
 """
 
-import numpy as np
 import jax.numpy as jnp
 
 from pycycle.new_elements.jax_element_base import JaxElement, _TOTAL_PROPS, _STATIC_PROPS
@@ -37,18 +36,21 @@ class NewFlowStart(JaxElement):
                              desc='The name of the input that governs the mix ratio of the reactant.')
 
     def pyc_setup_output_ports(self):
-        thermo_method = self.options['thermo_method']
         thermo_data = self.options['thermo_data']
+        thermo_method = self.options['thermo_method']
         composition = self.options['composition']
         reactant = self.options['reactant']
 
         if reactant is not False:
-            from pycycle.thermo.thermo import ThermoAdd
-            self._thermo_add_obj = ThermoAdd(method=thermo_method, mix_mode='reactant',
-                                             thermo_kwargs={'spec': thermo_data,
-                                                            'inflow_composition': composition,
-                                                            'mix_composition': reactant})
-            self.init_output_flow('Fl_O', self._thermo_add_obj.output_port_data())
+            if composition is None:
+                composition = THERMO_DEFAULT_COMPOSITIONS[thermo_method]
+            # Determine the output composition (method-agnostic factory function).
+            # Must use standalone function here since thermo object hasn't been
+            # created yet (it needs the output composition to be set first).
+            from pycycle.functional_thermo import get_mixed_output_composition
+            output_composition = get_mixed_output_composition(
+                thermo_method, thermo_data, composition, reactant)
+            self.init_output_flow('Fl_O', output_composition)
         else:
             if composition is None:
                 composition = THERMO_DEFAULT_COMPOSITIONS[thermo_method]
@@ -56,53 +58,23 @@ class NewFlowStart(JaxElement):
 
     def setup(self):
         reactant = self.options['reactant']
-        thermo_method = self.options['thermo_method']
         thermo_data = self.options['thermo_data']
+        thermo_method = self.options['thermo_method']
 
         composition = self.Fl_O_data['Fl_O']
 
-        # Compute composition array and its size
-        if thermo_method == 'CEA':
-            from pycycle.thermo.cea.species_data import Properties
-            mixed_props = Properties(thermo_data, init_elements=composition)
-            self._composition_b0 = mixed_props.b0.copy()
-            self._comp_size = len(mixed_props.b0)
+        # Get the composition array and size using factory function
+        from pycycle.functional_thermo import get_composition_array, create_composition_mixer
+        self._composition_b0 = get_composition_array(thermo_method, thermo_data, composition)
+        self._comp_size = len(self._composition_b0)
 
-            if reactant is not False:
-                # Precompute constants for reactant mixing in compute_physics
-                inflow_composition = self.options['composition']
-                if inflow_composition is None:
-                    inflow_composition = THERMO_DEFAULT_COMPOSITIONS['CEA']
-                inflow_props = Properties(thermo_data, init_elements=inflow_composition)
-
-                # Remap inflow b0 to mixed element ordering
-                in_out_map = np.zeros((self._comp_size, len(inflow_props.b0)))
-                for i, e in enumerate(inflow_props.elements):
-                    j = mixed_props.elements.index(e)
-                    in_out_map[j, i] = 1.0
-
-                b0_remapped = in_out_map @ inflow_props.b0
-                b0_mass = b0_remapped * mixed_props.element_wt
-                self._b0_base_mass_norm = b0_mass / np.sum(b0_mass)
-
-                # Fuel composition for 1kg
-                mix_comp = reactant if isinstance(reactant, str) else reactant
-                if isinstance(mix_comp, str):
-                    mix_comp = (mix_comp,)
-
-                self._init_fuel_1kg = np.zeros(self._comp_size)
-                for reactant_name in mix_comp:
-                    for i, e in enumerate(mixed_props.elements):
-                        self._init_fuel_1kg[i] = (thermo_data.reactants[reactant_name].get(e, 0)
-                                                  * thermo_data.element_wts[e])
-                self._init_fuel_1kg /= np.sum(self._init_fuel_1kg)
-
-                self._mixed_wt_mole = mixed_props.element_wt.copy()
-
-        else:  # TABULAR
-            comp_values = list(composition.values())
-            self._composition_b0 = np.array(comp_values)
-            self._comp_size = len(comp_values)
+        if reactant is not False:
+            # Create composition mixer for reactant mixing
+            inflow_composition = self.options['composition']
+            if inflow_composition is None:
+                inflow_composition = THERMO_DEFAULT_COMPOSITIONS[thermo_method]
+            self._mixer = create_composition_mixer(
+                thermo_method, thermo_data, inflow_composition, reactant)
 
         # --- Inputs ---
         self.add_input('T', val=518., units='degR')
@@ -156,14 +128,9 @@ class NewFlowStart(JaxElement):
             mix_ratio_name = self.options['mix_ratio_name']
             ratio = self.inp(inputs, mix_ratio_name)
 
-            # Mix base composition with reactant (all constants except W and ratio)
-            b0_base = jnp.array(self._b0_base_mass_norm)
-            fuel_1kg = jnp.array(self._init_fuel_1kg)
-            wt_mole = jnp.array(self._mixed_wt_mole)
-
-            b0_out = b0_base * W + fuel_1kg * W * ratio
-            b0_out = b0_out / jnp.sum(b0_out)
-            composition = b0_out / wt_mole
+            # Use the mixer to compute mixed composition (method-agnostic).
+            # FlowStart has no inflow, so use mix_base_jax with pre-computed base.
+            composition = self._mixer.mix_base_jax(W, W * ratio)
         else:
             composition = jnp.array(self._composition_b0)
 

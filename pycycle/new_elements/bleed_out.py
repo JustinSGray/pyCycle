@@ -98,7 +98,7 @@ class NewBleedOut(JaxElement):
             self._passthrough_vars.append((f'Fl_I:tot:{prop}', f'Fl_O:tot:{prop}'))
 
         # Fl_O composition and FAR — passthrough
-        self.add_output('Fl_O:tot:composition', shape_by_conn=True,
+        self.add_output('Fl_O:tot:composition',
                         copy_shape='Fl_I:tot:composition', primal=False)
         self._passthrough_vars.append(('Fl_I:tot:composition', 'Fl_O:tot:composition'))
 
@@ -125,7 +125,7 @@ class NewBleedOut(JaxElement):
                 self.add_output(f'{bn}:tot:{prop}', **kwargs)
                 self._passthrough_vars.append((f'Fl_I:tot:{prop}', f'{bn}:tot:{prop}'))
 
-            self.add_output(f'{bn}:tot:composition', shape_by_conn=True,
+            self.add_output(f'{bn}:tot:composition',
                             copy_shape='Fl_I:tot:composition', primal=False)
             self._passthrough_vars.append(('Fl_I:tot:composition', f'{bn}:tot:composition'))
 
